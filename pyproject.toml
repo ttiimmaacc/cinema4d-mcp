@@ -1,0 +1,17 @@
+[project]
+name = "cinema4d-mcp"
+version = "0.1.0"
+description = "a bridge between claude desktop and c4d"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [ "mcp>=1.4.0",]
+[[project.authors]]
+name = "ttiimmaacc"
+email = "ttiimmaacc@gmail.com"
+
+[build-system]
+requires = [ "hatchling",]
+build-backend = "hatchling.build"
+
+[project.scripts]
+cinema4d-mcp = "cinema4d_mcp:main"
