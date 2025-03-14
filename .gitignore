@@ -1,20 +1,36 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
 wheels/
-*.egg-info
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Virtual environments
-.venv
+venv/
+env/
+ENV/
 
-# macOS system files
-.DS_Store
-**/.DS_Store
-
-# IDE settings
+# IDE files
+.idea/
 .vscode/
+*.swp
+*.swo
 
-# Package management
-uv.lock
+# OS specific
+.DS_Store
+Thumbs.db

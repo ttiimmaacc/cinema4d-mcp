@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# Redirect all stdout from echo commands to stderr
+exec 3>&1  # Save the original stdout
+exec 1>&2  # Redirect stdout to stderr
+
+echo "Starting Cinema 4D MCP Server..."
+
+# Find the Python executable that has the mcp package installed
+PYTHON_WITH_MCP=$(python3 -c "import sys; import importlib.util; print('yes' if importlib.util.find_spec('mcp') else 'no')" 2>/dev/null)
+
+if [ "$PYTHON_WITH_MCP" == "yes" ]; then
+    PYTHON_EXEC="python3"
+else
+    echo "MCP package not found in default Python. Checking other versions..."
+    
+    # Try to find Python with MCP installed
+    for py_cmd in python3.9 python3.10 python3.11 python3.12; do
+        if command -v $py_cmd >/dev/null 2>&1; then
+            if $py_cmd -c "import importlib.util; exit(0 if importlib.util.find_spec('mcp') else 1)" 2>/dev/null; then
+                PYTHON_EXEC=$py_cmd
+                echo "Found MCP in $PYTHON_EXEC"
+                break
+            fi
+        fi
+    done
+fi
+
+if [ -z "$PYTHON_EXEC" ]; then
+    echo "Error: Could not find Python with MCP package installed"
+    echo "Please install the MCP package: pip install mcp"
+    exit 1
+fi
+
+# Run the module
+exec 1>&3  # Restore stdout for the server
+exec $PYTHON_EXEC -m cinema4d_mcp

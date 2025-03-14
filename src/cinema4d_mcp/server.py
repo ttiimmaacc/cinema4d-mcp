@@ -1,16 +1,18 @@
-# cinema4d_mcp/server.py
+"""Cinema 4D MCP Server."""
+
 import socket
 import json
+import os
 from dataclasses import dataclass
-from mcp.server.fastmcp import FastMCP, Context
 from typing import Any, Dict, List, Optional, Union
-from starlette.routing import Route
-from starlette.responses import JSONResponse
 from contextlib import asynccontextmanager
 
-# Configuration for Cinema 4D connection
-C4D_HOST = '127.0.0.1'  # localhost
-C4D_PORT = 5555  # default port, can be changed
+from mcp.server.fastmcp import FastMCP, Context
+from starlette.routing import Route
+from starlette.responses import JSONResponse
+
+from .config import C4D_HOST, C4D_PORT
+from .utils import logger, check_c4d_connection
 
 @dataclass
 class C4DConnection:
@@ -28,17 +30,17 @@ async def c4d_connection_context():
         sock.connect((C4D_HOST, C4D_PORT))
         connection.sock = sock
         connection.connected = True
-        print(f"✅ Connected to Cinema 4D at {C4D_HOST}:{C4D_PORT}")
+        logger.info(f"✅ Connected to Cinema 4D at {C4D_HOST}:{C4D_PORT}")
         yield connection  # Yield the connection
     except Exception as e:
-        print(f"❌ Failed to connect to Cinema 4D: {str(e)}")
+        logger.error(f"❌ Failed to connect to Cinema 4D: {str(e)}")
         connection.connected = False  # Ensure connection is marked as not connected
         yield connection  # Still yield the connection object
     finally:
         # Clean up on server shutdown
         if connection.sock:
             connection.sock.close()
-            print("🔌 Disconnected from Cinema 4D")
+            logger.info("🔌 Disconnected from Cinema 4D")
 
 def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str, Any]:
     """Send a command to Cinema 4D and get the response."""
@@ -65,19 +67,23 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
         return json.loads(response_text)
     
     except Exception as e:
+        logger.error(f"Communication error: {str(e)}")
         return {"error": f"Communication error: {str(e)}"}
 
 async def homepage(request):
-    return JSONResponse({'hello': 'world'})
-
-routes = [
-    Route("/", endpoint=homepage)
-]
+    """Handle homepage requests to check if server is running."""
+    c4d_available = check_c4d_connection(C4D_HOST, C4D_PORT)
+    return JSONResponse({
+        'status': 'ok',
+        'cinema4d_connected': c4d_available,
+        'host': C4D_HOST,
+        'port': C4D_PORT
+    })
 
 # Initialize our FastMCP server
 mcp = FastMCP(
     title="Cinema4D",
-    routes=routes
+    routes=[Route("/", endpoint=homepage)]
 )
 
 @mcp.tool()
@@ -97,15 +103,15 @@ async def get_scene_info(ctx: Context) -> str:
         # Format scene info nicely
         scene_info = response.get("scene_info", {})
         return f"""
-    # Cinema 4D Scene Information
-    - **Filename**: {scene_info.get('filename', 'Untitled')}
-    - **Objects**: {scene_info.get('object_count', 0)}
-    - **Polygons**: {scene_info.get('polygon_count', 0):,}
-    - **Materials**: {scene_info.get('material_count', 0)}
-    - **Current Frame**: {scene_info.get('current_frame', 0)}
-    - **FPS**: {scene_info.get('fps', 30)}
-    - **Frame Range**: {scene_info.get('frame_start', 0)} - {scene_info.get('frame_end', 90)}
-    """
+# Cinema 4D Scene Information
+- **Filename**: {scene_info.get('filename', 'Untitled')}
+- **Objects**: {scene_info.get('object_count', 0)}
+- **Polygons**: {scene_info.get('polygon_count', 0):,}
+- **Materials**: {scene_info.get('material_count', 0)}
+- **Current Frame**: {scene_info.get('current_frame', 0)}
+- **FPS**: {scene_info.get('fps', 30)}
+- **Frame Range**: {scene_info.get('frame_start', 0)} - {scene_info.get('frame_end', 90)}
+"""
 
 @mcp.tool()
 async def add_primitive(primitive_type: str, name: Optional[str] = None, position: Optional[List[float]] = None, 
@@ -114,7 +120,7 @@ async def add_primitive(primitive_type: str, name: Optional[str] = None, positio
     Add a primitive object to the Cinema 4D scene.
     
     Args:
-        primitive_type: Type of primitive (cube, sphere, cone, cylinder, etc.)
+        primitive_type: Type of primitive (cube, sphere, cone, cylinder, plane, etc.)
         name: Optional name for the new object
         position: Optional [x, y, z] position
         size: Optional [x, y, z] size or dimensions
@@ -144,11 +150,11 @@ async def add_primitive(primitive_type: str, name: Optional[str] = None, positio
         
         object_info = response.get("object", {})
         return f"""
-    ✅ Added {primitive_type} to scene
-    - **Name**: {object_info.get('name', primitive_type)}
-    - **ID**: {object_info.get('id', 'Unknown')}
-    - **Position**: {object_info.get('position', [0, 0, 0])}
-    """
+✅ Added {primitive_type} to scene
+- **Name**: {object_info.get('name', primitive_type)}
+- **ID**: {object_info.get('id', 'Unknown')}
+- **Position**: {object_info.get('position', [0, 0, 0])}
+"""
 
 @mcp.tool()
 async def modify_object(object_name: str, properties: Dict[str, Any], ctx: Context) -> str:
@@ -179,9 +185,9 @@ async def modify_object(object_name: str, properties: Dict[str, Any], ctx: Conte
             modified_props.append(f"- **{prop}**: {value}")
         
         return f"""
-    ✅ Modified object: {object_name}
-    {chr(10).join(modified_props)}
-    """
+✅ Modified object: {object_name}
+{chr(10).join(modified_props)}
+"""
 
 @mcp.tool()
 async def list_objects(ctx: Context) -> str:
@@ -207,9 +213,9 @@ async def list_objects(ctx: Context) -> str:
             object_list.append(f"- **{obj['name']}** ({obj['type']})")
         
         return f"""
-    # Objects in Scene ({len(objects)})
-    {chr(10).join(object_list)}
-    """
+# Objects in Scene ({len(objects)})
+{chr(10).join(object_list)}
+"""
 
 @mcp.tool()
 async def create_material(name: str, color: Optional[List[float]] = None, 
@@ -245,10 +251,10 @@ async def create_material(name: str, color: Optional[List[float]] = None,
         
         material_info = response.get("material", {})
         return f"""
-    ✅ Created material: {name}
-    - **ID**: {material_info.get('id', 'Unknown')}
-    - **Color**: {material_info.get('color', [1, 1, 1])}
-    """
+✅ Created material: {name}
+- **ID**: {material_info.get('id', 'Unknown')}
+- **Color**: {material_info.get('color', [1, 1, 1])}
+"""
 
 @mcp.tool()
 async def apply_material(material_name: str, object_name: str, ctx: Context) -> str:
@@ -310,11 +316,11 @@ async def render_frame(output_path: Optional[str] = None, width: Optional[int] =
         
         render_info = response.get("render_info", {})
         return f"""
-    ✅ Rendered frame
-    - **Path**: {render_info.get('path', 'Unknown')}
-    - **Resolution**: {render_info.get('width', 0)} x {render_info.get('height', 0)}
-    - **Render Time**: {render_info.get('render_time', 0):.2f} seconds
-    """
+✅ Rendered frame
+- **Path**: {render_info.get('path', 'Unknown')}
+- **Resolution**: {render_info.get('width', 0)} x {render_info.get('height', 0)}
+- **Render Time**: {render_info.get('render_time', 0):.2f} seconds
+"""
 
 @mcp.tool()
 async def set_keyframe(object_name: str, property_name: str, value: Any, frame: int, ctx: Context) -> str:
@@ -420,15 +426,14 @@ async def execute_python_script(script: str, ctx: Context) -> str:
         
         result = response.get("result", "No output")
         return f"""
-    ✅ Python script executed
-    **Output**:
-    {result}
-    """
+✅ Python script executed
+**Output**:
+{result}
+"""
 
 @mcp.resource("c4d://primitives")
 def get_primitives_info() -> str:
     """Get information about available Cinema 4D primitives."""
-    # This is static documentation that doesn't need the Cinema 4D connection
     return """
 # Cinema 4D Primitive Objects
 
@@ -460,7 +465,6 @@ def get_primitives_info() -> str:
 @mcp.resource("c4d://material_types")
 def get_material_types() -> str:
     """Get information about available Cinema 4D material types and their properties."""
-    # Static documentation about material types
     return """
 # Cinema 4D Material Types
 
@@ -485,17 +489,43 @@ def get_material_types() -> str:
 @mcp.resource("c4d://status")
 def get_connection_status() -> str:
     """Get the current connection status to Cinema 4D."""
-    return """
+    is_connected = check_c4d_connection(C4D_HOST, C4D_PORT)
+    status = "✅ Connected to Cinema 4D" if is_connected else "❌ Not connected to Cinema 4D"
+    
+    return f"""
 # Cinema 4D Connection Status
-Connection Status needs to be implemented!
+{status}
+
+## Connection Details
+- **Host**: {C4D_HOST}
+- **Port**: {C4D_PORT}
 """
 
 mcp_app = mcp
 
-def main():
-    """Main entry point for the server module."""
-    # Run the server using stdio transport by default
-    mcp_app.run()
 
-if __name__ == "__main__":
-    main()
+# mcp_app = mcp
+
+# def main():
+#     """Main entry point for the server module."""
+#     try:
+#         logger.info("Starting Cinema 4D MCP Server...")
+#         # Check if the socket server is running
+#         try:
+#             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+#             test_socket.connect((C4D_HOST, C4D_PORT))
+#             test_socket.close()
+#             logger.info(f"Successfully connected to Cinema 4D socket on {C4D_HOST}:{C4D_PORT}")
+#         except Exception as e:
+#             logger.warning(f"Could not connect to Cinema 4D socket: {e}")
+#             logger.warning("Server will still start, but Cinema 4D integration will be unavailable")
+        
+#         # Run the server
+#         mcp_app.run()
+#     except Exception as e:
+#         logger.error(f"Error starting server: {e}")
+#         logger.error(traceback.format_exc())
+#         sys.exit(1)
+
+# if __name__ == "__main__":
+#     main()

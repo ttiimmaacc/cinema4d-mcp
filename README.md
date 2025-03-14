@@ -1,111 +1,180 @@
-# cinema4d-mcp MCP server
+# Cinema4D MCP — Model Context Protocol (MCP) Server
 
-Connects Cinema 4D to Claude. Enables prompt assisted 3D modeling, scene creation, and manipulation.
+Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D manipulation.
+
+## Table of Contents
+
+- [Components](#components)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Setup](#setup)
+- [Usage](#usage)
+- [Development](#development)
+- [Troubleshooting & Debugging](#troubleshooting--debugging)
+- [File Structure](#file-structure)
+- [Tool Commands](#tool-commands)
 
 ## Components
 
-### Resources
+1. **C4D Plugin**: A socket server that listens for commands from the MCP server and executes them in the Cinema 4D environment.
+2. **MCP Server**: A Python server that implements the MCP protocol and provides tools for Cinema 4D integration.
 
-The server implements a simple note storage system with:
-- Custom note:// URI scheme for accessing individual notes
-- Each note resource has a name, description and text/plain mimetype
+## Prerequisites
 
-### Prompts
+- Cinema 4D
+- Python 3.10 or higher
 
-The server provides a single prompt:
-- summarize-notes: Creates summaries of all stored notes
-  - Optional "style" argument to control detail level (brief/detailed)
-  - Generates prompt combining all current notes with style preference
+## Development Installation
 
-### Tools
+To install the project, follow these steps:
 
-The server implements one tool:
-- add-note: Adds a new note to the server
-  - Takes "name" and "content" as required string arguments
-  - Updates server state and notifies clients of resource changes
-
-## Configuration
-
-[TODO: Add configuration details specific to your implementation]
-
-## Quickstart
-
-### Install
-
-#### Claude Desktop
-
-On MacOS: `~/Library/Application\ Support/Claude/claude_desktop_config.json`
-On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
-
-<details>
-  <summary>Development/Unpublished Servers Configuration</summary>
-  ```
-  "mcpServers": {
-    "cinema4d-mcp": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/Users/winepegs/cinema4d-mcp",
-        "run",
-        "cinema4d-mcp"
-      ]
-    }
-  }
-  ```
-</details>
-
-<details>
-  <summary>Published Servers Configuration</summary>
-  ```
-  "mcpServers": {
-    "cinema4d-mcp": {
-      "command": "uvx",
-      "args": [
-        "cinema4d-mcp"
-      ]
-    }
-  }
-  ```
-</details>
-
-## Development
-
-### Building and Publishing
-
-To prepare the package for distribution:
-
-1. Sync dependencies and update lockfile:
-```bash
-uv sync
-```
-
-2. Build package distributions:
-```bash
-uv build
-```
-
-This will create source and wheel distributions in the `dist/` directory.
-
-3. Publish to PyPI:
-```bash
-uv publish
-```
-
-Note: You'll need to set PyPI credentials via environment variables or command flags:
-- Token: `--token` or `UV_PUBLISH_TOKEN`
-- Or username/password: `--username`/`UV_PUBLISH_USERNAME` and `--password`/`UV_PUBLISH_PASSWORD`
-
-### Debugging
-
-Since MCP servers run over stdio, debugging can be challenging. For the best debugging
-experience, we strongly recommend using the [MCP Inspector](https://github.com/modelcontextprotocol/inspector).
-
-
-You can launch the MCP Inspector via [`npm`](https://docs.npmjs.com/downloading-and-installing-node-js-and-npm) with this command:
+### Clone the Repository
 
 ```bash
-npx @modelcontextprotocol/inspector uv --directory /Users/winepegs/cinema4d-mcp run cinema4d-mcp
+git clone https://github.com/ttiimmaacc/cinema4d-mcp.git
+cd cinema4d-mcp
 ```
 
+### Install the Package
 
-Upon launching, the Inspector will display a URL that you can access in your browser to begin debugging.
+```bash
+pip install -e .
+```
+
+### Make the Wrapper Script Executable
+
+```bash
+chmod +x bin/cinema4d-mcp-wrapper
+```
+
+## Setup
+
+### Cinema 4D Plugin Setup
+
+To set up the Cinema 4D plugin, follow these steps:
+
+1. **Copy the Plugin File**: Copy the `c4d_plugins/cinema4d_socket_plugin.py` file to Cinema 4D's scripts folder. The path varies depending on your operating system:
+   - macOS: `/Users/USERNAME/Library/Preferences/Maxon/Maxon Cinema 4D RXXX_XXXXXXXX/library/scripts/`
+   - Windows: `C:\Users\USERNAME\AppData\Roaming\Maxon\Maxon Cinema 4D RXXX_XXXXXXXX\library\scripts\`
+
+2. **Start the Socket Server**:
+   - Open Cinema 4D.
+   - Open the Script Manager and Console.
+   - Find and run `cinema4d_socket_plugin.py`.
+   - You should see a message in the console indicating that the socket server has started.
+
+### Claude Desktop Configuration
+
+To configure Claude Desktop, you need to modify its configuration file:
+
+1. **Open the Configuration File**:
+   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+   - Alternatively, use the Settings menu in Claude Desktop (Settings > Developer > Edit Config).
+
+2. **Add MCP Server Configuration**:
+   For development/unpublished server, add the following configuration:
+   ```json
+   "mcpServers": {
+     "cinema4d": {
+       "command": "python3",
+       "args": ["/Users/username/cinema4d-mcp/main.py"]
+     }
+   }
+   ```
+3. **Restart Claude Desktop** after updating the configuration file.
+  <details>
+
+  <summary>[TODO] For published server</summary>
+
+   ```json
+   {
+     "mcpServers": {
+       "cinema4d": {
+         "command": "cinema4d-mcp-wrapper",
+         "args": []
+       }
+     }
+   }
+   ```
+
+   </details>
+
+
+## Usage
+
+1. Ensure the Cinema 4D Socket Server is running.
+2. Open Claude Desktop and look for the hammer icon 🔨 in the input box, indicating MCP tools are available.
+3. Use the available [Tool Commands](#tool-commands) to interact with Cinema 4D through Claude.
+
+## Test directly from the command line
+
+To test the Cinema 4D socket server directly from the command line:
+
+```bash
+python main.py
+```
+---
+You should see output confirming the server's successful start and connection to Cinema 4D.
+
+## Troubleshooting & Debugging
+
+1. Check the log files:
+   ```bash
+   tail -f ~/Library/Logs/Claude/mcp*.log
+   ```
+
+2. Verify Cinema 4D shows connections in its console after you open Claude Desktop.
+
+3. Test the wrapper script directly:
+   ```bash
+   cinema4d-mcp-wrapper
+   ```
+
+4. If there are errors finding the mcp module, install it system-wide:
+   ```bash
+   pip install mcp
+   ```
+
+5. For advanced debugging, use the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+   ```bash
+   npx @modelcontextprotocol/inspector uv --directory /Users/username/cinema4d-mcp run cinema4d-mcp
+   ```
+
+## Project File Structure 
+
+```
+cinema4d-mcp/
+├── .gitignore
+├── LICENSE
+├── README.md
+├── main.py
+├── pyproject.toml
+├── setup.py
+├── bin/
+│   └── cinema4d-mcp-wrapper
+├── c4d_plugins/
+│   └── cinema4d_socket_plugin.py
+├── src/
+│   └── cinema4d_mcp/
+│       ├── __init__.py
+│       ├── server.py
+│       ├── config.py
+│       └── utils.py
+└── tests/
+    └── test_server.py
+```
+
+## Tool Commands
+
+- `add_primitive`: Add a primitive object to the Cinema 4D scene.
+- `apply_material`: Apply a material to an object.
+- `create_material`: Create a new material in Cinema 4D.
+- `execute_python_script`: Execute a Python script in Cinema 4D.
+- `get_scene_info`: Get information about the current Cinema 4D scene.
+- `list_objects`: List all objects in the current Cinema 4D scene.
+- `load_scene`: Load a Cinema 4D scene file.
+- `modify_object`: Modify properties of an existing object.
+- `render_frame`: Render the current frame.
+- `save_scene`: Save the current Cinema 4D scene.
+- `set_keyframe`: Set a keyframe for an object property.
