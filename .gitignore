@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# macOS system files
+.DS_Store
+**/.DS_Store
+
+# IDE settings
+.vscode/
+
+# Package management
+uv.lock

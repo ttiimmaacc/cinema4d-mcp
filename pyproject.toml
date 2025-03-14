@@ -1,10 +1,11 @@
 [project]
 name = "cinema4d-mcp"
 version = "0.1.0"
-description = "a bridge between claude desktop and c4d"
+description = "Cinema 4D MCP Server"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [ "mcp>=1.4.0",]
+dependencies = [ "mcp>=1.4.0", "starlette",]
+
 [[project.authors]]
 name = "ttiimmaacc"
 email = "ttiimmaacc@gmail.com"
