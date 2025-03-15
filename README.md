@@ -53,15 +53,14 @@ chmod +x bin/cinema4d-mcp-wrapper
 
 To set up the Cinema 4D plugin, follow these steps:
 
-1. **Copy the Plugin File**: Copy the `c4d_plugins/cinema4d_socket_plugin.py` file to Cinema 4D's scripts folder. The path varies depending on your operating system:
-   - macOS: `/Users/USERNAME/Library/Preferences/Maxon/Maxon Cinema 4D RXXX_XXXXXXXX/library/scripts/`
-   - Windows: `C:\Users\USERNAME\AppData\Roaming\Maxon\Maxon Cinema 4D RXXX_XXXXXXXX\library\scripts\`
+1. **Copy the Plugin File**: Copy the `c4d_plugins/mcp_server_plugin.pyp` file to Cinema 4D's plugin folder. The path varies depending on your operating system:
+   - macOS: `/Users/USERNAME/Library/Preferences/Maxon/Maxon Cinema 4D/plugins/`
+   - Windows: `C:\Users\USERNAME\AppData\Roaming\Maxon\Maxon Cinema 4D\plugins\`
 
 2. **Start the Socket Server**:
    - Open Cinema 4D.
-   - Open the Script Manager and Console.
-   - Find and run `cinema4d_socket_plugin.py`.
-   - You should see a message in the console indicating that the socket server has started.
+   - Goto Extensins > Socket Server Plugin
+   - You should see a Socket Server Control dialog window. Click Start Server.
 
 ### Claude Desktop Configuration
 
