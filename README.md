@@ -171,9 +171,24 @@ cinema4d-mcp/
 - `create_material`: Create a new material in Cinema 4D.
 - `execute_python_script`: Execute a Python script in Cinema 4D.
 - `get_scene_info`: Get information about the current Cinema 4D scene.
-- `list_objects`: List all objects in the current Cinema 4D scene.
+- `list_objects`: List all objects in the current Cinema 4D scene with hierarchy.
 - `load_scene`: Load a Cinema 4D scene file.
 - `modify_object`: Modify properties of an existing object.
 - `render_frame`: Render the current frame.
 - `save_scene`: Save the current Cinema 4D scene.
 - `set_keyframe`: Set a keyframe for an object property.
+- `create_mograph_cloner`: Create a MoGraph Cloner object (linear, grid, radial).
+- `apply_mograph_fields`: Create and apply a MoGraph Field (spherical, box, etc.).
+- `add_effector`: Add a MoGraph Effector to the scene.
+- `create_light`: Add a light to the scene.
+- `apply_shader`: Create and apply a specialized shader material.
+- `animate_camera`: Create a camera animation.
+- `create_abstract_shape`: Create an organic, abstract shape.
+- `apply_dynamics`: Add dynamics (rigid or soft) to an object.
+
+## Recent Fixes
+
+- Fixed Grid Cloner creation issue by providing correct parameter IDs
+- Fixed MoGraph Fields application by defining proper field type constants
+- Improved hierarchical display in list_objects command
+- Enhanced cloner visibility and creation reliability

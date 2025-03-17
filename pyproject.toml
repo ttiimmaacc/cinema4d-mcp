@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cinema4d-mcp"
-version = "0.1.0"
-description = "Cinema 4D MCP Server for Claude Desktop"
+version = "0.1.2"
+description = "Cinema 4D MCP Server for Claude Desktop with MoGraph support"
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
