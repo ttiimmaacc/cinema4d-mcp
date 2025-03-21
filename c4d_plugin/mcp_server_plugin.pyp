@@ -828,35 +828,92 @@ class C4DSocketServer(threading.Thread):
                     else:
                         self.log("[C4D] Redshift module has no Mmaterial constant")
                     
-                    # Try all possible methods to create a Redshift material
-                    creation_methods = [
-                        ("c4d.ID_REDSHIFT_MATERIAL", lambda: c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)),
-                        ("redshift.Mmaterial", lambda: c4d.BaseMaterial(getattr(redshift, "Mmaterial", c4d.ID_REDSHIFT_MATERIAL))),
-                        ("Direct ID 1036224", lambda: c4d.BaseMaterial(1036224)),
-                        ("Direct ID 1036746", lambda: c4d.BaseMaterial(1036746)),  # Alternative ID seen in some versions
-                        ("redshift.MATERIAL_TYPE", lambda: c4d.BaseMaterial(getattr(redshift, "MATERIAL_TYPE", c4d.ID_REDSHIFT_MATERIAL))),
-                        # Check existing materials to detect Redshift ID
-                        ("Detect from existing materials", self.get_redshift_material_id)
-                    ]
-                    
-                    success = False
-                    for method_name, creator in creation_methods:
-                        try:
-                            self.log(f"[C4D] Trying to create Redshift material using {method_name}")
-                            temp_mat = creator()
-                            if temp_mat:
-                                material_type = temp_mat.GetType()
-                                self.log(f"[C4D] Created material with type ID: {material_type}")
+                    # Use NodeMaterial approach for modern Cinema 4D versions (R24+)
+                    try:
+                        # First try the modern NodeMaterial approach
+                        self.log("[C4D] Trying to create Redshift material using NodeMaterial approach")
+                        import maxon
+                        
+                        # Create a NodeMaterial
+                        mat = c4d.NodeMaterial()
+                        if not mat:
+                            raise Exception("Failed to create NodeMaterial")
+                            
+                        mat.SetName(name)
+                        
+                        # Set the material type to Redshift by setting its node space
+                        rs_nodespace_id = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                        
+                        # Create default graph with proper Redshift nodes
+                        mat.CreateDefaultGraph(rs_nodespace_id)
+                        
+                        # Check if we successfully created a Redshift material
+                        if mat.HasSpace(rs_nodespace_id):
+                            self.log(f"[C4D] Successfully created Redshift NodeMaterial: {name}")
+                            
+                            # Set up the base material properties
+                            try:
+                                # Get the graph and find the standard material node
+                                graph = mat.GetGraph(rs_nodespace_id)
                                 
-                                # Check if this looks like a Redshift material
-                                if material_type >= 1000000:  # Redshift IDs are typically in the 1 million+ range
-                                    mat = temp_mat
-                                    mat.SetName(name)
-                                    self.log(f"[C4D] Successfully created Redshift material: {name}, type ID: {material_type}")
-                                    success = True
-                                    break
-                        except Exception as e:
-                            self.log(f"[C4D] Failed with {method_name}: {str(e)}")
+                                if graph:
+                                    # Find the Standard Surface material node
+                                    root = graph.GetViewRoot()
+                                    if root:
+                                        for node in graph.GetNodes():
+                                            node_id = node.GetId()
+                                            if "StandardMaterial" in str(node_id):
+                                                # Set the base color
+                                                try:
+                                                    node.SetParameter(
+                                                        maxon.nodes.ParameterID("base_color"), 
+                                                        maxon.Color(color[0], color[1], color[2]),
+                                                        maxon.PROPERTYFLAGS_NONE
+                                                    )
+                                                    self.log("[C4D] Set base color for Redshift material")
+                                                    break
+                                                except Exception as e:
+                                                    self.log(f"[C4D] Error setting base color: {str(e)}")
+                            except Exception as e:
+                                self.log(f"[C4D] Error setting material properties: {str(e)}")
+                            
+                            success = True
+                        else:
+                            self.log("[C4D] Failed to create Redshift node space")
+                    except Exception as e:
+                        self.log(f"[C4D] NodeMaterial approach failed: {str(e)}")
+                    
+                    # If NodeMaterial approach failed, try the older methods
+                    if not success:
+                        self.log("[C4D] Falling back to older material creation methods")
+                        
+                        creation_methods = [
+                            ("c4d.ID_REDSHIFT_MATERIAL", lambda: c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)),
+                            ("redshift.Mmaterial", lambda: c4d.BaseMaterial(getattr(redshift, "Mmaterial", c4d.ID_REDSHIFT_MATERIAL))),
+                            ("Direct ID 1036224", lambda: c4d.BaseMaterial(1036224)),
+                            ("Direct ID 1036746", lambda: c4d.BaseMaterial(1036746)),  # Alternative ID seen in some versions
+                            ("redshift.MATERIAL_TYPE", lambda: c4d.BaseMaterial(getattr(redshift, "MATERIAL_TYPE", c4d.ID_REDSHIFT_MATERIAL))),
+                            # Check existing materials to detect Redshift ID
+                            ("Detect from existing materials", self.get_redshift_material_id)
+                        ]
+                        
+                        for method_name, creator in creation_methods:
+                            try:
+                                self.log(f"[C4D] Trying to create Redshift material using {method_name}")
+                                temp_mat = creator()
+                                if temp_mat:
+                                    material_type = temp_mat.GetType()
+                                    self.log(f"[C4D] Created material with type ID: {material_type}")
+                                    
+                                    # Check if this looks like a Redshift material
+                                    if material_type >= 1000000:  # Redshift IDs are typically in the 1 million+ range
+                                        mat = temp_mat
+                                        mat.SetName(name)
+                                        self.log(f"[C4D] Successfully created Redshift material: {name}, type ID: {material_type}")
+                                        success = True
+                                        break
+                            except Exception as e:
+                                self.log(f"[C4D] Failed with {method_name}: {str(e)}")
                     
                     if not success:
                         self.log("[C4D] All Redshift material creation methods failed, falling back to standard material")
@@ -2284,20 +2341,177 @@ class C4DSocketServer(threading.Thread):
                 ):
                     shader[c4d.SLA_GRADIENT_INTERPOLATION] = parameters["interpolation"]
 
-            # Assign the shader to the material channel
-            mat[channel_id] = shader
+            # Check if this is a NodeMaterial-based Redshift material
+            is_node_material = False
+            try:
+                import maxon
+                if isinstance(mat, c4d.NodeMaterial) or hasattr(mat, "GetGraph"):
+                    # This is a modern node-based material
+                    rs_nodespace_id = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                    if mat.HasSpace(rs_nodespace_id):
+                        is_node_material = True
+                        self.log("[C4D] Detected NodeMaterial-based Redshift material")
+                        
+                        # Get the material graph
+                        graph = mat.GetGraph(rs_nodespace_id)
+                        if graph:
+                            # Handle shader creation in the node graph
+                            with graph.BeginTransaction() as transaction:
+                                try:
+                                    # Find the material node (Standard Surface)
+                                    material_node = None
+                                    for node in graph.GetNodes():
+                                        if "StandardMaterial" in str(node.GetId()):
+                                            material_node = node
+                                            break
+                                    
+                                    if material_node:
+                                        # Create appropriate shader node based on shader type
+                                        if shader_type == "noise":
+                                            # Create noise texture node
+                                            shader_node = graph.AddChild(
+                                                maxon.Id(),  # Auto-generate ID
+                                                maxon.Id("com.redshift3d.redshift4c4d.nodes.core.texturesampler")
+                                            )
+                                            
+                                            if shader_node:
+                                                # Set noise type
+                                                shader_node.SetParameter(
+                                                    maxon.nodes.ParameterID("tex0_tex"), 
+                                                    4,  # 4 = Noise for Redshift
+                                                    maxon.PROPERTYFLAGS_NONE
+                                                )
+                                                
+                                                # Configure noise parameters
+                                                if "scale" in parameters:
+                                                    try:
+                                                        shader_node.SetParameter(
+                                                            maxon.nodes.ParameterID("noise_scale"),
+                                                            float(parameters["scale"]),
+                                                            maxon.PROPERTYFLAGS_NONE
+                                                        )
+                                                    except:
+                                                        pass
+                                                        
+                                                # Connect to appropriate channel
+                                                if channel == "color":
+                                                    # Connect to base color
+                                                    graph.CreateConnection(
+                                                        shader_node.GetOutputs().FindChild("outcolor"),
+                                                        material_node.GetInputs().FindChild("base_color")
+                                                    )
+                                                elif channel == "reflection":
+                                                    # Connect to reflection
+                                                    graph.CreateConnection(
+                                                        shader_node.GetOutputs().FindChild("outcolor"),
+                                                        material_node.GetInputs().FindChild("refl_color")
+                                                    )
+                                                
+                                                self.log(f"[C4D] Successfully added {shader_type} node to Redshift material")
+                                        
+                                        elif shader_type == "gradient":
+                                            # Create gradient texture node
+                                            shader_node = graph.AddChild(
+                                                maxon.Id(),  # Auto-generate ID
+                                                maxon.Id("com.redshift3d.redshift4c4d.nodes.core.texturesampler")
+                                            )
+                                            
+                                            if shader_node:
+                                                # Set gradient type
+                                                shader_node.SetParameter(
+                                                    maxon.nodes.ParameterID("tex0_tex"), 
+                                                    2,  # 2 = Gradient for Redshift
+                                                    maxon.PROPERTYFLAGS_NONE
+                                                )
+                                                
+                                                # Connect to appropriate channel
+                                                if channel == "color":
+                                                    # Connect to base color
+                                                    graph.CreateConnection(
+                                                        shader_node.GetOutputs().FindChild("outcolor"),
+                                                        material_node.GetInputs().FindChild("base_color")
+                                                    )
+                                                    
+                                                self.log(f"[C4D] Successfully added {shader_type} node to Redshift material")
+                                        
+                                        elif shader_type == "fresnel":
+                                            # Create Redshift's Fresnel node instead of C4D's Fresnel shader
+                                            try:
+                                                self.log("[C4D] Creating Redshift native Fresnel node")
+                                                # Use Redshift's Fresnel node
+                                                fresnel_node = graph.AddChild(
+                                                    maxon.Id(),  # Auto-generate ID
+                                                    maxon.Id("com.redshift3d.redshift4c4d.nodes.core.fresnel")
+                                                )
+                                                
+                                                if fresnel_node:
+                                                    # Set Fresnel parameters if available
+                                                    if "ior" in parameters:
+                                                        try:
+                                                            fresnel_node.SetParameter(
+                                                                maxon.nodes.ParameterID("ior"),
+                                                                float(parameters["ior"]),
+                                                                maxon.PROPERTYFLAGS_NONE
+                                                            )
+                                                        except Exception as e:
+                                                            self.log(f"[C4D] Error setting Fresnel IOR: {str(e)}")
+                                                    
+                                                    # Connect to appropriate channel based on intended use
+                                                    if channel == "reflection":
+                                                        # Use Fresnel for reflection
+                                                        graph.CreateConnection(
+                                                            fresnel_node.GetOutputs().FindChild("out"),
+                                                            material_node.GetInputs().FindChild("refl_weight")
+                                                        )
+                                                    elif channel == "color":
+                                                        # Need a color correction node to convert Fresnel output to color
+                                                        color_node = graph.AddChild(
+                                                            maxon.Id(),
+                                                            maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection")
+                                                        )
+                                                        
+                                                        if color_node:
+                                                            # Connect Fresnel to color correction
+                                                            graph.CreateConnection(
+                                                                fresnel_node.GetOutputs().FindChild("out"),
+                                                                color_node.GetInputs().FindChild("input")
+                                                            )
+                                                            
+                                                            # Connect color correction to material
+                                                            graph.CreateConnection(
+                                                                color_node.GetOutputs().FindChild("out"),
+                                                                material_node.GetInputs().FindChild("base_color")
+                                                            )
+                                                    
+                                                    self.log("[C4D] Successfully added Redshift Fresnel node")
+                                            except Exception as e:
+                                                self.log(f"[C4D] Error creating Redshift Fresnel node: {str(e)}")
+                                    
+                                    transaction.Commit()
+                                except Exception as e:
+                                    self.log(f"[C4D] Error creating Redshift shader node: {str(e)}")
+                                    transaction.Rollback()
+                                    is_node_material = False  # Fall back to traditional approach
+            except Exception as e:
+                self.log(f"[C4D] Error working with NodeMaterial: {str(e)}")
+                is_node_material = False
 
-            # Enable the appropriate channel
-            channel_enable_map = {
-                "color": c4d.MATERIAL_USE_COLOR,
-                "luminance": c4d.MATERIAL_USE_LUMINANCE,
-                "transparency": c4d.MATERIAL_USE_TRANSPARENCY,
-                "reflection": c4d.MATERIAL_USE_REFLECTION,
-            }
-            if channel in channel_enable_map:
-                enable_id = channel_enable_map.get(channel)
-                if enable_id is not None:
-                    mat[enable_id] = True
+            # For standard materials or if node material handling failed, use traditional approach
+            if not is_node_material:
+                # Assign the shader to the material channel using traditional approach
+                mat[channel_id] = shader
+
+                # Enable the appropriate channel
+                channel_enable_map = {
+                    "color": c4d.MATERIAL_USE_COLOR,
+                    "luminance": c4d.MATERIAL_USE_LUMINANCE,
+                    "transparency": c4d.MATERIAL_USE_TRANSPARENCY,
+                    "reflection": c4d.MATERIAL_USE_REFLECTION,
+                }
+                if channel in channel_enable_map:
+                    enable_id = channel_enable_map.get(channel)
+                    if enable_id is not None:
+                        mat[enable_id] = True
 
             # Update the material
             mat.Update(True, True)

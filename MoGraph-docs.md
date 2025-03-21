@@ -533,13 +533,28 @@ The Fresnel shader (ID 5837) is known to cause issues in Cinema 4D when applied 
 BaseException: the plugin 'c4d.BaseShader' (ID 5837) is missing. Could not allocate instance
 ```
 
-This indicates the Fresnel shader plugin is not available or properly registered in your Cinema 4D installation. The MCP plugin has been updated to handle this error gracefully with proper error messages instead of closing the connection.
+This indicates the Fresnel shader plugin is not available or properly registered in your Cinema 4D installation. 
 
-When you need Fresnel functionality, consider these alternatives:
+The plugin now automatically handles this issue by:
 
-1. Use Redshift's native Fresnel node instead of the standard C4D Fresnel shader
-2. Create a custom shader network that mimics Fresnel functionality
-3. Use the Reflectance channel with Fresnel settings instead of a Fresnel shader
+1. For standard C4D materials: Providing proper error handling to prevent connection closure
+2. For Redshift materials: Using Redshift's native Fresnel node instead of C4D's Fresnel shader
+
+The MCP plugin now intelligently detects if a material is a modern NodeMaterial-based Redshift material and uses the appropriate approach:
+
+```json
+{
+  "command": "apply_shader",
+  "material_name": "MyRedshiftMaterial",
+  "shader_type": "fresnel",
+  "channel": "reflection",
+  "parameters": {
+    "ior": 1.5
+  }
+}
+```
+
+This will create a proper Redshift Fresnel node and connect it to the reflection weight input of the material.
 
 ### Material Type Detection
 
@@ -595,14 +610,45 @@ The response will now include the actual material type ID to verify it was creat
 }
 ```
 
-### Robust Material Creation
+### Modern NodeMaterial Approach
 
-The MCP plugin now uses a sophisticated approach to create proper Redshift materials:
+The plugin now uses the modern NodeMaterial API (introduced in Cinema 4D R24) for creating Redshift materials:
 
-1. Tries multiple different methods to create Redshift materials
-2. Logs detailed debugging information about material types
-3. Can detect Redshift material IDs from existing materials in the scene
-4. Falls back to direct numeric ID creation if needed
+```python
+# Modern approach for creating Redshift materials
+import c4d
+import maxon
+
+# Create a node-based material
+mat = c4d.NodeMaterial()
+mat.SetName("ModernRedshiftMaterial")
+
+# Set up Redshift node space
+rs_nodespace_id = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+mat.CreateDefaultGraph(rs_nodespace_id)
+
+# Get the material graph and modify nodes
+graph = mat.GetGraph(rs_nodespace_id)
+if graph:
+    # Now you can use the node graph API
+    with graph.BeginTransaction() as transaction:
+        # Add nodes, create connections, etc.
+        transaction.Commit()
+
+# Insert the material
+doc.InsertMaterial(mat)
+c4d.EventAdd()
+```
+
+### Multi-tier Fallback Approach
+
+The MCP plugin now uses a sophisticated multi-tier approach to create proper Redshift materials:
+
+1. First tries the modern NodeMaterial approach (R24+)
+2. Falls back to multiple legacy methods if that fails
+3. Logs detailed debugging information about material types
+4. Can detect Redshift material IDs from existing materials in the scene
+5. Provides intelligent shader handling based on material type
 
 You can verify the material types in your scene using the validation command:
 
