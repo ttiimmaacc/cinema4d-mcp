@@ -225,6 +225,8 @@ class C4DSocketServer(threading.Thread):
                             response = self.handle_apply_shader(command)
                         elif command_type == "animate_camera":
                             response = self.handle_animate_camera(command)
+                        elif command["command"] == "validate_redshift_materials":
+                            response = self.handle_validate_redshift_materials(command)
                         else:
                             response = {"error": f"Unknown command: {command_type}"}
 
@@ -797,32 +799,164 @@ class C4DSocketServer(threading.Thread):
         name = command.get("name") or command.get("material_name") or "New Material"
         color = command.get("color", [1, 1, 1])
         properties = command.get("properties", {})
+        
+        # Check various ways to specify a Redshift material type
+        material_type = command.get("material_type", "standard")  # standard, redshift
+        if material_type == "standard" and properties.get("type") in ["redshift", "redshift_node"]:
+            material_type = "redshift"
+            self.log(f"[C4D] Using Redshift material type from properties")
+        
+        # Another common pattern is to specify material_type as a key in properties
+        if material_type == "standard" and "redshift" in properties.get("material_type", "").lower():
+            material_type = "redshift"
+            self.log(f"[C4D] Using Redshift material type from properties.material_type")
+            
+        procedural = command.get("procedural", False)  # use procedural shaders
+        shader_type = command.get(
+            "shader_type", "noise"
+        )  # noise, checker, gradient, etc.
+        
+        self.log(f"[C4D] Creating {material_type} material: {name}")
 
         try:
-            # Create a new standard material
-            mat = c4d.BaseMaterial(c4d.Mmaterial)
-            mat.SetName(name)
+            mat = None
+            material_id = f"mat_{name}_{int(time.time())}"
 
-            # Set base color
-            if len(color) >= 3:
-                color_vector = c4d.Vector(color[0], color[1], color[2])
-                mat[c4d.MATERIAL_COLOR_COLOR] = color_vector
-
-            # Apply additional properties (if needed)
+            # Check if we should create a Redshift material
             if (
-                "specular" in properties
-                and isinstance(properties["specular"], list)
-                and len(properties["specular"]) >= 3
+                material_type == "redshift"
+                and hasattr(c4d, "modules")
+                and hasattr(c4d.modules, "redshift")
             ):
-                spec = properties["specular"]
-                mat[c4d.MATERIAL_SPECULAR_COLOR] = c4d.Vector(spec[0], spec[1], spec[2])
+                try:
+                    redshift = c4d.modules.redshift
 
-            if "reflection" in properties and isinstance(
-                properties["reflection"], (int, float)
-            ):
-                mat[c4d.MATERIAL_REFLECTION_BRIGHTNESS] = float(
-                    properties["reflection"]
-                )
+                    # Create a true Redshift node material
+                    mat = c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)
+                    if not mat:
+                        self.log("[C4D] Failed to create Redshift material, falling back to standard material")
+                        raise Exception("Failed to create Redshift material")
+                    
+                    mat.SetName(name)
+                    self.log(f"[C4D] Created Redshift material: {name}, type ID: {mat.GetType()}")
+                    
+                    # Use CreateDefaultGraph for reliable material setup
+                    try:
+                        import maxon
+                        rs_nodespace_id = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                        mat.CreateDefaultGraph(rs_nodespace_id)
+                    except Exception as e:
+                        print(f"[C4D] Error creating default graph: {str(e)}")
+                    
+                    # Access the material graph
+                    node_space = redshift.GetRSMaterialNodeSpace(mat)
+                    root = redshift.GetRSMaterialRootShader(mat)
+                    
+                    if root is None:
+                        raise Exception("Failed to get Redshift root shader")
+
+                    if procedural:
+                        # Create procedural nodes based on shader type
+                        if shader_type == "noise":
+                            proc_shader = redshift.RSMaterialNodeCreator.CreateNode(
+                                node_space,
+                                redshift.RSMaterialNodeType.TEXTURE,
+                                "RS::TextureNode",
+                            )
+                            proc_shader[redshift.TEXTURE_TYPE] = redshift.TEXTURE_NOISE
+                        elif shader_type == "checker":
+                            proc_shader = redshift.RSMaterialNodeCreator.CreateNode(
+                                node_space,
+                                redshift.RSMaterialNodeType.TEXTURE,
+                                "RS::TextureNode",
+                            )
+                            proc_shader[redshift.TEXTURE_TYPE] = (
+                                redshift.TEXTURE_CHECKER
+                            )
+                        elif shader_type == "gradient":
+                            proc_shader = redshift.RSMaterialNodeCreator.CreateNode(
+                                node_space,
+                                redshift.RSMaterialNodeType.TEXTURE,
+                                "RS::TextureNode",
+                            )
+                            proc_shader[redshift.TEXTURE_TYPE] = (
+                                redshift.TEXTURE_GRADIENT
+                            )
+                        else:
+                            # Default to noise
+                            proc_shader = redshift.RSMaterialNodeCreator.CreateNode(
+                                node_space,
+                                redshift.RSMaterialNodeType.TEXTURE,
+                                "RS::TextureNode",
+                            )
+                            proc_shader[redshift.TEXTURE_TYPE] = redshift.TEXTURE_NOISE
+
+                        # Create a color correction node to apply the base color
+                        color_correct = redshift.RSMaterialNodeCreator.CreateNode(
+                            node_space,
+                            redshift.RSMaterialNodeType.COLOR,
+                            "RS::ColorCorrect",
+                        )
+                        color_correct[redshift.COLOR_CORRECT_TINT_COLOR] = c4d.Vector(
+                            color[0], color[1], color[2]
+                        )
+
+                        # Connect nodes: procedural -> color correct -> output
+                        redshift.CreateConnectionBetweenNodes(
+                            node_space, proc_shader, "outcolor", color_correct, "input"
+                        )
+                        redshift.CreateConnectionBetweenNodes(
+                            node_space, color_correct, "outcolor", root, "diffuse_color"
+                        )
+
+                    else:
+                        # Set base color directly
+                        root[redshift.OUTPUT_COLOR] = c4d.Vector(
+                            color[0], color[1], color[2]
+                        )
+
+                    # Apply additional Redshift-specific properties
+                    rs_properties = properties.get("redshift", {})
+                    for prop, value in rs_properties.items():
+                        try:
+                            # Apply to root shader
+                            root[prop] = value
+                        except:
+                            print(f"[C4D] Could not set Redshift property {prop}")
+
+                except Exception as e:
+                    print(f"[C4D] Error creating Redshift material: {str(e)}")
+                    # Fall back to standard material
+                    material_type = "standard"
+                    mat = None
+
+            # Create standard material if not Redshift or if Redshift failed
+            if material_type != "redshift" or mat is None:
+                mat = c4d.BaseMaterial(c4d.Mmaterial)
+                mat.SetName(name)
+
+                # Set base color
+                if len(color) >= 3:
+                    color_vector = c4d.Vector(color[0], color[1], color[2])
+                    mat[c4d.MATERIAL_COLOR_COLOR] = color_vector
+
+                # Apply additional properties (if needed)
+                if (
+                    "specular" in properties
+                    and isinstance(properties["specular"], list)
+                    and len(properties["specular"]) >= 3
+                ):
+                    spec = properties["specular"]
+                    mat[c4d.MATERIAL_SPECULAR_COLOR] = c4d.Vector(
+                        spec[0], spec[1], spec[2]
+                    )
+
+                if "reflection" in properties and isinstance(
+                    properties["reflection"], (int, float)
+                ):
+                    mat[c4d.MATERIAL_REFLECTION_BRIGHTNESS] = float(
+                        properties["reflection"]
+                    )
 
             # Insert material into document
             doc.InsertMaterial(mat)
@@ -831,15 +965,24 @@ class C4DSocketServer(threading.Thread):
             # Update the document
             c4d.EventAdd()
 
-            # Generate a unique ID as a string since materials don't have GetGUID
-            # Using their name and a timestamp instead
-            material_id = f"mat_{name}_{int(time.time())}"
+            # Determine material color for response (might be different for Redshift materials)
+            if material_type == "redshift":
+                material_color = color  # Use the requested color since getting from node graph is complex
+            else:
+                material_color = [
+                    mat[c4d.MATERIAL_COLOR_COLOR].x,
+                    mat[c4d.MATERIAL_COLOR_COLOR].y,
+                    mat[c4d.MATERIAL_COLOR_COLOR].z,
+                ]
 
             return {
                 "material": {
                     "name": mat.GetName(),  # Exact Cinema 4D material name
                     "id": material_id,  # Your internal ID (if needed)
-                    "color": color,  # Actual material color (RGB)
+                    "color": material_color,  # Actual material color (RGB)
+                    "type": material_type,
+                    "material_type_id": mat.GetType(),  # Return actual material type ID for verification
+                    "procedural": procedural if material_type == "redshift" else False,
                 }
             }
         except Exception as e:
@@ -850,6 +993,12 @@ class C4DSocketServer(threading.Thread):
         doc = c4d.documents.GetActiveDocument()
         material_name = command.get("material_name", "")
         object_name = command.get("object_name", "")
+        material_type = command.get("material_type", "standard")  # standard, redshift
+        projection_type = command.get(
+            "projection_type", "cubic"
+        )  # cubic, spherical, flat, etc.
+        auto_uv = command.get("auto_uv", False)  # generate UVs automatically
+        procedural = command.get("procedural", False)  # use procedural shaders
 
         # Find the object
         obj = self.find_object_by_name(doc, object_name)
@@ -866,8 +1015,116 @@ class C4DSocketServer(threading.Thread):
             tag = c4d.TextureTag()
             tag.SetMaterial(mat)
 
+            # Set projection type
+            if projection_type == "cubic":
+                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_CUBIC
+            elif projection_type == "spherical":
+                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_SPHERICAL
+            elif projection_type == "flat":
+                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_FLAT
+            elif projection_type == "cylindrical":
+                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_CYLINDRICAL
+            elif projection_type == "frontal":
+                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_FRONTAL
+            elif projection_type == "uvw":
+                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_UVW
+
             # Add the tag to the object
             obj.InsertTag(tag)
+
+            # Generate UVs automatically if needed
+            if auto_uv:
+                try:
+                    # Create UVW tag if none exists
+                    uvw_tag = obj.GetTag(c4d.Tuvw)
+                    if not uvw_tag:
+                        uvw_tag = c4d.UVWTag(obj.GetPolygonCount())
+                        obj.InsertTag(uvw_tag)
+
+                    # Create a temporary UVW mapping object
+                    uvw_obj = c4d.BaseObject(c4d.Ouvw)
+                    doc.InsertObject(uvw_obj)
+
+                    # Set source object
+                    uvw_obj[c4d.UVWMAPPING_MAPPING] = c4d.UVWMAPPING_MAPPING_CUBIC
+                    uvw_obj[c4d.UVWMAPPING_PROJECTION] = c4d.UVWMAPPING_PROJECTION_CUBIC
+                    uvw_obj[c4d.UVWMAPPING_TISOCPIC] = True
+                    uvw_obj[c4d.UVWMAPPING_FITSIZE] = True
+
+                    # Set the selection object
+                    selection = c4d.InExcludeData()
+                    selection.InsertObject(obj, 1)
+                    uvw_obj[c4d.UVWMAPPING_SELECTION] = selection
+
+                    # Generate UVs
+                    c4d.CallButton(uvw_obj, c4d.UVWMAPPING_GENERATE)
+
+                    # Remove temp object
+                    doc.RemoveObject(uvw_obj)
+                except Exception as e:
+                    print(f"[C4D] Error creating UVs: {str(e)}")
+
+            # Handle Redshift material setup if needed
+            if (
+                material_type == "redshift"
+                and hasattr(c4d, "modules")
+                and hasattr(c4d.modules, "redshift")
+            ):
+                try:
+                    redshift = c4d.modules.redshift
+
+                    # Try to convert material to Redshift if it's not already
+                    if mat.GetType() != c4d.ID_REDSHIFT_MATERIAL:
+                        # Create new Redshift material
+                        rs_mat = c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)
+                        rs_mat.SetName(f"RS_{mat.GetName()}")
+
+                        # Copy basic material properties like color
+                        color = mat[c4d.MATERIAL_COLOR_COLOR]
+                        
+                        # Use CreateDefaultGraph for reliable material setup
+                        try:
+                            import maxon
+                            rs_nodespace_id = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                            rs_mat.CreateDefaultGraph(rs_nodespace_id)
+                        except Exception as e:
+                            print(f"[C4D] Error creating default graph: {str(e)}")
+
+                        # Access the Redshift material graph
+                        node_space = redshift.GetRSMaterialNodeSpace(rs_mat)
+                        root = redshift.GetRSMaterialRootShader(rs_mat)
+                        
+                        if root is None:
+                            raise Exception("Failed to get Redshift root shader")
+
+                        if procedural:
+                            # Create procedural texture nodes
+                            noise_shader = redshift.RSMaterialNodeCreator.CreateNode(
+                                node_space,
+                                redshift.RSMaterialNodeType.TEXTURE,
+                                "RS::TextureNode",
+                            )
+                            noise_shader[redshift.TEXTURE_TYPE] = redshift.TEXTURE_NOISE
+
+                            # Connect procedural texture to output
+                            redshift.CreateConnectionBetweenNodes(
+                                node_space,
+                                noise_shader,
+                                "outcolor",
+                                root,
+                                "diffuse_color",
+                            )
+                        else:
+                            # Set color directly
+                            root[redshift.OUTPUT_COLOR] = color
+
+                        # Insert new material
+                        doc.InsertMaterial(rs_mat)
+
+                        # Update the tag to use the new material
+                        tag.SetMaterial(rs_mat)
+                except Exception as e:
+                    print(f"[C4D] Error setting up Redshift material: {str(e)}")
 
             # Update the document
             c4d.EventAdd()
@@ -875,6 +1132,8 @@ class C4DSocketServer(threading.Thread):
             return {
                 "success": True,
                 "message": f"Applied material '{material_name}' to object '{object_name}'",
+                "material_type": material_type,
+                "auto_uv": auto_uv,
             }
         except Exception as e:
             return {"error": f"Failed to apply material: {str(e)}"}
@@ -1100,48 +1359,6 @@ class C4DSocketServer(threading.Thread):
             }
         except Exception as e:
             return {"error": f"Failed to set keyframe: {str(e)}"}
-
-    def set_position_keyframe(self, obj, frame, position):
-        """Set a keyframe for the object's position."""
-        doc = c4d.documents.GetActiveDocument()
-        fps = doc.GetFps()
-        track_ids = [
-            ("position.x", position[0]),
-            ("position.y", position[1]),
-            ("position.z", position[2]),
-        ]
-
-        for prop_name, value in track_ids:
-            desc_id = {
-                "position.x": c4d.DescID(
-                    c4d.DescLevel(c4d.ID_BASEOBJECT_POSITION, c4d.DTYPE_VECTOR, 0),
-                    c4d.DescLevel(c4d.VECTOR_X, c4d.DTYPE_REAL, 0),
-                ),
-                "position.y": c4d.DescID(
-                    c4d.DescLevel(c4d.ID_BASEOBJECT_POSITION, c4d.DTYPE_VECTOR, 0),
-                    c4d.DescLevel(c4d.VECTOR_Y, c4d.DTYPE_REAL, 0),
-                ),
-                "position.z": c4d.DescID(
-                    c4d.DescLevel(c4d.ID_BASEOBJECT_POSITION, c4d.DTYPE_VECTOR, 0),
-                    c4d.DescLevel(c4d.VECTOR_Z, c4d.DTYPE_REAL, 0),
-                ),
-            }[prop_name]
-
-            track = obj.FindCTrack(desc_id)
-            if not track:
-                track = c4d.CTrack(obj, desc_id)
-                obj.InsertTrackSorted(track)
-
-            curve = track.GetCurve()
-            key_dict = curve.AddKey(c4d.BaseTime(frame, fps))
-            if key_dict is None:
-                self.log(f"Failed to add keyframe for {prop_name}")
-                continue
-
-            key = key_dict["key"]
-            key.SetValue(curve, value)
-
-        c4d.EventAdd()
 
     def handle_save_scene(self, command):
         """Handle save_scene command with main thread execution and proper timeout handling."""
@@ -1412,7 +1629,7 @@ class C4DSocketServer(threading.Thread):
                     MG_GRID_COUNT_Y = 1002
                     MG_GRID_COUNT_Z = 1003
                     MG_GRID_SIZE = 1010
-                    
+
                     cloner[MG_GRID_COUNT_X] = grid_dim
                     cloner[MG_GRID_COUNT_Y] = grid_dim
                     cloner[MG_GRID_COUNT_Z] = grid_dim
@@ -1510,26 +1727,26 @@ class C4DSocketServer(threading.Thread):
                 # Step 1: Map field type to proper SDK constants
                 # Define these manually if not available in the SDK
                 # Based on MoGraph documentation in R2025, these are the correct IDs
-                Fsphere = 1039384     # Spherical Field
-                Fbox = 1039385        # Box Field
-                Fcylinder = 1039386   # Cylindrical Field  
-                Ftorus = 1039387      # Torus Field
-                Fcone = 1039388       # Cone Field
-                Flinear = 1039389     # Linear Field
-                Fradial = 1039390     # Radial Field
-                Fsound = 1039391      # Sound Field
-                Fnoise = 1039394      # Noise Field
-                
+                Fsphere = 1039384  # Spherical Field
+                Fbox = 1039385  # Box Field
+                Fcylinder = 1039386  # Cylindrical Field
+                Ftorus = 1039387  # Torus Field
+                Fcone = 1039388  # Cone Field
+                Flinear = 1039389  # Linear Field
+                Fradial = 1039390  # Radial Field
+                Fsound = 1039391  # Sound Field
+                Fnoise = 1039394  # Noise Field
+
                 field_constants = {
-                    "spherical": Fsphere,        # Spherical Field 
-                    "box": Fbox,                 # Box Field
-                    "cylindrical": Fcylinder,    # Cylindrical Field
-                    "torus": Ftorus,             # Torus Field
-                    "cone": Fcone,               # Cone Field
-                    "linear": Flinear,           # Linear Field
-                    "radial": Fradial,           # Radial Field
-                    "sound": Fsound,             # Sound Field
-                    "noise": Fnoise,             # Noise Field
+                    "spherical": Fsphere,  # Spherical Field
+                    "box": Fbox,  # Box Field
+                    "cylindrical": Fcylinder,  # Cylindrical Field
+                    "torus": Ftorus,  # Torus Field
+                    "cone": Fcone,  # Cone Field
+                    "linear": Flinear,  # Linear Field
+                    "radial": Fradial,  # Radial Field
+                    "sound": Fsound,  # Sound Field
+                    "noise": Fnoise,  # Noise Field
                 }
 
                 # Get the proper field type constant or default to spherical
@@ -2022,11 +2239,20 @@ class C4DSocketServer(threading.Thread):
                 channel, c4d.MATERIAL_COLOR_SHADER
             )  # Default to color
 
-            # Create the shader
-            shader = c4d.BaseShader(shader_type_id)
-            if shader is None:
-                self.log(f"[C4D] Failed to create {shader_type} shader")
-                return {"error": f"Failed to create {shader_type} shader"}
+            # Create the shader with proper error handling for missing plugins
+            try:
+                # Check first if we're trying to apply a fresnel shader, which is known to be problematic
+                if shader_type == "fresnel":
+                    # Log a warning about the fresnel shader
+                    self.log(f"[C4D] Warning: Fresnel shader (ID {shader_type_id}) may not be available in this installation")
+                    
+                shader = c4d.BaseShader(shader_type_id)
+                if shader is None:
+                    self.log(f"[C4D] Failed to create {shader_type} shader")
+                    return {"error": f"Failed to create {shader_type} shader"}
+            except Exception as shader_error:
+                self.log(f"[C4D] Error creating shader: {str(shader_error)}")
+                return {"error": f"Failed to create {shader_type} shader: {str(shader_error)}"}
 
             # Set parameters for the shader
             if shader_type == "noise":
@@ -2613,6 +2839,263 @@ class C4DSocketServer(threading.Thread):
             self.log(f"[C4D] Available materials: {', '.join(material_names)}")
 
         return None
+
+    def handle_validate_redshift_materials(self, command):
+        """Validate Redshift node materials in the scene and fix issues when possible."""
+        import maxon
+        
+        warnings = []
+        fixes = []
+        doc = c4d.documents.GetActiveDocument()
+        
+        try:
+            # Get the Redshift node space ID
+            redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+            
+            # Count of materials by type
+            mat_stats = {
+                "total": 0,
+                "redshift": 0,
+                "standard": 0, 
+                "fixed": 0,
+                "issues": 0
+            }
+            
+            # Validate all materials in the document
+            for mat in doc.GetMaterials():
+                mat_stats["total"] += 1
+                name = mat.GetName()
+                
+                # Check if it's a Redshift node material (should be c4d.ID_REDSHIFT_MATERIAL)
+                is_rs_material = (mat.GetType() == c4d.ID_REDSHIFT_MATERIAL)
+                
+                if not is_rs_material:
+                    warnings.append(f"ℹ️ '{name}': Not a Redshift node material (type: {mat.GetType()}).")
+                    mat_stats["standard"] += 1
+                    
+                    # Auto-fix option: convert standard materials to Redshift if requested
+                    if command.get("auto_convert", False):
+                        try:
+                            # Create new Redshift material
+                            rs_mat = c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)
+                            rs_mat.SetName(f"RS_{name}")
+                            
+                            # Copy basic properties
+                            color = mat[c4d.MATERIAL_COLOR_COLOR]
+                            
+                            # Set up default graph using CreateDefaultGraph
+                            try:
+                                rs_mat.CreateDefaultGraph(redshift_ns)
+                            except Exception as e:
+                                warnings.append(f"⚠️ Error creating default graph for '{name}': {str(e)}")
+                                # Continue anyway and try to work with what we have
+                            
+                            # Get the graph and root
+                            graph = rs_mat.GetGraph(redshift_ns)
+                            root = graph.GetRoot()
+                            
+                            # Find the Standard Surface output
+                            for node in graph.GetNodes():
+                                if "StandardMaterial" in node.GetId():
+                                    # Set diffuse color
+                                    try:
+                                        node.SetParameter(
+                                            maxon.nodes.ParameterID("base_color"), 
+                                            maxon.Color(color.x, color.y, color.z),
+                                            maxon.PROPERTYFLAGS_NONE
+                                        )
+                                    except:
+                                        pass
+                                    break
+                            
+                            # Insert the new material
+                            doc.InsertMaterial(rs_mat)
+                            
+                            # Find and update texture tags
+                            if command.get("update_references", False):
+                                obj = doc.GetFirstObject()
+                                while obj:
+                                    tag = obj.GetFirstTag()
+                                    while tag:
+                                        if tag.GetType() == c4d.Ttexture:
+                                            if tag[c4d.TEXTURETAG_MATERIAL] == mat:
+                                                tag[c4d.TEXTURETAG_MATERIAL] = rs_mat
+                                        tag = tag.GetNext()
+                                    obj = obj.GetNext()
+                            
+                            fixes.append(f"✅ Converted '{name}' to Redshift node material.")
+                            mat_stats["fixed"] += 1
+                        except Exception as e:
+                            warnings.append(f"❌ Failed to convert '{name}': {str(e)}")
+                    
+                    continue
+                
+                # For Redshift materials, continue with validation
+                if is_rs_material:
+                    # It's a confirmed Redshift material
+                    mat_stats["redshift"] += 1
+                    
+                    # Check if it's using the Redshift node space
+                    if hasattr(mat, 'GetNodeMaterialSpace') and mat.GetNodeMaterialSpace() != redshift_ns:
+                        warnings.append(f"⚠️ '{name}': Redshift material but not using correct node space.")
+                        mat_stats["issues"] += 1
+                        continue
+                else:
+                    # Skip further validation for non-Redshift materials
+                    continue
+                
+                # Validate the node graph
+                graph = mat.GetGraph(redshift_ns)
+                if not graph:
+                    warnings.append(f"❌ '{name}': No node graph.")
+                    mat_stats["issues"] += 1
+                    
+                    # Try to fix by creating a default graph
+                    if command.get("auto_fix", False):
+                        try:
+                            mat.CreateDefaultGraph(redshift_ns)
+                            fixes.append(f"✅ Created default graph for '{name}'.")
+                            mat_stats["fixed"] += 1
+                        except Exception as e:
+                            warnings.append(f"❌ Could not create default graph for '{name}': {str(e)}")
+                    
+                    continue
+                
+                # Check the root node connections
+                root = graph.GetRoot()
+                if not root:
+                    warnings.append(f"❌ '{name}': No root node in graph.")
+                    mat_stats["issues"] += 1
+                    continue
+                
+                # Check if we have inputs
+                inputs = root.GetInputs()
+                if not inputs or len(inputs) == 0:
+                    warnings.append(f"❌ '{name}': Root has no input ports.")
+                    mat_stats["issues"] += 1
+                    continue
+                
+                # Check the output connection
+                output_port = inputs[0]  # First input is typically the main output
+                output_node = output_port.GetDestination()
+                
+                if not output_node:
+                    warnings.append(f"⚠️ '{name}': Output not connected.")
+                    mat_stats["issues"] += 1
+                    
+                    # Try to fix by creating a Standard Surface node
+                    if command.get("auto_fix", False):
+                        try:
+                            # Create Standard Surface node
+                            standard_surface = graph.CreateNode(maxon.nodes.IdAndVersion("com.redshift3d.redshift4c4d.nodes.core.standardmaterial"))
+                            
+                            # Connect to output
+                            graph.CreateConnection(
+                                standard_surface.GetOutputs()[0],  # Surface output
+                                root.GetInputs()[0]  # Surface input on root
+                            )
+                            
+                            fixes.append(f"✅ Added Standard Surface node to '{name}'.")
+                            mat_stats["fixed"] += 1
+                        except Exception as e:
+                            warnings.append(f"❌ Could not add Standard Surface to '{name}': {str(e)}")
+                    
+                    continue
+                
+                # Check that the output is connected to a Redshift Material node (Standard Surface, etc.)
+                if "StandardMaterial" not in output_node.GetId() and "Material" not in output_node.GetId():
+                    warnings.append(f"❌ '{name}': Output not connected to a Redshift Material node.")
+                    mat_stats["issues"] += 1
+                    continue
+                
+                # Now check specific material inputs
+                rs_mat_node = output_node
+                
+                # Check diffuse/base color
+                base_color = None
+                for input_port in rs_mat_node.GetInputs():
+                    port_id = input_port.GetId()
+                    if "diffuse_color" in port_id or "base_color" in port_id:
+                        base_color = input_port
+                        break
+                
+                if base_color is None:
+                    warnings.append(f"⚠️ '{name}': No diffuse/base color input found.")
+                    mat_stats["issues"] += 1
+                    continue
+                
+                if not base_color.GetDestination():
+                    warnings.append(f"ℹ️ '{name}': Diffuse/base color input not connected.")
+                    # This is not necessarily an issue, just informational
+                else:
+                    source_node = base_color.GetDestination().GetNode()
+                    source_type = "unknown"
+                    
+                    # Identify the type of source
+                    if "ColorTexture" in source_node.GetId():
+                        source_type = "texture"
+                    elif "Noise" in source_node.GetId():
+                        source_type = "noise"
+                    elif "Checker" in source_node.GetId():
+                        source_type = "checker"
+                    elif "Gradient" in source_node.GetId():
+                        source_type = "gradient"
+                    elif "ColorConstant" in source_node.GetId():
+                        source_type = "color"
+                    
+                    warnings.append(f"✅ '{name}': Diffuse/base color connected to {source_type} node.")
+                
+                # Check for common issues in other ports
+                # Detect if there's a fresnel node present
+                has_fresnel = False
+                for node in graph.GetNodes():
+                    if "Fresnel" in node.GetId():
+                        has_fresnel = True
+                        
+                        # Verify the Fresnel node has proper connections
+                        inputs_valid = True
+                        for input_port in node.GetInputs():
+                            port_id = input_port.GetId()
+                            if "ior" in port_id and not input_port.GetDestination():
+                                inputs_valid = False
+                                warnings.append(f"⚠️ '{name}': Fresnel node missing IOR input.")
+                                mat_stats["issues"] += 1
+                        
+                        outputs_valid = False
+                        for output_port in node.GetOutputs():
+                            if output_port.GetSource():
+                                outputs_valid = True
+                                break
+                                
+                        if not outputs_valid:
+                            warnings.append(f"⚠️ '{name}': Fresnel node has no output connections.")
+                            mat_stats["issues"] += 1
+                
+                if has_fresnel:
+                    warnings.append(f"ℹ️ '{name}': Contains Fresnel shader (check for potential issues).")
+            
+            # Summary stats
+            summary = f"Material validation complete. Found {mat_stats['total']} materials: " + \
+                      f"{mat_stats['redshift']} Redshift, {mat_stats['standard']} Standard, " + \
+                      f"{mat_stats['issues']} with issues, {mat_stats['fixed']} fixed."
+            
+            # Update the document to apply any changes
+            c4d.EventAdd()
+            
+            return {
+                "status": "ok", 
+                "warnings": warnings,
+                "fixes": fixes,
+                "summary": summary,
+                "stats": mat_stats
+            }
+        
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Error validating materials: {str(e)}",
+                "warnings": warnings
+            }
 
 
 class SocketServerDialog(gui.GeDialog):
