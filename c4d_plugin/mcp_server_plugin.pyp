@@ -1434,6 +1434,738 @@ class C4DSocketServer(threading.Thread):
         )
         return {"objects": objects}
 
+    def handle_add_effector(self, command):
+        """Handle add_effector command."""
+        doc = c4d.documents.GetActiveDocument()
+        name = command.get("effector_name", "New Effector")
+        type_name = command.get("effector_type", "random").lower()
+        cloner_name = command.get("cloner_name", "")
+        properties = command.get("properties", {})
+
+        try:
+            # Debug log
+            self.log(f"[C4D] Creating {type_name} effector named '{name}'")
+            if cloner_name:
+                self.log(f"[C4D] Will attempt to apply to cloner '{cloner_name}'")
+
+            # Map effector types to C4D constants.
+            effector_types = {
+                "random": c4d.Omgrandom,
+                "formula": c4d.Omgformula,
+                "step": c4d.Omgstep,
+                "target": (
+                    c4d.Omgtarget
+                    if hasattr(c4d, "Omgtarget")
+                    else c4d.Omgeffectortarget
+                ),
+                "time": c4d.Omgtime,
+                "sound": c4d.Omgsound,
+                "plain": c4d.Omgplain,
+                "delay": c4d.Omgdelay,
+                "spline": c4d.Omgspline,
+                "python": c4d.Omgpython,
+            }
+
+            if hasattr(c4d, "Omgfalloff"):
+                effector_types["falloff"] = c4d.Omgfalloff
+
+            effector_id = effector_types.get(type_name, c4d.Omgrandom)
+            effector = c4d.BaseObject(effector_id)
+            if effector is None:
+                return {"error": f"Failed to create {type_name} effector"}
+            effector.SetName(name)
+
+            # Set common properties.
+            if "strength" in properties and isinstance(
+                properties["strength"], (int, float)
+            ):
+                effector[c4d.ID_MG_BASEEFFECTOR_STRENGTH] = float(
+                    properties["strength"]
+                )
+            if "position_mode" in properties and isinstance(
+                properties["position_mode"], bool
+            ):
+                effector[c4d.ID_MG_BASEEFFECTOR_POSITION_ACTIVE] = properties[
+                    "position_mode"
+                ]
+            if "rotation_mode" in properties and isinstance(
+                properties["rotation_mode"], bool
+            ):
+                effector[c4d.ID_MG_BASEEFFECTOR_ROTATION_ACTIVE] = properties[
+                    "rotation_mode"
+                ]
+            if "scale_mode" in properties and isinstance(
+                properties["scale_mode"], bool
+            ):
+                effector[c4d.ID_MG_BASEEFFECTOR_SCALE_ACTIVE] = properties["scale_mode"]
+
+            doc.InsertObject(effector)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, effector)
+
+            # If a cloner is specified, add the effector to its effector list.
+            cloner_applied = False
+            if cloner_name:
+                # Try to find cloner by name - both exact and fuzzy matching
+                cloner = None
+
+                # Try standard find first
+                cloner = self.find_object_by_name(doc, cloner_name)
+
+                # If not found, and name is generic like "Cloner", try to find by type
+                if cloner is None and cloner_name.lower() in [
+                    "cloner",
+                    "mograph cloner",
+                ]:
+                    self.log(f"[C4D] Trying to find any MoGraph Cloner object")
+                    obj = doc.GetFirstObject()
+                    while obj:
+                        if obj.GetType() == c4d.Omgcloner:
+                            cloner = obj
+                            self.log(f"[C4D] Found cloner by type: {cloner.GetName()}")
+                            break
+                        obj = obj.GetNext()
+
+                if cloner is None:
+                    self.log(
+                        f"[C4D] Warning: Cloner '{cloner_name}' not found, effector created but not applied"
+                    )
+                    # Instead of returning error, just continue without applying
+                else:
+                    if cloner.GetType() != c4d.Omgcloner:
+                        self.log(
+                            f"[C4D] Warning: Object '{cloner_name}' is not a MoGraph Cloner"
+                        )
+                        # Instead of returning error, just continue without applying
+                    else:
+                        try:
+                            # Get the effector list or create a new one
+                            effector_list = None
+
+                            # Try to get existing list
+                            try:
+                                effector_list = cloner[
+                                    c4d.ID_MG_MOTIONGENERATOR_EFFECTORLIST
+                                ]
+                            except:
+                                self.log(f"[C4D] Creating new effector list for cloner")
+                                pass
+
+                            # Create new list if needed
+                            if not isinstance(effector_list, c4d.InExcludeData):
+                                effector_list = c4d.InExcludeData()
+
+                            # Insert effector with enabled flag (1)
+                            effector_list.InsertObject(effector, 1)
+                            cloner[c4d.ID_MG_MOTIONGENERATOR_EFFECTORLIST] = (
+                                effector_list
+                            )
+                            doc.AddUndo(c4d.UNDOTYPE_CHANGE, cloner)
+                            cloner_applied = True
+                            self.log(
+                                f"[C4D] Successfully applied effector to cloner '{cloner.GetName()}'"
+                            )
+                        except Exception as e:
+                            self.log(
+                                f"[C4D] Error applying effector to cloner: {str(e)}"
+                            )
+                            # Continue without returning error - at least create the effector
+
+            c4d.EventAdd()
+
+            return {
+                "object": {
+                    "name": effector.GetName(),
+                    "id": str(effector.GetGUID()),
+                    "type": type_name,
+                    "applied_to_cloner": cloner_applied,
+                }
+            }
+        except Exception as e:
+            self.log(f"[C4D] Error creating effector: {str(e)}")
+            return {"error": f"Failed to create effector: {str(e)}"}
+            
+    def handle_apply_mograph_fields(self, command):
+        """Handle apply_mograph_fields command with robust error handling to prevent crashes.
+
+        Rewritten based on Cinema 4D R2025 SDK documentation for MoGraph Fields.
+        """
+        # Extract command parameters with defaults
+        field_type = command.get("field_type", "spherical").lower()
+        field_name = command.get("field_name", f"{field_type.capitalize()} Field")
+        target_name = command.get("target_name", "")
+        parameters = command.get("parameters", {})
+
+        self.log(
+            f"[C4D] Starting apply_mograph_fields for {field_type} field named '{field_name}'"
+        )
+
+        # Define function for main thread execution that follows Cinema 4D SDK documentation
+        def create_field_safe(doc, field_type, field_name, target_name, parameters):
+            """Create a field on the main thread following R2025 SDK guidelines."""
+            self.log("[C4D] Creating field on main thread (using R2025 SDK approach)")
+
+            result = {}
+            field = None
+            target = None
+            field_applied = False
+            applied_to = "None"
+
+            try:
+                # Step 1: Map field type to proper SDK constants
+                # Define these manually if not available in the SDK
+                # Based on MoGraph documentation in R2025, these are the correct IDs
+                Fsphere = 1039384  # Spherical Field
+                Fbox = 1039385  # Box Field
+                Fcylinder = 1039386  # Cylindrical Field
+                Ftorus = 1039387  # Torus Field
+                Fcone = 1039388  # Cone Field
+                Flinear = 1039389  # Linear Field
+                Fradial = 1039390  # Radial Field
+                Fsound = 1039391  # Sound Field
+                Fnoise = 1039394  # Noise Field
+
+                field_constants = {
+                    "spherical": Fsphere,  # Spherical Field
+                    "box": Fbox,  # Box Field
+                    "cylindrical": Fcylinder,  # Cylindrical Field
+                    "torus": Ftorus,  # Torus Field
+                    "cone": Fcone,  # Cone Field
+                    "linear": Flinear,  # Linear Field
+                    "radial": Fradial,  # Radial Field
+                    "sound": Fsound,  # Sound Field
+                    "noise": Fnoise,  # Noise Field
+                }
+
+                # Get the proper field type constant or default to spherical
+                field_type_id = field_constants.get(field_type, Fsphere)
+                self.log(f"[C4D] Using field type: {field_type} (ID: {field_type_id})")
+
+                # Step 2: Create the field object using proper SDK approach
+                self.log(f"[C4D] Creating {field_type} field object")
+                field = c4d.BaseObject(field_type_id)
+                if not field:
+                    self.log("[C4D] Failed to create field object")
+                    result["error"] = "Failed to create field object"
+                    return result
+
+                field.SetName(field_name)
+
+                # Step 3: Set field parameters
+                if "strength" in parameters and isinstance(
+                    parameters["strength"], (int, float)
+                ):
+                    field[c4d.FIELD_STRENGTH] = float(parameters["strength"])
+                    self.log(f"[C4D] Set strength: {parameters['strength']}")
+
+                if "falloff" in parameters and isinstance(
+                    parameters["falloff"], (int, float)
+                ):
+                    field[c4d.FIELD_FALLOFF] = float(parameters["falloff"])
+                    self.log(f"[C4D] Set falloff: {parameters['falloff']}")
+
+                # Step 4: Insert field into document (must do this first)
+                self.log("[C4D] Inserting field into document")
+                doc.InsertObject(field)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, field)
+
+                # Step 5: Find target if specified
+                if target_name:
+                    self.log(f"[C4D] Looking for target: {target_name}")
+                    target = self.find_object_by_name(doc, target_name)
+
+                    if not target:
+                        self.log(f"[C4D] Target object '{target_name}' not found")
+                    else:
+                        self.log(f"[C4D] Found target: {target.GetName()}")
+
+                # Step 6: Apply field to target if found - using correct SDK approach
+                if target:
+                    self.log(f"[C4D] Creating Fields tag for {target.GetName()}")
+                    tag = c4d.BaseTag(c4d.Tfields)
+
+                    if not tag:
+                        self.log("[C4D] Failed to create Fields tag")
+                    else:
+                        # Insert tag into target object
+                        target.InsertTag(tag)
+                        doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+
+                        # Explicitly follow the SDK procedure for Fields
+                        # 1. Get the field list (create if needed)
+                        self.log("[C4D] Getting/creating FieldList")
+                        field_list = tag[c4d.FIELDS]
+
+                        if not field_list or not isinstance(field_list, c4d.FieldList):
+                            field_list = c4d.FieldList()
+                            self.log("[C4D] Created new FieldList")
+
+                        # 2. Create a proper Field Layer using the modules.mograph namespace
+                        self.log("[C4D] Creating FieldLayer")
+                        try:
+                            # Using proper namespace from SDK documentation
+                            if hasattr(c4d.modules, "mograph"):
+                                field_layer = c4d.modules.mograph.FieldLayer(
+                                    c4d.FLfield
+                                )
+                                self.log(
+                                    "[C4D] Created field layer using c4d.modules.mograph"
+                                )
+                            else:
+                                # Fallback if mograph module not available
+                                field_layer = c4d.FieldLayer(c4d.FLfield)
+                                self.log(
+                                    "[C4D] Created field layer using c4d.FieldLayer"
+                                )
+
+                            if not field_layer:
+                                self.log("[C4D] Failed to create FieldLayer")
+                                raise RuntimeError("Failed to create FieldLayer")
+
+                            # 3. Link the field object to the layer
+                            self.log(
+                                f"[C4D] Linking field '{field.GetName()}' to layer"
+                            )
+                            success = field_layer.SetLinkedObject(field)
+                            if not success:
+                                self.log(
+                                    "[C4D] Warning: SetLinkedObject returned False"
+                                )
+
+                            # 4. Insert the layer into the field list
+                            self.log("[C4D] Inserting layer into field list")
+                            field_list.InsertLayer(field_layer)
+
+                            # 5. Assign the modified field list back to the tag
+                            self.log("[C4D] Setting field list on tag")
+                            tag[c4d.FIELDS] = field_list
+
+                            # Mark as applied and register undo
+                            doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
+                            field_applied = True
+                            applied_to = target.GetName()
+                            self.log(
+                                f"[C4D] Successfully applied field to {applied_to}"
+                            )
+
+                        except Exception as e:
+                            self.log(f"[C4D] Error setting up field layer: {str(e)}")
+                            import traceback
+
+                            traceback.print_exc()
+
+                # Step 7: Update scene
+                self.log("[C4D] Calling EventAdd to update scene")
+                c4d.EventAdd()
+
+                # Step 8: Prepare result
+                if field:
+                    field_info = {
+                        "name": field.GetName(),
+                        "id": str(field.GetGUID()),
+                        "type": field_type,
+                        "applied_to": applied_to,
+                    }
+
+                    if "strength" in parameters:
+                        field_info["strength"] = parameters["strength"]
+
+                    self.log(f"[C4D] Field creation complete: {field.GetName()}")
+                    result["field"] = field_info
+                else:
+                    self.log("[C4D] No field was created")
+                    result["error"] = "Failed to create field object"
+
+                return result
+
+            except Exception as e:
+                self.log(f"[C4D] Error in create_field_safe: {str(e)}")
+                import traceback
+
+                traceback.print_exc()
+                result["error"] = f"Failed to apply MoGraph field: {str(e)}"
+                return result
+
+        try:
+            # Get the active document
+            doc = c4d.documents.GetActiveDocument()
+            if not doc:
+                self.log("[C4D] No active document")
+                return {"error": "No active document"}
+
+            # Execute field creation on the main thread with explicit timeout
+            self.log(
+                "[C4D] Dispatching field creation to main thread with explicit timeout"
+            )
+            result = self.execute_on_main_thread(
+                create_field_safe,
+                doc,
+                field_type,
+                field_name,
+                target_name,
+                parameters,
+                _timeout=60,  # Extended timeout for field operations
+            )
+
+            # Make sure we always return a valid result with detailed error checking
+            if result is None:
+                self.log(f"[C4D] Main thread execution returned None")
+                return {"error": "Main thread execution returned None"}
+            elif not isinstance(result, dict):
+                self.log(
+                    f"[C4D] Unexpected result type: {type(result)}, value: {str(result)[:100]}"
+                )
+                # Try to convert non-dict result to a dict result
+                try:
+                    return {
+                        "field": {
+                            "name": field_name,
+                            "type": field_type,
+                            "result": str(result),
+                        }
+                    }
+                except:
+                    return {
+                        "error": f"Unexpected result type from main thread execution: {type(result)}"
+                    }
+
+            return result
+
+        except Exception as e:
+            self.log(f"[C4D] Error in handle_apply_mograph_fields: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
+            return {"error": f"Failed to apply MoGraph field: {str(e)}"}
+
+    def handle_create_soft_body(self, command):
+        """Handle create_soft_body command."""
+        doc = c4d.documents.GetActiveDocument()
+        object_name = command.get("object_name", "")
+        name = command.get("name", "Soft Body")
+        stiffness = command.get("stiffness", 50)
+        mass = command.get("mass", 1.0)
+
+        # Find target object
+        obj = self.find_object_by_name(doc, object_name)
+        if obj is None:
+            return {"error": f"Object not found: {object_name}"}
+
+        def create_soft_body_safe(obj, name, stiffness, mass, object_name):
+            # Create Dynamics tag (ID 180000102)
+            tag = c4d.BaseTag(180000102)
+            if tag is None:
+                raise RuntimeError("Failed to create Dynamics Body tag")
+            tag.SetName(name)
+
+            tag[c4d.RIGID_BODY_DYNAMIC] = 1  # Enable dynamics
+            tag[c4d.RIGID_BODY_MASS] = mass
+            tag[c4d.RIGID_BODY_SOFTBODY] = True  # Enable soft body
+
+            obj.InsertTag(tag)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+            c4d.EventAdd()
+
+            return {
+                "object": object_name,
+                "tag_name": tag.GetName(),
+                "stiffness": stiffness,
+                "mass": mass,
+            }
+
+        try:
+            soft_body_info = self.execute_on_main_thread(
+                create_soft_body_safe, obj, name, stiffness, mass, object_name
+            )
+            return {"soft_body": soft_body_info}
+        except Exception as e:
+            return {"error": f"Failed to create Soft Body: {str(e)}"}
+
+    def handle_apply_dynamics(self, command):
+        """Handle apply_dynamics command."""
+        doc = c4d.documents.GetActiveDocument()
+        object_name = command.get("object_name", "")
+        tag_type = command.get("tag_type", "rigid_body").lower()
+        params = command.get("parameters", {})
+
+        try:
+            obj = self.find_object_by_name(doc, object_name)
+            if obj is None:
+                return {"error": f"Object not found: {object_name}"}
+
+            tag_types = {
+                "rigid_body": 180000102,  # Rigid Body tag
+                "collider": 180000102,  # Different mode in same tag
+                "connector": 180000103,  # Connector tag
+                "ghost": 180000102,  # Special mode in dynamics tag
+            }
+            tag_type_id = tag_types.get(tag_type, 180000102)
+
+            tag = c4d.BaseTag(tag_type_id)
+            if tag is None:
+                return {"error": f"Failed to create {tag_type} tag"}
+
+            if tag_type == "rigid_body":
+                tag[c4d.RIGID_BODY_DYNAMIC] = 2  # Dynamic mode
+            elif tag_type == "collider":
+                tag[c4d.RIGID_BODY_DYNAMIC] = 0  # Static mode
+            elif tag_type == "ghost":
+                tag[c4d.RIGID_BODY_DYNAMIC] = 3  # Ghost mode
+
+            # Set common parameters.
+            if "mass" in params and isinstance(params["mass"], (int, float)):
+                tag[c4d.RIGID_BODY_MASS] = float(params["mass"])
+            if "friction" in params and isinstance(params["friction"], (int, float)):
+                tag[c4d.RIGID_BODY_FRICTION] = float(params["friction"])
+            if "elasticity" in params and isinstance(
+                params["elasticity"], (int, float)
+            ):
+                tag[c4d.RIGID_BODY_ELASTICITY] = float(params["elasticity"])
+            if "collision_margin" in params and isinstance(
+                params["collision_margin"], (int, float)
+            ):
+                tag[c4d.RIGID_BODY_MARGIN] = float(params["collision_margin"])
+
+            obj.InsertTag(tag)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+            c4d.EventAdd()
+
+            return {
+                "dynamics": {
+                    "object": object_name,
+                    "tag_type": tag_type,
+                    "parameters": params,
+                }
+            }
+        except Exception as e:
+            return {"error": f"Failed to apply Dynamics tag: {str(e)}"}
+
+    def handle_create_abstract_shape(self, command):
+        """Handle create_abstract_shape command."""
+        doc = c4d.documents.GetActiveDocument()
+        shape_type = command.get("shape_type", "metaball").lower()
+        name = command.get("object_name", f"{shape_type.capitalize()}")
+        position = command.get("position", [0, 0, 0])
+
+        try:
+            shape_types = {
+                "metaball": 5159,
+                "metaball_spline": 5161,
+                "loft": 5107,
+                "sweep": 5118,
+                "atom": 5168,
+                "platonic": 5170,
+                "cloth": 5186,
+                "landscape": 5119,
+                "extrude": 5116,
+            }
+            shape_type_id = shape_types.get(shape_type, 5159)
+
+            shape = c4d.BaseObject(shape_type_id)
+            if shape is None:
+                return {"error": f"Failed to create {shape_type} object"}
+
+            shape.SetName(name)
+            if len(position) >= 3:
+                shape.SetAbsPos(c4d.Vector(position[0], position[1], position[2]))
+
+            # For certain shapes, add additional child objects.
+            if shape_type == "metaball":
+                sphere = c4d.BaseObject(c4d.Osphere)
+                sphere.SetName("Metaball Sphere")
+                sphere.SetAbsScale(c4d.Vector(0.5, 0.5, 0.5))
+                sphere.InsertUnder(shape)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, sphere)
+            elif shape_type in ("loft", "sweep"):
+                spline = c4d.BaseObject(c4d.Osplinecircle)
+                spline.SetName("Profile Spline")
+                spline.InsertUnder(shape)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, spline)
+                path = c4d.BaseObject(c4d.Osplinenside)
+                path.SetName("Path Spline")
+                path.SetAbsPos(c4d.Vector(0, 50, 0))
+                path.InsertUnder(shape)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, path)
+
+            doc.InsertObject(shape)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, shape)
+            c4d.EventAdd()
+
+            return {
+                "shape": {
+                    "name": shape.GetName(),
+                    "id": str(shape.GetGUID()),
+                    "type": shape_type,
+                    "position": position,
+                }
+            }
+        except Exception as e:
+            return {"error": f"Failed to create abstract shape: {str(e)}"}
+
+    def handle_create_light(self, command):
+        """Handle create_light command."""
+        doc = c4d.documents.GetActiveDocument()
+        light_type = command.get("type", "spot").lower()
+        name = command.get("object_name", f"{light_type.capitalize()} Light")
+        position = command.get("position", [0, 100, 0])
+        color = command.get("color", [1, 1, 1])
+        intensity = command.get("intensity", 100)
+
+        try:
+            light = c4d.BaseObject(c4d.Olight)
+            if light is None:
+                return {"error": "Failed to create light object"}
+            light.SetName(name)
+
+            light_type_map = {
+                "spot": 0,
+                "point": 1,
+                "distant": 2,
+                "area": 3,
+                "paraxial": 4,
+                "parallel": 5,
+                "omni": 1,
+            }
+            light[c4d.LIGHT_TYPE] = light_type_map.get(light_type, 1)
+            if len(position) >= 3:
+                light.SetAbsPos(c4d.Vector(position[0], position[1], position[2]))
+            if len(color) >= 3:
+                light[c4d.LIGHT_COLOR] = c4d.Vector(color[0], color[1], color[2])
+            light[c4d.LIGHT_BRIGHTNESS] = intensity
+            light[c4d.LIGHT_SHADOWTYPE] = 1  # Use shadow maps
+
+            doc.InsertObject(light)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, light)
+            c4d.EventAdd()
+
+            return {
+                "light": {
+                    "name": light.GetName(),
+                    "id": str(light.GetGUID()),
+                    "type": light_type,
+                    "position": position,
+                    "color": color,
+                    "intensity": intensity,
+                }
+            }
+        except Exception as e:
+            return {"error": f"Failed to create light: {str(e)}"}
+
+    def handle_animate_camera(self, command):
+        """Handle animate_camera command."""
+        doc = c4d.documents.GetActiveDocument()
+        camera_name = command.get("camera_name", "")
+        path_type = command.get("path_type", "linear").lower()
+        positions = command.get("positions", [])
+        frames = command.get("frames", [])
+        create_camera = command.get("create_camera", False)
+        camera_properties = command.get("camera_properties", {})
+
+        try:
+            # Log the command for debugging purposes
+            self.log(
+                f"[C4D] Animate camera command: path_type={path_type}, camera={camera_name}, positions={len(positions)}, frames={len(frames)}"
+            )
+
+            camera = None
+            if camera_name:
+                camera = self.find_object_by_name(doc, camera_name)
+                if camera is None:
+                    self.log(
+                        f"[C4D] Camera '{camera_name}' not found, will create a new one"
+                    )
+
+                    # List existing cameras to help with debugging
+                    existing_cameras = []
+                    obj = doc.GetFirstObject()
+                    while obj:
+                        if obj.GetType() == c4d.Ocamera:
+                            existing_cameras.append(obj.GetName())
+                        obj = obj.GetNext()
+
+                    if existing_cameras:
+                        self.log(
+                            f"[C4D] Available cameras: {', '.join(existing_cameras)}"
+                        )
+                    else:
+                        self.log("[C4D] No cameras found in the scene")
+
+            if camera is None or create_camera:
+                camera = c4d.BaseObject(c4d.Ocamera)
+                camera.SetName(camera_name or "Animated Camera")
+                self.log(f"[C4D] Created new camera: {camera.GetName()}")
+
+                if "focal_length" in camera_properties and isinstance(
+                    camera_properties["focal_length"], (int, float)
+                ):
+                    camera[c4d.CAMERA_FOCUS] = float(camera_properties["focal_length"])
+                if "aperture" in camera_properties and isinstance(
+                    camera_properties["aperture"], (int, float)
+                ):
+                    camera[c4d.CAMERA_APERTURE] = float(camera_properties["aperture"])
+                if "film_offset_x" in camera_properties and isinstance(
+                    camera_properties["film_offset_x"], (int, float)
+                ):
+                    camera[c4d.CAMERA_FILM_OFFSET_X] = float(
+                        camera_properties["film_offset_x"]
+                    )
+                if "film_offset_y" in camera_properties and isinstance(
+                    camera_properties["film_offset_y"], (int, float)
+                ):
+                    camera[c4d.CAMERA_FILM_OFFSET_Y] = float(
+                        camera_properties["film_offset_y"]
+                    )
+
+                doc.InsertObject(camera)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, camera)
+                doc.SetActiveObject(camera)
+
+            # Add default frames if only positions are provided
+            if positions and not frames:
+                frames = list(range(len(positions)))
+
+            if not positions or not frames or len(positions) != len(frames):
+                return {
+                    "error": "Invalid positions or frames data. They must be arrays of equal length."
+                }
+
+            # Set keyframes for camera positions.
+            for pos, frame in zip(positions, frames):
+                if len(pos) >= 3:
+                    self.set_position_keyframe(camera, frame, pos)
+
+            # If a spline path is requested.
+            if path_type == "spline" and len(positions) > 1:
+                path = c4d.BaseObject(c4d.Ospline)
+                path.SetName(f"{camera.GetName()} Path")
+                points = [
+                    c4d.Vector(p[0], p[1], p[2]) for p in positions if len(p) >= 3
+                ]
+                path.ResizeObject(len(points))
+                for i, pt in enumerate(points):
+                    path.SetPoint(i, pt)
+                doc.InsertObject(path)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, path)
+
+                align_to_path = path_type == "spline_oriented"
+                path_tag = c4d.BaseTag(c4d.Talignment)
+                path_tag[c4d.ALIGNMENTOBJECT_LINK] = path
+                path_tag[c4d.ALIGNMENTOBJECT_ALIGN] = align_to_path
+                camera.InsertTag(path_tag)
+                doc.AddUndo(c4d.UNDOTYPE_NEW, path_tag)
+
+            c4d.EventAdd()
+
+            return {
+                "camera_animation": {
+                    "camera": camera.GetName(),
+                    "path_type": path_type,
+                    "keyframe_count": len(positions),
+                    "frame_range": [min(frames), max(frames)],
+                }
+            }
+        except Exception as e:
+            return {"error": f"Failed to animate camera: {str(e)}"}
+
     def get_redshift_material_id(self):
         """Detect Redshift material ID by examining existing materials.
         
