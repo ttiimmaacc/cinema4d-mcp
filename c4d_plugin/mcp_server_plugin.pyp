@@ -1544,4 +1544,167 @@ if rs_mat:
             return {"error": f"Failed to apply shader: {str(e)}"}
 
 
-# Class definition for SocketServerDialog and plugin registration would follow here
+class SocketServerDialog(gui.GeDialog):
+    """GUI Dialog to control the server and display logs."""
+
+    def __init__(self):
+        super(SocketServerDialog, self).__init__()
+        self.server = None
+        self.msg_queue = queue.Queue()  # Thread-safe queue
+        self.SetTimer(100)  # Update UI at 10 Hz
+
+    def CreateLayout(self):
+        self.SetTitle("Socket Server Control")
+
+        self.status_text = self.AddStaticText(
+            1002, c4d.BFH_SCALEFIT, name="Server: Offline"
+        )
+
+        self.GroupBegin(1010, c4d.BFH_SCALEFIT, 2, 1)
+        self.AddButton(1011, c4d.BFH_SCALE, name="Start Server")
+        self.AddButton(1012, c4d.BFH_SCALE, name="Stop Server")
+        self.GroupEnd()
+
+        self.log_box = self.AddMultiLineEditText(
+            1004,
+            c4d.BFH_SCALEFIT,
+            initw=400,
+            inith=250,
+            style=c4d.DR_MULTILINE_READONLY,
+        )
+
+        self.Enable(1012, False)  # Disable "Stop" button initially
+        return True
+
+    def CoreMessage(self, id, msg):
+        """Handles UI updates and main thread execution triggered by SpecialEventAdd()."""
+        if id == PLUGIN_ID:
+            try:
+                # Process all pending messages in the queue
+                while not self.msg_queue.empty():
+                    try:
+                        # Get next message from queue with timeout to avoid potential deadlocks
+                        msg_type, msg_value = self.msg_queue.get(timeout=0.1)
+
+                        # Process based on message type
+                        if msg_type == "STATUS":
+                            self.UpdateStatusText(msg_value)
+                        elif msg_type == "LOG":
+                            self.AppendLog(msg_value)
+                        elif msg_type == "EXEC":
+                            # Execute function on main thread
+                            if callable(msg_value):
+                                try:
+                                    msg_value()
+                                except Exception as e:
+                                    error_msg = f"[C4D] Error in main thread execution: {str(e)}"
+                                    self.AppendLog(error_msg)
+                                    print(
+                                        error_msg
+                                    )  # Also print to console for debugging
+                            else:
+                                self.AppendLog(
+                                    f"[C4D] Warning: Non-callable value received: {type(msg_value)}"
+                                )
+                        else:
+                            self.AppendLog(
+                                f"[C4D] Warning: Unknown message type: {msg_type}"
+                            )
+                    except queue.Empty:
+                        # Queue timeout - break the loop to prevent blocking
+                        break
+                    except Exception as e:
+                        # Handle any other exceptions during message processing
+                        error_msg = f"[C4D] Error processing message: {str(e)}"
+                        self.AppendLog(error_msg)
+                        print(error_msg)  # Also print to console for debugging
+            except Exception as e:
+                # Catch all exceptions to prevent Cinema 4D from crashing
+                error_msg = f"[C4D] Critical error in message processing: {str(e)}"
+                print(error_msg)  # Print to console as UI might be unstable
+                try:
+                    self.AppendLog(error_msg)
+                except:
+                    pass  # Ignore if we can't even log to UI
+
+        return True
+
+    def Timer(self, msg):
+        """Periodic UI update in case SpecialEventAdd() missed something."""
+        if self.server:
+            if not self.server.running:  # Detect unexpected crashes
+                self.UpdateStatusText("Offline")
+                self.Enable(1011, True)
+                self.Enable(1012, False)
+        return True
+
+    def UpdateStatusText(self, status):
+        """Update server status UI."""
+        self.SetString(1002, f"Server: {status}")
+        self.Enable(1011, status == "Offline")
+        self.Enable(1012, status == "Online")
+
+    def AppendLog(self, message):
+        """Append log messages to UI."""
+        existing_text = self.GetString(1004)
+        new_text = (existing_text + "\n" + message).strip()
+        self.SetString(1004, new_text)
+
+    def Command(self, id, msg):
+        if id == 1011:  # Start Server button
+            self.StartServer()
+            return True
+        elif id == 1012:  # Stop Server button
+            self.StopServer()
+            return True
+        return False
+
+    def StartServer(self):
+        """Start the socket server thread."""
+        if not self.server:
+            self.server = C4DSocketServer(msg_queue=self.msg_queue)
+            self.server.start()
+            self.Enable(1011, False)
+            self.Enable(1012, True)
+
+    def StopServer(self):
+        """Stop the socket server."""
+        if self.server:
+            self.server.stop()
+            self.server = None
+            self.Enable(1011, True)
+            self.Enable(1012, False)
+
+
+class SocketServerPlugin(c4d.plugins.CommandData):
+    """Cinema 4D Plugin Wrapper"""
+
+    PLUGIN_ID = 1057843
+    PLUGIN_NAME = "Socket Server Plugin"
+
+    def __init__(self):
+        self.dialog = None
+
+    def Execute(self, doc):
+        if self.dialog is None:
+            self.dialog = SocketServerDialog()
+        return self.dialog.Open(
+            dlgtype=c4d.DLG_TYPE_ASYNC,
+            pluginid=self.PLUGIN_ID,
+            defaultw=400,
+            defaulth=300,
+        )
+
+    def GetState(self, doc):
+        return c4d.CMD_ENABLED
+
+
+if __name__ == "__main__":
+    c4d.plugins.RegisterCommandPlugin(
+        SocketServerPlugin.PLUGIN_ID,
+        SocketServerPlugin.PLUGIN_NAME,
+        0,
+        None,
+        None,
+        SocketServerPlugin(),
+    )
