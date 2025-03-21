@@ -554,7 +554,7 @@ When creating materials through the MCP, ensure you specify the correct material
 }
 ```
 
-You can also specify the material type through properties:
+You can also specify the material type through properties in multiple ways:
 
 ```json
 {
@@ -562,6 +562,19 @@ You can also specify the material type through properties:
   "name": "RedshiftMaterial",
   "properties": {
     "type": "redshift_node"
+  },
+  "color": [1, 0, 0]
+}
+```
+
+Or:
+
+```json
+{
+  "command": "create_material",
+  "name": "RedshiftMaterial",
+  "properties": {
+    "material_type": "redshift"
   },
   "color": [1, 0, 0]
 }
@@ -578,6 +591,49 @@ The response will now include the actual material type ID to verify it was creat
     "type": "redshift",
     "material_type_id": 1036224,
     "procedural": false
+  }
+}
+```
+
+### Robust Material Creation
+
+The MCP plugin now uses a sophisticated approach to create proper Redshift materials:
+
+1. Tries multiple different methods to create Redshift materials
+2. Logs detailed debugging information about material types
+3. Can detect Redshift material IDs from existing materials in the scene
+4. Falls back to direct numeric ID creation if needed
+
+You can verify the material types in your scene using the validation command:
+
+```json
+{
+  "command": "validate_redshift_materials"
+}
+```
+
+The response includes details about all material types in your scene:
+
+```json
+{
+  "status": "ok",
+  "warnings": ["..."],
+  "fixes": [],
+  "summary": "Material validation complete...",
+  "stats": {
+    "total": 5,
+    "redshift": 2,
+    "standard": 3,
+    "fixed": 0,
+    "issues": 0,
+    "material_types": {
+      "Standard Material": 3,
+      "Redshift Material (1036224)": 2
+    }
+  },
+  "ids": {
+    "standard_material": 5703,
+    "redshift_material": 1036224
   }
 }
 ```
