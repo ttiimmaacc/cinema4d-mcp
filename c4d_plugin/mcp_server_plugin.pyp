@@ -799,24 +799,11 @@ class C4DSocketServer(threading.Thread):
         name = command.get("name") or command.get("material_name") or "New Material"
         color = command.get("color", [1, 1, 1])
         properties = command.get("properties", {})
-        
-        # Check various ways to specify a Redshift material type
         material_type = command.get("material_type", "standard")  # standard, redshift
-        if material_type == "standard" and properties.get("type") in ["redshift", "redshift_node"]:
-            material_type = "redshift"
-            self.log(f"[C4D] Using Redshift material type from properties")
-        
-        # Another common pattern is to specify material_type as a key in properties
-        if material_type == "standard" and "redshift" in properties.get("material_type", "").lower():
-            material_type = "redshift"
-            self.log(f"[C4D] Using Redshift material type from properties.material_type")
-            
         procedural = command.get("procedural", False)  # use procedural shaders
         shader_type = command.get(
             "shader_type", "noise"
         )  # noise, checker, gradient, etc.
-        
-        self.log(f"[C4D] Creating {material_type} material: {name}")
 
         try:
             mat = None
@@ -831,14 +818,49 @@ class C4DSocketServer(threading.Thread):
                 try:
                     redshift = c4d.modules.redshift
 
-                    # Create a true Redshift node material
-                    mat = c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)
-                    if not mat:
-                        self.log("[C4D] Failed to create Redshift material, falling back to standard material")
-                        raise Exception("Failed to create Redshift material")
+                    # Log the Redshift material ID constants for debugging
+                    self.log(f"[C4D] Redshift material ID constant: {c4d.ID_REDSHIFT_MATERIAL}")
                     
-                    mat.SetName(name)
-                    self.log(f"[C4D] Created Redshift material: {name}, type ID: {mat.GetType()}")
+                    # Check if the Redshift module has its own material constant
+                    rs_material_id = getattr(redshift, "Mmaterial", None)
+                    if rs_material_id is not None:
+                        self.log(f"[C4D] Redshift module material ID: {rs_material_id}")
+                    else:
+                        self.log("[C4D] Redshift module has no Mmaterial constant")
+                    
+                    # Try all possible methods to create a Redshift material
+                    creation_methods = [
+                        ("c4d.ID_REDSHIFT_MATERIAL", lambda: c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)),
+                        ("redshift.Mmaterial", lambda: c4d.BaseMaterial(getattr(redshift, "Mmaterial", c4d.ID_REDSHIFT_MATERIAL))),
+                        ("Direct ID 1036224", lambda: c4d.BaseMaterial(1036224)),
+                        ("Direct ID 1036746", lambda: c4d.BaseMaterial(1036746)),  # Alternative ID seen in some versions
+                        ("redshift.MATERIAL_TYPE", lambda: c4d.BaseMaterial(getattr(redshift, "MATERIAL_TYPE", c4d.ID_REDSHIFT_MATERIAL))),
+                        # Check existing materials to detect Redshift ID
+                        ("Detect from existing materials", self.get_redshift_material_id)
+                    ]
+                    
+                    success = False
+                    for method_name, creator in creation_methods:
+                        try:
+                            self.log(f"[C4D] Trying to create Redshift material using {method_name}")
+                            temp_mat = creator()
+                            if temp_mat:
+                                material_type = temp_mat.GetType()
+                                self.log(f"[C4D] Created material with type ID: {material_type}")
+                                
+                                # Check if this looks like a Redshift material
+                                if material_type >= 1000000:  # Redshift IDs are typically in the 1 million+ range
+                                    mat = temp_mat
+                                    mat.SetName(name)
+                                    self.log(f"[C4D] Successfully created Redshift material: {name}, type ID: {material_type}")
+                                    success = True
+                                    break
+                        except Exception as e:
+                            self.log(f"[C4D] Failed with {method_name}: {str(e)}")
+                    
+                    if not success:
+                        self.log("[C4D] All Redshift material creation methods failed, falling back to standard material")
+                        raise Exception("Failed to create Redshift material with any method")
                     
                     # Use CreateDefaultGraph for reliable material setup
                     try:
@@ -981,7 +1003,6 @@ class C4DSocketServer(threading.Thread):
                     "id": material_id,  # Your internal ID (if needed)
                     "color": material_color,  # Actual material color (RGB)
                     "type": material_type,
-                    "material_type_id": mat.GetType(),  # Return actual material type ID for verification
                     "procedural": procedural if material_type == "redshift" else False,
                 }
             }
@@ -2239,20 +2260,11 @@ class C4DSocketServer(threading.Thread):
                 channel, c4d.MATERIAL_COLOR_SHADER
             )  # Default to color
 
-            # Create the shader with proper error handling for missing plugins
-            try:
-                # Check first if we're trying to apply a fresnel shader, which is known to be problematic
-                if shader_type == "fresnel":
-                    # Log a warning about the fresnel shader
-                    self.log(f"[C4D] Warning: Fresnel shader (ID {shader_type_id}) may not be available in this installation")
-                    
-                shader = c4d.BaseShader(shader_type_id)
-                if shader is None:
-                    self.log(f"[C4D] Failed to create {shader_type} shader")
-                    return {"error": f"Failed to create {shader_type} shader"}
-            except Exception as shader_error:
-                self.log(f"[C4D] Error creating shader: {str(shader_error)}")
-                return {"error": f"Failed to create {shader_type} shader: {str(shader_error)}"}
+            # Create the shader
+            shader = c4d.BaseShader(shader_type_id)
+            if shader is None:
+                self.log(f"[C4D] Failed to create {shader_type} shader")
+                return {"error": f"Failed to create {shader_type} shader"}
 
             # Set parameters for the shader
             if shader_type == "noise":
@@ -2795,6 +2807,79 @@ class C4DSocketServer(threading.Thread):
         )
         return all_objects
 
+    def get_redshift_material_id(self):
+        """Detect Redshift material ID by examining existing materials.
+        
+        This function scans the active document for materials with type IDs
+        in the range typical for Redshift materials (over 1,000,000).
+        
+        Returns:
+            A BaseMaterial with the detected Redshift material type or None if not found
+        """
+        doc = c4d.documents.GetActiveDocument()
+        
+        # Look for existing Redshift materials to detect the proper ID
+        for mat in doc.GetMaterials():
+            mat_type = mat.GetType()
+            if mat_type >= 1000000:
+                self.log(f"[C4D] Found existing Redshift material with type ID: {mat_type}")
+                # Try to create a material with this ID
+                try:
+                    rs_mat = c4d.BaseMaterial(mat_type)
+                    if rs_mat and rs_mat.GetType() == mat_type:
+                        self.log(f"[C4D] Successfully created Redshift material using detected ID: {mat_type}")
+                        return rs_mat
+                except:
+                    pass
+                    
+        # If Python scripting can create Redshift materials, try this method
+        try:
+            # Execute a Python script to create a Redshift material
+            script = """
+import c4d
+doc = c4d.documents.GetActiveDocument()
+# Try with known Redshift ID
+rs_mat = c4d.BaseMaterial(1036224)
+if rs_mat:
+    rs_mat.SetName("TempRedshiftMaterial")
+    doc.InsertMaterial(rs_mat)
+    c4d.EventAdd()
+"""
+            # Only try script-based approach if explicitly allowed
+            if hasattr(c4d, "modules") and hasattr(c4d.modules, "net") and hasattr(c4d.modules.net, "Execute"):
+                # Execute in a controlled way that won't affect normal operation
+                import tempfile, os
+                script_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.py', delete=False) as f:
+                        f.write(script.encode('utf-8'))
+                        script_path = f.name
+                        
+                    # Try to execute this script
+                    self.execute_on_main_thread(lambda: c4d.modules.net.Execute(script_path))
+                finally:
+                    # Always clean up the temp file
+                    if script_path and os.path.exists(script_path):
+                        try:
+                            os.unlink(script_path)
+                        except:
+                            pass
+            
+            # Now look for the material we created
+            temp_mat = self.find_material_by_name(doc, "TempRedshiftMaterial")
+            if temp_mat and temp_mat.GetType() >= 1000000:
+                self.log(f"[C4D] Created Redshift material via script with type ID: {temp_mat.GetType()}")
+                # Clean up the temporary material
+                doc.RemoveMaterial(temp_mat)
+                c4d.EventAdd()
+                # Create a fresh material with this ID
+                return c4d.BaseMaterial(temp_mat.GetType())
+        except Exception as e:
+            self.log(f"[C4D] Script-based Redshift material creation failed: {str(e)}")
+            
+        # No Redshift materials found
+        return None
+        
     def find_material_by_name(self, doc, name):
         """Find a material by name in the document.
 
@@ -2852,13 +2937,28 @@ class C4DSocketServer(threading.Thread):
             # Get the Redshift node space ID
             redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
             
+            # Log all relevant Redshift material IDs for debugging
+            self.log(f"[C4D] Standard material ID: {c4d.Mmaterial}")
+            self.log(f"[C4D] Redshift material ID (c4d.ID_REDSHIFT_MATERIAL): {c4d.ID_REDSHIFT_MATERIAL}")
+            
+            # Check if Redshift module has its own material type constant
+            if hasattr(c4d, "modules") and hasattr(c4d.modules, "redshift"):
+                redshift = c4d.modules.redshift
+                rs_material_id = getattr(redshift, "Mmaterial", None)
+                if rs_material_id is not None:
+                    self.log(f"[C4D] Redshift module material ID: {rs_material_id}")
+                rs_material_type = getattr(redshift, "MATERIAL_TYPE", None)
+                if rs_material_type is not None:
+                    self.log(f"[C4D] Redshift MATERIAL_TYPE: {rs_material_type}")
+            
             # Count of materials by type
             mat_stats = {
                 "total": 0,
                 "redshift": 0,
                 "standard": 0, 
                 "fixed": 0,
-                "issues": 0
+                "issues": 0,
+                "material_types": {}
             }
             
             # Validate all materials in the document
@@ -2866,8 +2966,21 @@ class C4DSocketServer(threading.Thread):
                 mat_stats["total"] += 1
                 name = mat.GetName()
                 
+                # Track all material types encountered
+                mat_type = mat.GetType()
+                if mat_type not in mat_stats["material_types"]:
+                    mat_stats["material_types"][mat_type] = 1
+                else:
+                    mat_stats["material_types"][mat_type] += 1
+                
                 # Check if it's a Redshift node material (should be c4d.ID_REDSHIFT_MATERIAL)
-                is_rs_material = (mat.GetType() == c4d.ID_REDSHIFT_MATERIAL)
+                is_rs_material = (mat_type == c4d.ID_REDSHIFT_MATERIAL)
+                
+                # Also check for alternative Redshift material type IDs
+                if not is_rs_material and mat_type >= 1000000:
+                    # This is likely a Redshift material with a different ID
+                    self.log(f"[C4D] Found possible Redshift material with ID {mat_type}: {name}")
+                    is_rs_material = True
                 
                 if not is_rs_material:
                     warnings.append(f"ℹ️ '{name}': Not a Redshift node material (type: {mat.GetType()}).")
@@ -3082,12 +3195,35 @@ class C4DSocketServer(threading.Thread):
             # Update the document to apply any changes
             c4d.EventAdd()
             
+            # Format material_types for better readability
+            material_types_formatted = {}
+            for type_id, count in mat_stats["material_types"].items():
+                if type_id == c4d.Mmaterial:
+                    name = "Standard Material"
+                elif type_id == c4d.ID_REDSHIFT_MATERIAL:
+                    name = "Redshift Material (using c4d.ID_REDSHIFT_MATERIAL)"
+                elif type_id == 1036224:
+                    name = "Redshift Material (1036224)"
+                elif type_id >= 1000000:
+                    name = f"Possible Redshift Material ({type_id})"
+                else:
+                    name = f"Unknown Type ({type_id})"
+                
+                material_types_formatted[name] = count
+            
+            # Replace the original dictionary with the formatted one
+            mat_stats["material_types"] = material_types_formatted
+            
             return {
                 "status": "ok", 
                 "warnings": warnings,
                 "fixes": fixes,
                 "summary": summary,
-                "stats": mat_stats
+                "stats": mat_stats,
+                "ids": {
+                    "standard_material": c4d.Mmaterial,
+                    "redshift_material": c4d.ID_REDSHIFT_MATERIAL
+                }
             }
         
         except Exception as e:
