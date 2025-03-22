@@ -1742,50 +1742,69 @@ class C4DSocketServer(threading.Thread):
             return {"error": f"Failed to create effector: {str(e)}"}
 
     def handle_apply_mograph_fields(self, command):
-        """Handle apply_mograph_fields command using the direct approach for R2025.1.
+        """Handle apply_mograph_fields command with comprehensive target linking for R2025.1.
         
-        This implementation uses a simplified direct approach similar to how interactive
-        field creation works in Cinema 4D, based on observed script logs.
+        This implementation creates and links fields to targets using multiple methods
+        for maximum compatibility with different object types and Cinema 4D workflows.
         """
         # Extract command parameters with defaults
         field_type = command.get("field_type", "spherical").lower()
         field_name = command.get("field_name", f"{field_type.capitalize()} Field")
         target_name = command.get("target_name", "")
         parameters = command.get("parameters", {})
+        field_mode = command.get("mode", "").lower()  # Optional mode (affecting clones/object/etc)
         
         self.log(f"[C4D] Creating {field_type} field named '{field_name}'")
         
         # Define function for main thread execution
-        def create_field_direct(doc, field_type, field_name, target_name, parameters):
-            """Create field using direct approach based on observed script logs."""
+        def create_field_direct(doc, field_type, field_name, target_name, parameters, field_mode):
+            """Create field and properly link it to target using multiple mechanisms."""
             result = {}
             
             try:
-                # STEP 1: Map field commands to Cinema 4D command IDs (more reliable than object IDs)
+                # STEP 1: Map field commands and types
                 field_commands = {
                     "spherical": 440000243,  # Spherical Field command
                     "box": 440000244,        # Box Field command
                     "radial": 440000245,     # Radial Field command
                     "linear": 440000246,     # Linear Field command
-                    "noise": 440000248       # Noise Field command
+                    "noise": 440000248,      # Noise Field command
+                    "formula": 440000251,    # Formula Field command
+                    "random": 440000247,     # Random Field command
+                    "sound": 440000249,      # Sound Field command
+                    "python": 440000257      # Python Field command
+                }
+                
+                # Map to field object IDs for direct creation
+                field_types = {
+                    "spherical": 1039384,    # Spherical Field object
+                    "box": 1039385,          # Box Field object
+                    "radial": 1039390,       # Radial Field object
+                    "linear": 1039389,       # Linear Field object
+                    "noise": 1039394,        # Noise Field object
+                    "formula": 1039397,      # Formula Field object
+                    "random": 1039393,       # Random Field object
+                    "sound": 1039395,        # Sound Field object
+                    "python": 1039404        # Python Field object
                 }
                 
                 # Get command ID or default to spherical
                 field_command = field_commands.get(field_type, 440000243)  # Default to spherical
+                field_object_id = field_types.get(field_type, 1039384)     # Default to spherical
                 
-                # STEP 2: First find target object if specified
+                # STEP 2: Find target object if specified
                 target = None
                 if target_name:
                     self.log(f"[C4D] Looking for target object: {target_name}")
                     target = self.find_object_by_name(doc, target_name)
                     if target:
-                        self.log(f"[C4D] Found target: {target.GetName()}")
+                        self.log(f"[C4D] Found target: {target.GetName()} (Type: {target.GetType()})")
                         # Make it the active object so field creation links to it
                         doc.SetActiveObject(target)
                     else:
                         self.log(f"[C4D] Target not found: {target_name}")
                 
-                # STEP 3: Create a random effector if no target specified (fields need a target)
+                # STEP 3: Create a random effector if no target specified
                 created_effector = False
                 if not target:
                     self.log("[C4D] No target specified, creating a random effector")
@@ -1798,7 +1817,7 @@ class C4DSocketServer(threading.Thread):
                         self.log(f"[C4D] Created effector: {target.GetName()}")
                         created_effector = True
                     else:
-                        self.log("[C4D] Failed to create effector, using manual method")
+                        self.log("[C4D] Failed to create effector via command, using manual method")
                         # Manual fallback
                         if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
                             target = c4d.BaseObject(c4d.modules.mograph.Omgrandom)
@@ -1812,12 +1831,24 @@ class C4DSocketServer(threading.Thread):
                             c4d.EventAdd()
                             created_effector = True
                 
-                # STEP 4: Create field using command (this is how the UI does it)
+                # STEP 4: Create field using command
                 self.log(f"[C4D] Creating field using command ID: {field_command}")
+                field = None
+                
+                # First try the command approach (most reliable for proper linking)
                 c4d.CallCommand(field_command)
                 
                 # Get the created field (should be active object now)
                 field = doc.GetActiveObject()
+                
+                # If command method failed, try direct object creation
+                if not field or field.GetName() == target.GetName():
+                    self.log("[C4D] Command method didn't create field, trying direct creation")
+                    field = c4d.BaseObject(field_object_id)
+                    if field:
+                        self.log(f"[C4D] Created field directly (Type: {field.GetType()})")
+                        doc.InsertObject(field)
+                        c4d.EventAdd()
                 
                 # Verify we got a field object
                 if not field:
@@ -1834,13 +1865,13 @@ class C4DSocketServer(threading.Thread):
                 # These are standard parameter IDs for Fields in R2025.1
                 # Using direct IDs instead of constants that might not be available
                 field_param_ids = {
-                    "strength": 1365, # Field Strength (was c4d.FIELD_STRENGTH)
-                    "falloff": 1367,  # Field Falloff (was c4d.FIELD_FALLOFF)
-                    "inner_offset": 1366, # Inner Offset (was c4d.FIELD_INNER_OFFSET)
-                    "min": 1368,     # Min (was c4d.FIELD_MIN)
-                    "max": 1369,     # Max (was c4d.FIELD_MAX)
+                    "strength": 1365, # Field Strength
+                    "falloff": 1367,  # Field Falloff
+                    "inner_offset": 1366, # Inner Offset
+                    "min": 1368,     # Min
+                    "max": 1369,     # Max
                     "scale": 1111,   # Scale parameter
-                    "multiplier": 1370, # Multiplier (was c4d.FIELD_MULTIPLIER)
+                    "multiplier": 1370, # Multiplier
                 }
                 
                 # Set parameters that were provided using direct parameter IDs
@@ -1866,13 +1897,161 @@ class C4DSocketServer(threading.Thread):
                 except Exception as e:
                     self.log(f"[C4D] Warning: Could not set type-specific parameters: {e}")
                 
-                # Make sure changes are applied
+                # Update to ensure field parameters are set
                 c4d.EventAdd()
                 
-                # STEP 6: Get target information
+                # STEP 6: Explicitly apply field to target (critical step)
+                # This uses multiple methods to ensure the field is properly linked
+                field_linked = False
                 target_info = "None"
+                
                 if target:
                     target_info = target.GetName()
+                    self.log(f"[C4D] Explicitly linking field to target: {target_info}")
+                    
+                    try:
+                        # Method 1: Create Fields tag and link (reliable for all object types)
+                        self.log("[C4D] Method 1: Creating Fields tag")
+                        fields_tag = c4d.BaseTag(c4d.Tfields)
+                        
+                        if fields_tag:
+                            # Insert tag into target
+                            target.InsertTag(fields_tag)
+                            doc.AddUndo(c4d.UNDOTYPE_NEW, fields_tag)
+                            
+                            # Create field list
+                            field_list = c4d.FieldList()
+                            
+                            # Try different layer creation approaches for maximum compatibility
+                            field_layer = None
+                            
+                            # Modern approach (R2025.1)
+                            if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
+                                self.log("[C4D] Using c4d.modules.mograph.FieldLayer")
+                                try:
+                                    field_layer = c4d.modules.mograph.FieldLayer(c4d.FLfield)
+                                except Exception as e1:
+                                    self.log(f"[C4D] Error creating FieldLayer with modules: {e1}")
+                            
+                            # Legacy approach fallback
+                            if not field_layer:
+                                self.log("[C4D] Fallback: Using direct FieldLayer")
+                                try:
+                                    field_layer = c4d.FieldLayer(c4d.FLfield)
+                                except Exception as e2:
+                                    self.log(f"[C4D] Error creating direct FieldLayer: {e2}")
+                            
+                            # If we got a layer, link and apply
+                            if field_layer:
+                                self.log(f"[C4D] Linking field '{field.GetName()}' to layer")
+                                result = field_layer.SetLinkedObject(field)
+                                
+                                if result:
+                                    self.log("[C4D] Field linked to layer successfully")
+                                    
+                                    # Insert layer into field list
+                                    field_list.InsertLayer(field_layer)
+                                    
+                                    # Assign field list to tag
+                                    fields_tag[c4d.FIELDS] = field_list
+                                    
+                                    # Update document
+                                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, fields_tag)
+                                    c4d.EventAdd()
+                                    
+                                    field_linked = True
+                                    self.log(f"[C4D] Field successfully linked to {target_info}")
+                                else:
+                                    self.log("[C4D] SetLinkedObject returned False")
+                        
+                        # Method 2: Direct linking for certain target types (like effectors)
+                        if not field_linked:
+                            self.log("[C4D] Method 2: Trying direct field assignment") 
+                            
+                            # For MoGraph effectors, they often have a direct FIELDS parameter
+                            try:
+                                # This is an ID used by many effectors
+                                effector_fields_id = 1019951
+                                
+                                # Check if target has a Fields parameter
+                                if target.GetType() in [1018643, 1018644, 1018643, 1018783]:  # Effector types
+                                    self.log("[C4D] Target is an effector, trying direct field list assignment")
+                                    
+                                    # Get existing field list or create new one
+                                    flist = target[effector_fields_id] or c4d.FieldList()
+                                    
+                                    # Create field layer
+                                    try:
+                                        if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
+                                            flayer = c4d.modules.mograph.FieldLayer(c4d.FLfield)
+                                        else:
+                                            flayer = c4d.FieldLayer(c4d.FLfield)
+                                            
+                                        # Link field
+                                        if flayer.SetLinkedObject(field):
+                                            # Add layer to list
+                                            flist.InsertLayer(flayer)
+                                            
+                                            # Set field list on effector
+                                            target[effector_fields_id] = flist
+                                            doc.AddUndo(c4d.UNDOTYPE_CHANGE, target)
+                                            c4d.EventAdd()
+                                            
+                                            field_linked = True
+                                            self.log(f"[C4D] Field directly linked to effector {target_info}")
+                                    except Exception as e3:
+                                        self.log(f"[C4D] Direct effector linking failed: {e3}")
+                            except Exception as e4:
+                                self.log(f"[C4D] Method 2 failed: {e4}")
+                        
+                        # Method 3: Use mode-specific approach for Cloners
+                        if not field_linked and target.GetType() == 1018544:  # Cloner object
+                            self.log("[C4D] Method 3: Target is a Cloner, checking for special modes")
+                            
+                            # Determine the correct field parameter based on mode
+                            try:
+                                # Fields affecting different aspects of cloners
+                                if field_mode == "position" or not field_mode:
+                                    field_param = 1058970  # Position fields
+                                elif field_mode == "rotation":
+                                    field_param = 1058971  # Rotation fields
+                                elif field_mode == "scale":
+                                    field_param = 1058972  # Scale fields
+                                else:
+                                    field_param = 1058970  # Default to position
+                                
+                                # Get existing field list or create new one
+                                flist = target[field_param] or c4d.FieldList()
+                                
+                                # Create field layer
+                                try:
+                                    if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
+                                        flayer = c4d.modules.mograph.FieldLayer(c4d.FLfield)
+                                    else:
+                                        flayer = c4d.FieldLayer(c4d.FLfield)
+                                        
+                                    # Link field
+                                    if flayer.SetLinkedObject(field):
+                                        # Add layer to list
+                                        flist.InsertLayer(flayer)
+                                        
+                                        # Set field list on cloner
+                                        target[field_param] = flist
+                                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, target)
+                                        c4d.EventAdd()
+                                        
+                                        field_linked = True
+                                        self.log(f"[C4D] Field linked to cloner ({field_mode}) {target_info}")
+                                except Exception as e5:
+                                    self.log(f"[C4D] Cloner mode linking failed: {e5}")
+                            except Exception as e6:
+                                self.log(f"[C4D] Method 3 failed: {e6}")
+                        
+                    except Exception as e:
+                        self.log(f"[C4D] Error linking field to target: {e}")
+                
+                # Final update
+                c4d.EventAdd()
                 
                 # Return success with field info
                 return {
@@ -1881,6 +2060,7 @@ class C4DSocketServer(threading.Thread):
                         "id": str(field.GetGUID()),
                         "type": field_type,
                         "target": target_info,
+                        "linked_to_target": field_linked,
                         "created_effector": created_effector
                     }
                 }
@@ -1898,21 +2078,12 @@ class C4DSocketServer(threading.Thread):
                 return {"error": "No active document"}
                 
             result = self.execute_on_main_thread(
-                create_field_direct, doc, field_type, field_name, target_name, parameters
+                create_field_direct, doc, field_type, field_name, target_name, parameters, field_mode
             )
             return result
         except Exception as e:
             self.log(f"[C4D] Exception in handle_apply_mograph_fields: {str(e)}")
             return {"error": f"Failed to apply MoGraph field: {str(e)}"}
-
-        try:
-            # Get the active document
-            doc = c4d.documents.GetActiveDocument()
-            if not doc:
-                self.log("[C4D] No active document")
-                return {"error": "No active document"}
-
-            # Execute field creation on the main thread with explicit timeout
             self.log(
                 "[C4D] Dispatching field creation to main thread with explicit timeout"
             )
