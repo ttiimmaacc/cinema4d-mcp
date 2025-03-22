@@ -1163,9 +1163,14 @@ class C4DSocketServer(threading.Thread):
 
     def handle_execute_python(self, command):
         """Handle execute_python command."""
+        # Try both 'code' and 'script' parameters for better compatibility
         code = command.get("code", "")
         if not code:
-            return {"error": "No Python code provided"}
+            # Try alternative parameter names
+            code = command.get("script", "")
+            if not code:
+                self.log("[C4D] Error: No Python code provided in 'code' or 'script' parameters")
+                return {"error": "No Python code provided"}
 
         # For security, limit available modules
         allowed_imports = ["c4d", "math", "random", "time", "json", "os.path", "sys"]
@@ -1955,11 +1960,19 @@ class C4DSocketServer(threading.Thread):
             return {"error": f"Object not found: {object_name}"}
 
         def create_soft_body_safe(obj, name, stiffness, mass, object_name):
-            # Create Dynamics tag (ID 180000102)
-            tag = c4d.BaseTag(180000102)
+            self.log(f"[C4D] Creating soft body dynamics tag '{name}' for object '{object_name}'")
+            
+            # Get dynamics tag ID - same for all C4D versions
+            dynamics_tag_id = 180000102  # This is the standard tag ID for dynamics
+            
+            # Create Dynamics tag
+            tag = c4d.BaseTag(dynamics_tag_id)
             if tag is None:
+                self.log(f"[C4D] Error: Failed to create Dynamics Body tag with ID {dynamics_tag_id}")
                 raise RuntimeError("Failed to create Dynamics Body tag")
+                
             tag.SetName(name)
+            self.log(f"[C4D] Successfully created dynamics tag: {name}")
 
             tag[c4d.RIGID_BODY_DYNAMIC] = 1  # Enable dynamics
             tag[c4d.RIGID_BODY_MASS] = mass
