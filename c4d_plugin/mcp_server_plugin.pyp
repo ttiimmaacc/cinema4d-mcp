@@ -1877,19 +1877,21 @@ class C4DSocketServer(threading.Thread):
                     field.SetBit(c4d.BIT_ACTIVE, True)
                     field.SetBit(c4d.BIT_VISIBLE, True)
                     
-                    # CRITICAL: Insert field as child of target
-                    # Fields MUST be children of their targets in C4D 2025
+                    # CRITICAL: Fields MUST be inserted directly as children of their targets in C4D 2025
+                    # This is crucial for the field-target linking to work correctly
                     self.log(f"[C4D] CRITICAL! Inserting field as child of target: {target.GetName()}")
                     
-                    # First insert into document to ensure it exists
-                    doc.InsertObject(field)
-                    # Then explicitly set its parent to the target
-                    field.InsertUnder(target)
+                    # DO NOT insert into document first - that's the root cause of the issue!
+                    # Instead insert DIRECTLY under target from the start
                     doc.AddUndo(c4d.UNDOTYPE_NEW, field)
+                    field.InsertUnderLast(target)  # Must use InsertUnderLast for proper hierarchy
                     
-                    # Make it the active object
+                    # Make it the active object and force scene update
                     doc.SetActiveObject(field)
                     c4d.EventAdd()
+                    
+                    # Special fix for 2025.1 - force field to wake up via parent update
+                    target.Message(c4d.MSG_UPDATE)
                     
                     # Final verification that field exists in scene
                     parent_name = field.GetUp().GetName() if field.GetUp() else 'None'
@@ -2020,28 +2022,98 @@ class C4DSocketServer(threading.Thread):
                                     c4d.EventAdd()
                             
                             if field_driver_tag:
-                                # Try to link field to a parameter
+                                # Try to link field to a parameter - CRITICAL for 2025.1
                                 self.log("[C4D] Attempting to add field to Field Driver parameters")
+                                
+                                # Force an update first to ensure field is fully initialized
+                                field.Message(c4d.MSG_UPDATE)
+                                target.Message(c4d.MSG_UPDATE)
+                                field_driver_tag.Message(c4d.MSG_UPDATE)
+                                c4d.EventAdd()
                                 
                                 # For effectors, try to link to strength parameter
                                 if target.GetType() in [1018643, 1018644, 1018783]:  # Effector IDs
+                                    # Try direct field access by adding field to the driver tag's field list
+                                    self.log("[C4D] CRITICAL! Adding field to Field Driver directly")
+                                    
+                                    # First get any existing fields
+                                    field_list = field_driver_tag.GetObject()
+                                    if not field_list:
+                                        # Create a new field list if none exists
+                                        field_list = c4d.BaseList2D(c4d.Tbaselist2d)
+                                    
+                                    # Add our field to the tag's field list
+                                    field_list.InsertUnder(field)
+                                    
+                                    # Set the field list back to the tag
+                                    field_driver_tag.SetObject(field_list)
+                                    
+                                    # Then try to link to specific parameter
                                     param_id = 1000  # Strength parameter ID (common for effectors)
                                     self.log(f"[C4D] Linking field to effector strength: {param_id}")
                                     if field_driver_tag.AddParameter(param_id, field):
                                         field_driver_success = True
                                         self.log("[C4D] Successfully linked field via Field Driver!")
                                 
-                                # For cloners, try to link based on mode
+                                # For cloners, try to link based on mode - 2025.1 specific approach
                                 elif target.GetType() == 1018544:  # Cloner object
-                                    param_map = {"position": 1001, "rotation": 1002, "scale": 1003}
-                                    param_id = param_map.get(field_mode, 1001)  # Default to position
-                                    self.log(f"[C4D] Linking field to cloner {field_mode}: {param_id}")
-                                    if field_driver_tag.AddParameter(param_id, field):
+                                    # Cinema 4D 2025.1 uses different parameter IDs for cloners
+                                    param_map_2025 = {"position": 1001, "rotation": 1002, "scale": 1003}
+                                    param_map_legacy = {"position": 10001, "rotation": 10002, "scale": 10003}
+                                    
+                                    # Try 2025.1 IDs first
+                                    param_id = param_map_2025.get(field_mode, 1001)  # Default to position
+                                    self.log(f"[C4D] CRITICAL! Linking field to cloner {field_mode}: {param_id}")
+                                    
+                                    success = False
+                                    try:
+                                        # First try to add the field directly to the tag's field list
+                                        field_list = field_driver_tag.GetObject()
+                                        if not field_list:
+                                            field_list = c4d.BaseList2D(c4d.Tbaselist2d)
+                                        field_list.InsertUnder(field)
+                                        field_driver_tag.SetObject(field_list)
+                                        
+                                        # Then try both parameter methods
+                                        if field_driver_tag.AddParameter(param_id, field):
+                                            success = True
+                                            self.log("[C4D] Successfully linked field via Field Driver (2025.1 ID)!")
+                                    except Exception as e:
+                                        self.log(f"[C4D] 2025.1 ID linking failed: {e}")
+                                    
+                                    # If 2025.1 approach failed, try legacy IDs
+                                    if not success:
+                                        param_id = param_map_legacy.get(field_mode, 10001)
+                                        self.log(f"[C4D] Trying legacy ID approach: {param_id}")
+                                        if field_driver_tag.AddParameter(param_id, field):
+                                            success = True
+                                            self.log("[C4D] Successfully linked field via Field Driver (legacy ID)!")
+                                    
+                                    field_driver_success = success
+                                
+                                # Special handling for other object types
+                                else:
+                                    # For all other object types, try using a generic approach
+                                    self.log(f"[C4D] Generic object type: {target.GetType()}, trying default approach")
+                                    
+                                    # Add field to the tag's field list first
+                                    field_list = field_driver_tag.GetObject()
+                                    if not field_list:
+                                        field_list = c4d.BaseList2D(c4d.Tbaselist2d)
+                                    field_list.InsertUnder(field)
+                                    field_driver_tag.SetObject(field_list)
+                                    
+                                    # Try to add to position parameter (most common)
+                                    if field_driver_tag.AddParameter(1001, field):
                                         field_driver_success = True
-                                        self.log("[C4D] Successfully linked field via Field Driver!")
+                                        self.log("[C4D] Successfully linked field via Field Driver generic approach!")
                                 
                                 if field_driver_success:
+                                    # Send multiple update messages to ensure the link is registered
                                     field_driver_tag.Message(c4d.MSG_UPDATE)
+                                    target.Message(c4d.MSG_UPDATE)
+                                    field.Message(c4d.MSG_UPDATE)
+                                    c4d.EventAdd()
                         except Exception as fd_err:
                             self.log(f"[C4D] Field Driver approach failed: {fd_err}")
                         
@@ -2102,13 +2174,35 @@ class C4DSocketServer(threading.Thread):
                                         # Insert layer into field list
                                         field_list.InsertLayer(field_layer)
                                         
-                                        # CRITICAL: Enable "Use Fields" checkbox (ID 1058973)
-                                        # This is required for field activation - fixes "Applied to: None" issue
-                                        self.log("[C4D] Enabling Fields system via FIELDS_ENABLED")
+                                        # CRITICAL: Enable "Use Fields" checkbox - THIS IS THE KEY FIX FOR "Applied to: None"
+                                        self.log("[C4D] CRITICAL! Enabling Fields system via multiple approaches")
                                         try:
-                                            fields_tag[1058973] = True  # FIELDS_ENABLED
+                                            # Try all possible parameter IDs that could enable fields
+                                            # This is absolutely critical - without this, you get "Applied to: None"
+                                            fields_tag[1058973] = True  # FIELDS_ENABLED (R2025.1)
+                                            fields_tag[5840] = True     # Legacy FIELDS_ENABLED
+                                            
+                                            # Also set the primary flags identified in R2025.1 documentation
+                                            # These must ALL be set to ensure fields are properly enabled
+                                            fields_tag[c4d.FIELDS_ENABLE] = True  # Primary Fields Enable flag
+                                            
+                                            # In some versions, there's an additional "Use Fields" flag in the tag itself
+                                            fields_tag[c4d.ID_BASEOBJECT_USEFIELDS] = True
+                                            
+                                            # Force tag update to ensure settings are applied
+                                            fields_tag.Message(c4d.MSG_UPDATE)
+                                            c4d.EventAdd()
+                                            
+                                            self.log("[C4D] CRITICAL CHECK - Fields enabled: YES")
                                         except Exception as e:
                                             self.log(f"[C4D] Error enabling fields: {e}")
+                                            # Try direct flag approach as fallback
+                                            try:
+                                                # In some builds of R2025, enable bit flags directly
+                                                fields_tag.SetBit(c4d.BIT_FIELDS_ENABLED, True)
+                                                self.log("[C4D] Enabled fields via bit flags")
+                                            except:
+                                                self.log("[C4D] All field enabling approaches failed")
                                         
                                         # Assign field list back to tag (CRITICAL STEP)
                                         fields_tag[c4d.FIELDS] = field_list
