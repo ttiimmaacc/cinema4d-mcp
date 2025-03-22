@@ -1742,214 +1742,150 @@ class C4DSocketServer(threading.Thread):
             return {"error": f"Failed to create effector: {str(e)}"}
 
     def handle_apply_mograph_fields(self, command):
-        """Handle apply_mograph_fields command with robust error handling to prevent crashes.
-
-        Rewritten based on Cinema 4D R2025 SDK documentation for MoGraph Fields.
+        """Handle apply_mograph_fields command using the direct approach for R2025.1.
+        
+        This implementation uses a simplified direct approach similar to how interactive
+        field creation works in Cinema 4D, based on observed script logs.
         """
         # Extract command parameters with defaults
         field_type = command.get("field_type", "spherical").lower()
         field_name = command.get("field_name", f"{field_type.capitalize()} Field")
         target_name = command.get("target_name", "")
         parameters = command.get("parameters", {})
-
-        self.log(
-            f"[C4D] Starting apply_mograph_fields for {field_type} field named '{field_name}'"
-        )
-
-        # Define function for main thread execution that follows Cinema 4D SDK documentation
-        def create_field_safe(doc, field_type, field_name, target_name, parameters):
-            """Create a field on the main thread following R2025 SDK guidelines."""
-            self.log("[C4D] Creating field on main thread (using R2025 SDK approach)")
-
+        
+        self.log(f"[C4D] Creating {field_type} field named '{field_name}'")
+        
+        # Define function for main thread execution
+        def create_field_direct(doc, field_type, field_name, target_name, parameters):
+            """Create field using direct approach based on observed script logs."""
             result = {}
-            field = None
-            target = None
-            field_applied = False
-            applied_to = "None"
-
+            
             try:
-                # Step 1: Map field type to proper SDK constants using module approach for R2025.1
-                self.log("[C4D] Determining correct field object ID")
+                # STEP 1: Map field commands to Cinema 4D command IDs (more reliable than object IDs)
+                field_commands = {
+                    "spherical": 440000243,  # Spherical Field command
+                    "box": 440000244,        # Box Field command
+                    "radial": 440000245,     # Radial Field command
+                    "linear": 440000246,     # Linear Field command
+                    "noise": 440000248       # Noise Field command
+                }
                 
-                if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
-                    # Modern approach using modules (R2025.1)
-                    self.log("[C4D] Using R2025.1 modules approach for field constants")
-                    try:
-                        field_constants = {
-                            "spherical": c4d.modules.mograph.Fsphere,
-                            "box": c4d.modules.mograph.Fbox,
-                            "cylindrical": c4d.modules.mograph.Fcylinder, 
-                            "torus": c4d.modules.mograph.Ftorus,
-                            "cone": c4d.modules.mograph.Fcone,
-                            "linear": c4d.modules.mograph.Flinear,
-                            "radial": c4d.modules.mograph.Fradial,
-                            "sound": c4d.modules.mograph.Fsound,
-                            "noise": c4d.modules.mograph.Fnoise
-                        }
-                    except Exception as e:
-                        self.log(f"[C4D] Error accessing modules.mograph constants: {e}")
-                        # Fall through to hardcoded IDs
-                        field_constants = {}
-                else:
-                    self.log("[C4D] Modules approach not available")
-                    field_constants = {}
+                # Get command ID or default to spherical
+                field_command = field_commands.get(field_type, 440000243)  # Default to spherical
                 
-                # Fallback to hardcoded IDs if module constants not available
-                if not field_constants:
-                    self.log("[C4D] Using hardcoded field IDs")
-                    # Define these manually based on MoGraph documentation
-                    field_constants = {
-                        "spherical": 1039384,  # Spherical Field
-                        "box": 1039385,        # Box Field
-                        "cylindrical": 1039386, # Cylindrical Field
-                        "torus": 1039387,      # Torus Field
-                        "cone": 1039388,       # Cone Field
-                        "linear": 1039389,     # Linear Field
-                        "radial": 1039390,     # Radial Field
-                        "sound": 1039391,      # Sound Field
-                        "noise": 1039394       # Noise Field
-                    }
-
-                # Get the proper field type constant or default to spherical
-                default_field = field_constants.get("spherical", 1039384)
-                field_type_id = field_constants.get(field_type, default_field)
-                self.log(f"[C4D] Using field type: {field_type} (ID: {field_type_id})")
-
-                # Step 2: Create the field object and INSERT it into the document FIRST
-                self.log(f"[C4D] Creating {field_type} field object")
-                field = c4d.BaseObject(field_type_id)
+                # STEP 2: First find target object if specified
+                target = None
+                if target_name:
+                    self.log(f"[C4D] Looking for target object: {target_name}")
+                    target = self.find_object_by_name(doc, target_name)
+                    if target:
+                        self.log(f"[C4D] Found target: {target.GetName()}")
+                        # Make it the active object so field creation links to it
+                        doc.SetActiveObject(target)
+                    else:
+                        self.log(f"[C4D] Target not found: {target_name}")
+                
+                # STEP 3: Create a random effector if no target specified (fields need a target)
+                created_effector = False
+                if not target:
+                    self.log("[C4D] No target specified, creating a random effector")
+                    # Create random effector using command (most reliable)
+                    c4d.CallCommand(1018643)  # Random Effector command
+                    
+                    # Get the created effector (should be the active object)
+                    target = doc.GetActiveObject()
+                    if target and target.GetType() == 1018643:  # Random Effector ID
+                        self.log(f"[C4D] Created effector: {target.GetName()}")
+                        created_effector = True
+                    else:
+                        self.log("[C4D] Failed to create effector, using manual method")
+                        # Manual fallback
+                        if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
+                            target = c4d.BaseObject(c4d.modules.mograph.Omgrandom)
+                        else:
+                            target = c4d.BaseObject(1018643)  # Random Effector
+                        
+                        if target:
+                            target.SetName("Random Effector")
+                            doc.InsertObject(target)
+                            doc.SetActiveObject(target)
+                            c4d.EventAdd()
+                            created_effector = True
+                
+                # STEP 4: Create field using command (this is how the UI does it)
+                self.log(f"[C4D] Creating field using command ID: {field_command}")
+                c4d.CallCommand(field_command)
+                
+                # Get the created field (should be active object now)
+                field = doc.GetActiveObject()
+                
+                # Verify we got a field object
                 if not field:
-                    self.log("[C4D] Failed to create field object")
-                    result["error"] = "Failed to create field object"
-                    return result
-
+                    self.log("[C4D] Failed to create field, field is None")
+                    return {"error": "Failed to create field object"}
+                
+                # Set field name
+                self.log(f"[C4D] Naming field: {field_name}")
                 field.SetName(field_name)
                 
-                # Set field parameters BEFORE inserting
-                if "strength" in parameters and isinstance(parameters["strength"], (int, float)):
-                    field[c4d.FIELD_STRENGTH] = float(parameters["strength"])
-                    self.log(f"[C4D] Set strength: {parameters['strength']}")
-
-                if "falloff" in parameters and isinstance(parameters["falloff"], (int, float)):
-                    field[c4d.FIELD_FALLOFF] = float(parameters["falloff"])
-                    self.log(f"[C4D] Set falloff: {parameters['falloff']}")
+                # STEP 5: Set field parameters
+                self.log("[C4D] Setting field parameters")
+                # Map from parameter names to C4D constants
+                param_map = {
+                    "strength": c4d.FIELD_STRENGTH,
+                    "falloff": c4d.FIELD_FALLOFF,
+                    "inner_offset": c4d.FIELD_INNER_OFFSET,
+                    "min": c4d.FIELD_MIN,
+                    "max": c4d.FIELD_MAX,
+                    "multiplier": c4d.FIELD_MULTIPLIER,
+                    "direction_scale": c4d.FIELD_DIRECTIONSCALE,
+                    "direction_mode": c4d.FIELD_DIRECTIONMODE
+                }
                 
-                # Critical step: INSERT the field into document FIRST
-                # This is essential for field to persist
-                self.log("[C4D] Inserting field into document")
-                doc.InsertObject(field)
-                doc.AddUndo(c4d.UNDOTYPE_NEW, field)
+                # Set parameters that were provided
+                for param_name, c4d_param in param_map.items():
+                    if param_name in parameters and isinstance(parameters[param_name], (int, float)):
+                        field[c4d_param] = float(parameters[param_name])
+                        self.log(f"[C4D] Set {param_name}: {parameters[param_name]}")
                 
-                # Update C4D
+                # Make sure changes are applied
                 c4d.EventAdd()
-                self.log(f"[C4D] Field object created successfully: {field.GetName()}")
-
-                # Step 3: Find target if specified
-                if target_name:
-                    self.log(f"[C4D] Looking for target: {target_name}")
-                    target = self.find_object_by_name(doc, target_name)
-
-                    if not target:
-                        self.log(f"[C4D] Target object '{target_name}' not found")
-                    else:
-                        self.log(f"[C4D] Found target: {target.GetName()}")
-
-                # Step 4: Apply field to target if found - using best practice from MoGraph-docs.md
+                
+                # STEP 6: Get target information
+                target_info = "None"
                 if target:
-                    self.log(f"[C4D] Creating Fields tag for {target.GetName()}")
-                    
-                    # Create Fields tag
-                    tag = c4d.BaseTag(c4d.Tfields)
-                    if not tag:
-                        self.log("[C4D] Failed to create Fields tag")
-                    else:
-                        # Insert tag into target object FIRST 
-                        self.log(f"[C4D] Inserting Fields tag into {target.GetName()}")
-                        target.InsertTag(tag)
-                        doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
-                        
-                        # Create FieldList - important: do this AFTER inserting tag
-                        self.log("[C4D] Creating new FieldList")
-                        field_list = c4d.FieldList()
-                        
-                        # Create FieldLayer for the field object
-                        self.log("[C4D] Creating FieldLayer")
-                        try:
-                            # Use correct namespace based on C4D version
-                            if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
-                                self.log("[C4D] Using c4d.modules.mograph.FieldLayer")
-                                field_layer = c4d.modules.mograph.FieldLayer(c4d.FLfield)
-                            else:
-                                self.log("[C4D] Using c4d.FieldLayer fallback")
-                                field_layer = c4d.FieldLayer(c4d.FLfield)
-                                
-                            if not field_layer:
-                                self.log("[C4D] Failed to create FieldLayer")
-                                raise RuntimeError("Failed to create FieldLayer")
-                                
-                            # CRITICAL: Link field to layer - this is the key connection
-                            self.log(f"[C4D] Linking field '{field.GetName()}' to layer")
-                            result = field_layer.SetLinkedObject(field)
-                            if not result:
-                                self.log("[C4D] Warning: SetLinkedObject returned False")
-                                
-                            # Add layer to field list
-                            self.log("[C4D] Inserting layer into field list")
-                            field_list.InsertLayer(field_layer)
-                            
-                            # Update the tag with the field list
-                            self.log("[C4D] Setting field list back to tag")
-                            tag[c4d.FIELDS] = field_list
-                            
-                            # Register for undo
-                            doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
-                            
-                            # Force an update to actually apply the changes
-                            c4d.EventAdd()
-                            
-                            # Record successful application
-                            field_applied = True
-                            applied_to = target.GetName()
-                            self.log(f"[C4D] Successfully applied field to {applied_to}")
-                            
-                        except Exception as e:
-                            self.log(f"[C4D] Error in field application: {str(e)}")
-                            import traceback
-                            traceback.print_exc()
-
-                # Final step: Ensure scene is updated with all changes
-                self.log("[C4D] Final update to ensure all changes are applied")
-                c4d.EventAdd()
-
-                # Prepare response with field information
-                if field:
-                    field_info = {
+                    target_info = target.GetName()
+                
+                # Return success with field info
+                return {
+                    "field": {
                         "name": field.GetName(),
                         "id": str(field.GetGUID()),
                         "type": field_type,
-                        "applied_to": applied_to,
-                        "applied_successfully": field_applied,
+                        "target": target_info,
+                        "created_effector": created_effector
                     }
-
-                    if "strength" in parameters:
-                        field_info["strength"] = parameters["strength"]
-                    if "falloff" in parameters:
-                        field_info["falloff"] = parameters["falloff"]
-
-                    self.log(f"[C4D] Field creation complete: {field.GetName()}")
-                    result["field"] = field_info
-                else:
-                    self.log("[C4D] No field was created")
-                    result["error"] = "Failed to create field object"
-
-                return result
-
+                }
+                
             except Exception as e:
-                self.log(f"[C4D] Error in create_field_safe: {str(e)}")
+                self.log(f"[C4D] Error creating field: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                result["error"] = f"Failed to apply MoGraph field: {str(e)}"
-                return result
+                return {"error": f"Field creation error: {str(e)}"}
+        
+        # Execute on main thread
+        try:
+            doc = c4d.documents.GetActiveDocument()
+            if not doc:
+                return {"error": "No active document"}
+                
+            result = self.execute_on_main_thread(
+                create_field_direct, doc, field_type, field_name, target_name, parameters
+            )
+            return result
+        except Exception as e:
+            self.log(f"[C4D] Exception in handle_apply_mograph_fields: {str(e)}")
+            return {"error": f"Failed to apply MoGraph field: {str(e)}"}
 
         try:
             # Get the active document
