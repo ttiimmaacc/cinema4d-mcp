@@ -1,8 +1,8 @@
 """
 Cinema 4D MCP Server Plugin
 Updated for Cinema 4D R2025.1 compatibility
-Version 0.1.7 - Enhanced Redshift material creation and debugging with NodeMaterial
-Features all command handlers and improved Redshift material diagnostics
+Version 0.1.8 - R2025.1 SDK-compliant Redshift material creation
+Features direct NodeMaterial creation, improved transaction handling, and robust fallbacks
 """
 
 import c4d
@@ -383,65 +383,108 @@ class C4DSocketServer(threading.Thread):
     def handle_debug_redshift_material(self, command):
         """Debug handler to test Redshift material creation directly."""
         self.log("[C4D] DEBUG: Testing Redshift material creation...")
-        
+
         try:
             doc = c4d.documents.GetActiveDocument()
             # Get diagnostic info
             diagnostic = {
                 "c4d_version": c4d.GetC4DVersion(),
                 "has_redshift_module": hasattr(c4d.modules, "redshift"),
-                "plugin_info": []
+                "plugin_info": [],
             }
-            
+
             # Check for Redshift plugin
             plugins = c4d.plugins.FilterPluginList(c4d.PLUGINTYPE_MATERIAL, True)
             redshift_plugin_id = None
-            
+
             for plugin in plugins:
                 plugin_name = plugin.GetName()
                 plugin_id = plugin.GetID()
-                diagnostic["plugin_info"].append({
-                    "name": plugin_name,
-                    "id": plugin_id
-                })
-                
+                diagnostic["plugin_info"].append({"name": plugin_name, "id": plugin_id})
+
                 if "redshift" in plugin_name.lower():
                     redshift_plugin_id = plugin_id
                     diagnostic["redshift_plugin_id"] = plugin_id
-            
+
             # Create a test material
             test_name = f"Debug_RS_{int(time.time())}"
             material_type = "redshift" if redshift_plugin_id else "standard"
             mat = None
-            
-            if redshift_plugin_id:
-                # Create Redshift material
-                self.log(f"[C4D] Creating test Redshift material with ID {redshift_plugin_id}")
-                mat = c4d.BaseMaterial(redshift_plugin_id)
-                mat.SetName(test_name)
-                
-                # Try to set up node graph
-                try:
-                    import maxon
-                    redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
-                    node_mat = c4d.NodeMaterial(mat)
-                    if not node_mat.HasSpace(redshift_ns):
-                        node_mat.CreateDefaultGraph(redshift_ns)
+
+            # Create Redshift material using R2025.1 approach
+            self.log("[C4D] Creating test Redshift material using R2025.1 NodeMaterial approach")
+            try:
+                # Create directly as NodeMaterial (recommended for R2025.1+)
+                import maxon
+                mat = c4d.NodeMaterial()
+                if mat:
+                    mat.SetName(test_name)
                     
-                    # Set color
-                    graph = node_mat.GetGraph(redshift_ns)
-                    if graph:
-                        for node in graph.GetNodes():
-                            if "StandardMaterial" in node.GetId():
-                                try:
-                                    node.SetParameter(
-                                        maxon.nodes.ParameterID("base_color"),
-                                        maxon.Vector(1.0, 0.0, 0.0)
-                                    )
-                                    break
+                    # Set up Redshift node space
+                    redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                    
+                    # Create the default graph
+                    if mat.CreateDefaultGraph(redshift_ns):
+                        self.log("[C4D] Successfully created Redshift NodeMaterial")
+                        
+                        # Set color
+                        graph = mat.GetGraph(redshift_ns)
+                        if graph:
+                            with graph.BeginTransaction() as transaction:
+                                # Find the Standard Surface node
+                                for node in graph.GetNodes():
+                                    if "StandardMaterial" in node.GetId():
+                                        try:
+                                            # Set base color parameter
+                                            param_id = maxon.nodes.ParameterID("base_color")
+                                            color_value = maxon.Color(1.0, 0.0, 0.0)
+                                            
+                                            node.SetParameter(
+                                                param_id,
+                                                color_value,
+                                                maxon.PARAMETERPRIORITY_ANIMATION
+                                            )
+                                            break
+                                        except Exception as e:
+                                            diagnostic["color_error"] = str(e)
+                                
+                                # Commit the transaction
+                                transaction.Commit()
+                    else:
+                        self.log("[C4D] Failed to create default Redshift graph - trying legacy approach")
+                        if redshift_plugin_id:
+                            mat = c4d.BaseMaterial(redshift_plugin_id)
+                            mat.SetName(test_name)
+                            node_mat = c4d.NodeMaterial(mat)
+                            node_mat.CreateDefaultGraph(redshift_ns)
+            except Exception as e:
+                self.log(f"[C4D] NodeMaterial approach failed: {str(e)} - using legacy approach")
+                # Fallback to legacy approach
+                if redshift_plugin_id:
+                    mat = c4d.BaseMaterial(redshift_plugin_id)
+                    mat.SetName(test_name)
+                    
+                    try:
+                        import maxon
+                        redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                        node_mat = c4d.NodeMaterial(mat)
+                        if not node_mat.HasSpace(redshift_ns):
+                            node_mat.CreateDefaultGraph(redshift_ns)
+                        
+                        # Set color
+                        graph = node_mat.GetGraph(redshift_ns)
+                        if graph:
+                            for node in graph.GetNodes():
+                                if "StandardMaterial" in node.GetId():
+                                    try:
+                                        node.SetParameter(
+                                            maxon.nodes.ParameterID("base_color"),
+                                            maxon.Vector(1.0, 0.0, 0.0),
+                                        )
+                                        break
                                 except:
                                     pass
-                    
+
                     # Validate
                     diagnostic["has_node_graph"] = node_mat.HasSpace(redshift_ns)
                     diagnostic["node_count"] = len(graph.GetNodes()) if graph else 0
@@ -454,12 +497,12 @@ class C4DSocketServer(threading.Thread):
                 mat = c4d.BaseMaterial(c4d.Mmaterial)
                 mat.SetName(test_name)
                 mat[c4d.MATERIAL_COLOR_COLOR] = c4d.Vector(1, 0, 0)
-            
+
             # Insert material into document
             if mat:
                 doc.InsertMaterial(mat)
                 c4d.EventAdd()
-            
+
             # Return detailed diagnostic information
             return {
                 "status": "ok",
@@ -467,17 +510,18 @@ class C4DSocketServer(threading.Thread):
                 "diagnostic": diagnostic,
                 "material_type": material_type,
                 "material_id": mat.GetType() if mat else None,
-                "material_name": test_name
+                "material_name": test_name,
             }
-            
+
         except Exception as e:
             import traceback
+
             return {
                 "status": "error",
                 "message": f"Error in debug Redshift material: {str(e)}",
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc(),
             }
-    
+
     def handle_get_scene_info(self):
         """Handle get_scene_info command."""
         doc = c4d.documents.GetActiveDocument()
@@ -1037,10 +1081,12 @@ class C4DSocketServer(threading.Thread):
 
                 # For Cinema 4D R2025.1, we need to get settings as BaseContainer
                 try:
-                    self.log("[C4D] Using R2025.1 approach for rendering with BaseContainer settings")
+                    self.log(
+                        "[C4D] Using R2025.1 approach for rendering with BaseContainer settings"
+                    )
                     # Get the render data as a BaseContainer
                     settings = rd.GetDataInstance()  # Gets the BaseContainer
-                    
+
                     # Use BaseContainer for render settings
                     c4d.documents.RenderDocument(
                         doc,
@@ -1051,7 +1097,7 @@ class C4DSocketServer(threading.Thread):
                     )
                 except Exception as e:
                     self.log(f"[C4D] Error with R2025.1 rendering approach: {str(e)}")
-                    
+
                     # Fall back to traditional method if needed
                     try:
                         self.log("[C4D] Falling back to traditional rendering approach")
@@ -1175,20 +1221,22 @@ class C4DSocketServer(threading.Thread):
                     c4d.FORMAT_C4DEXPORT,
                 ):
                     return {"error": f"Failed to save document to {file_path}"}
-                
+
                 # R2025.1 fix: Update document name and path to fix "Untitled-1" issue
                 try:
                     # Update the document name
                     doc.SetDocumentName(os.path.basename(file_path))
-                    
+
                     # Update document path
                     doc.SetDocumentPath(os.path.dirname(file_path))
-                    
+
                     # Ensure UI is updated
                     c4d.EventAdd()
                     self.log(f"[C4D] Updated document name and path for {file_path}")
                 except Exception as e:
-                    self.log(f"[C4D] Warning: Could not update document name/path: {str(e)}")
+                    self.log(
+                        f"[C4D] Warning: Could not update document name/path: {str(e)}"
+                    )
 
                 return {
                     "success": True,
@@ -1364,14 +1412,16 @@ class C4DSocketServer(threading.Thread):
                     grid_size = (
                         int(count ** (1 / 3)) or 1
                     )  # Cube root for even distribution
-                    
+
                     # Use correct R2025.1 MoGraph constants path
                     try:
                         # R2025.1 approach using modules.mograph namespace
                         cloner[c4d.modules.mograph.MG_GRID_COUNT_X] = grid_size
                         cloner[c4d.modules.mograph.MG_GRID_COUNT_Y] = grid_size
                         cloner[c4d.modules.mograph.MG_GRID_COUNT_Z] = grid_size
-                        self.log("[C4D] Set grid counts using c4d.modules.mograph namespace")
+                        self.log(
+                            "[C4D] Set grid counts using c4d.modules.mograph namespace"
+                        )
                     except Exception as e:
                         # Fallback to traditional constants if needed
                         self.log(f"[C4D] Error with mograph module: {str(e)}")
@@ -1379,7 +1429,9 @@ class C4DSocketServer(threading.Thread):
                             cloner[c4d.MG_GRID_COUNT_X] = grid_size
                             cloner[c4d.MG_GRID_COUNT_Y] = grid_size
                             cloner[c4d.MG_GRID_COUNT_Z] = grid_size
-                            self.log("[C4D] Set grid counts using traditional constants")
+                            self.log(
+                                "[C4D] Set grid counts using traditional constants"
+                            )
                         except Exception as e2:
                             self.log(f"[C4D] Could not set grid counts: {str(e2)}")
                     # Set some reasonable spacing
@@ -1396,14 +1448,16 @@ class C4DSocketServer(threading.Thread):
                     else:
                         # No object specified, fall back to grid mode
                         cloner[c4d.ID_MG_MOTIONGENERATOR_MODE] = 1  # Grid
-                        
+
                         # Use correct R2025.1 MoGraph constants path
                         try:
                             # R2025.1 approach using modules.mograph namespace
                             cloner[c4d.modules.mograph.MG_GRID_COUNT_X] = 3
                             cloner[c4d.modules.mograph.MG_GRID_COUNT_Y] = 3
                             cloner[c4d.modules.mograph.MG_GRID_COUNT_Z] = 3
-                            self.log("[C4D] Set default grid counts using c4d.modules.mograph namespace")
+                            self.log(
+                                "[C4D] Set default grid counts using c4d.modules.mograph namespace"
+                            )
                         except Exception as e:
                             # Fallback to traditional constants if needed
                             self.log(f"[C4D] Error with mograph module: {str(e)}")
@@ -1411,9 +1465,13 @@ class C4DSocketServer(threading.Thread):
                                 cloner[c4d.MG_GRID_COUNT_X] = 3
                                 cloner[c4d.MG_GRID_COUNT_Y] = 3
                                 cloner[c4d.MG_GRID_COUNT_Z] = 3
-                                self.log("[C4D] Set default grid counts using traditional constants")
+                                self.log(
+                                    "[C4D] Set default grid counts using traditional constants"
+                                )
                             except Exception as e2:
-                                self.log(f"[C4D] Could not set default grid counts: {str(e2)}")
+                                self.log(
+                                    f"[C4D] Could not set default grid counts: {str(e2)}"
+                                )
 
                 # Add a default child object to clone if none exists
                 # (otherwise cloner won't show anything)
@@ -1502,20 +1560,40 @@ class C4DSocketServer(threading.Thread):
                                 # Try R2025.1 module path first
                                 if mode_id == 0:  # Linear
                                     additional_props["count"] = current_obj[
-                                        c4d.modules.mograph.MG_LINEAR_COUNT if hasattr(c4d.modules, "mograph") else c4d.MG_LINEAR_COUNT
+                                        (
+                                            c4d.modules.mograph.MG_LINEAR_COUNT
+                                            if hasattr(c4d.modules, "mograph")
+                                            else c4d.MG_LINEAR_COUNT
+                                        )
                                     ]
                                 elif mode_id == 1:  # Grid
                                     if hasattr(c4d.modules, "mograph"):
-                                        additional_props["count_x"] = current_obj[c4d.modules.mograph.MG_GRID_COUNT_X]
-                                        additional_props["count_y"] = current_obj[c4d.modules.mograph.MG_GRID_COUNT_Y]
-                                        additional_props["count_z"] = current_obj[c4d.modules.mograph.MG_GRID_COUNT_Z]
+                                        additional_props["count_x"] = current_obj[
+                                            c4d.modules.mograph.MG_GRID_COUNT_X
+                                        ]
+                                        additional_props["count_y"] = current_obj[
+                                            c4d.modules.mograph.MG_GRID_COUNT_Y
+                                        ]
+                                        additional_props["count_z"] = current_obj[
+                                            c4d.modules.mograph.MG_GRID_COUNT_Z
+                                        ]
                                     else:
-                                        additional_props["count_x"] = current_obj[c4d.MG_GRID_COUNT_X]
-                                        additional_props["count_y"] = current_obj[c4d.MG_GRID_COUNT_Y]
-                                        additional_props["count_z"] = current_obj[c4d.MG_GRID_COUNT_Z]
+                                        additional_props["count_x"] = current_obj[
+                                            c4d.MG_GRID_COUNT_X
+                                        ]
+                                        additional_props["count_y"] = current_obj[
+                                            c4d.MG_GRID_COUNT_Y
+                                        ]
+                                        additional_props["count_z"] = current_obj[
+                                            c4d.MG_GRID_COUNT_Z
+                                        ]
                                 elif mode_id == 2:  # Radial
                                     additional_props["count"] = current_obj[
-                                        c4d.modules.mograph.MG_POLY_COUNT if hasattr(c4d.modules, "mograph") else c4d.MG_POLY_COUNT
+                                        (
+                                            c4d.modules.mograph.MG_POLY_COUNT
+                                            if hasattr(c4d.modules, "mograph")
+                                            else c4d.MG_POLY_COUNT
+                                        )
                                     ]
                             except Exception as e:
                                 self.log(f"[C4D] Error getting cloner counts: {str(e)}")
@@ -2392,15 +2470,15 @@ class C4DSocketServer(threading.Thread):
         try:
             # Execute a Python script to create a Redshift material
             script = """
-import c4d
-doc = c4d.documents.GetActiveDocument()
-# Try with known Redshift ID
-rs_mat = c4d.BaseMaterial(1036224)
-if rs_mat:
-    rs_mat.SetName("TempRedshiftMaterial")
-    doc.InsertMaterial(rs_mat)
-    c4d.EventAdd()
-"""
+                    import c4d
+                    doc = c4d.documents.GetActiveDocument()
+                    # Try with known Redshift ID
+                    rs_mat = c4d.BaseMaterial(1036224)
+                    if rs_mat:
+                        rs_mat.SetName("TempRedshiftMaterial")
+                        doc.InsertMaterial(rs_mat)
+                        c4d.EventAdd()
+                    """
             # Only try script-based approach if explicitly allowed
             if (
                 hasattr(c4d, "modules")
@@ -2937,42 +3015,77 @@ if rs_mat:
 
                 # Using R2025.1 SDK approach for creating Redshift NodeMaterial
                 try:
-                    self.log("[C4D] Creating Redshift material using R2025.1 SDK approach")
-                    
-                    # Determine the Redshift material ID to use
-                    rs_id = 1036224  # Default known Redshift material ID
-                    
-                    if hasattr(c4d, "ID_REDSHIFT_MATERIAL"):
-                        rs_id = c4d.ID_REDSHIFT_MATERIAL
-                        self.log(f"[C4D] Using c4d.ID_REDSHIFT_MATERIAL: {rs_id}")
-                    elif redshift_plugin_id is not None:
-                        rs_id = redshift_plugin_id
-                        self.log(f"[C4D] Using detected plugin ID: {rs_id}")
-                    else:
-                        self.log(f"[C4D] Using default Redshift ID: {rs_id}")
+                    self.log(
+                        "[C4D] Creating Redshift material using R2025.1 SDK approach"
+                    )
+
+                    try:
+                        # R2025.1 Approach: Create directly with NodeMaterial (preferred)
+                        self.log("[C4D] Using R2025.1 direct NodeMaterial approach")
+                        import maxon
                         
-                    # Step 1: Create a material with the Redshift Material ID
-                    mat = c4d.BaseMaterial(rs_id)
-                    
-                    if not mat:
-                        raise RuntimeError("Failed to create base Redshift material")
+                        # Create a new NodeMaterial directly
+                        mat = c4d.NodeMaterial()
+                        if mat:
+                            mat.SetName(name)
+                            
+                            # Set up Redshift node space
+                            redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                            
+                            # Create the default Redshift graph
+                            if mat.CreateDefaultGraph(redshift_ns):
+                                self.log("[C4D] Successfully created default Redshift node graph")
+                                redshift_material_created = True
+                                material_type = "redshift"
+                                success = True
+                            else:
+                                self.log("[C4D] Failed to create default Redshift node graph")
+                                # Fall back to legacy approach
+                        else:
+                            self.log("[C4D] Failed to create NodeMaterial - falling back to legacy approach")
+                    except Exception as e:
+                        self.log(f"[C4D] R2025.1 direct NodeMaterial approach failed: {str(e)}")
+                        self.log("[C4D] Falling back to legacy approach")
                         
-                    # Set the name immediately
-                    mat.SetName(name)
-                    
-                    # Verify we got a valid Redshift material
-                    if mat and mat.GetType() == rs_id:
-                        self.log(f"[C4D] Successfully created Redshift material, type: {mat.GetType()}")
-                        redshift_material_created = True
-                        material_type = "redshift"
-                        success = True
-                    else:
-                        self.log("[C4D] Failed to create valid Redshift material")
-                        material_type = "standard"
-                        
+                    # Legacy Approach (fallback)
+                    if not redshift_material_created:
+                        # Determine the Redshift material ID to use
+                        rs_id = 1036224  # Default known Redshift material ID
+
+                        if hasattr(c4d, "ID_REDSHIFT_MATERIAL"):
+                            rs_id = c4d.ID_REDSHIFT_MATERIAL
+                            self.log(f"[C4D] Using c4d.ID_REDSHIFT_MATERIAL: {rs_id}")
+                        elif redshift_plugin_id is not None:
+                            rs_id = redshift_plugin_id
+                            self.log(f"[C4D] Using detected plugin ID: {rs_id}")
+                        else:
+                            self.log(f"[C4D] Using default Redshift ID: {rs_id}")
+
+                        # Step 1: Create a material with the Redshift Material ID
+                        mat = c4d.BaseMaterial(rs_id)
+
+                        if not mat:
+                            raise RuntimeError("Failed to create base Redshift material")
+
+                        # Set the name immediately
+                        mat.SetName(name)
+
+                        # Verify we got a valid Redshift material
+                        if mat and mat.GetType() == rs_id:
+                            self.log(
+                                f"[C4D] Successfully created Redshift material, type: {mat.GetType()}"
+                            )
+                            redshift_material_created = True
+                            material_type = "redshift"
+                            success = True
+                        else:
+                            self.log("[C4D] Failed to create valid Redshift material")
+                            material_type = "standard"
+
                 except Exception as e:
                     self.log(f"[C4D] Redshift material creation error: {str(e)}")
                     import traceback
+
                     traceback.print_exc()
                     material_type = "standard"
 
@@ -2980,7 +3093,6 @@ if rs_mat:
                 if redshift_material_created and mat:
                     try:
                         self.log("[C4D] Setting up Redshift node graph...")
-                        mat.SetName(name)
                         material_type = "redshift"
                         success = True
 
@@ -2992,58 +3104,76 @@ if rs_mat:
                             "com.redshift3d.redshift4c4d.class.nodespace"
                         )
 
-                        # Create default graph (includes Standard material node)
-                        self.log(
-                            "[C4D] Creating default node graph for Redshift material"
-                        )
-                        try:
-                            # Step 2: Properly initialize as a NodeMaterial (R2025.1 approach)
-                            # This is critical as per the R2025.1 SDK documentation
-                            node_mat = c4d.NodeMaterial(mat)
-                            if not node_mat:
-                                raise RuntimeError("Failed to create NodeMaterial wrapper")
-                            
-                            # Step 3: Create the default graph using the NodeMaterial
-                            if not node_mat.HasSpace(redshift_ns):
-                                graph = node_mat.CreateDefaultGraph(redshift_ns)
-                                self.log("[C4D] Created default Redshift node graph")
-                            else:
-                                graph = node_mat.GetGraph(redshift_ns)
-                                self.log("[C4D] Using existing Redshift node graph")
+                        # Work with material as NodeMaterial
+                        node_mat = None
+                        
+                        if isinstance(mat, c4d.NodeMaterial):
+                            # Direct NodeMaterial approach (used in R2025.1+)
+                            self.log("[C4D] Material is already a NodeMaterial")
+                            node_mat = mat
+                        else:
+                            # Legacy conversion approach
+                            self.log("[C4D] Converting to NodeMaterial")
+                            try:
+                                # Convert BaseMaterial to NodeMaterial
+                                node_mat = c4d.NodeMaterial(mat)
+                                if not node_mat:
+                                    raise RuntimeError("Failed to create NodeMaterial wrapper")
                                 
-                            # Important: Update our reference to use the NodeMaterial
-                            mat = node_mat
-
-                            # Find the Standard Surface material node to set color
-                            if len(color) >= 3 and graph:
-                                root = graph.GetViewRoot()
-                                if root:
-                                    # Try to find Standard Surface node
-                                    for node in graph.GetNodes():
-                                        node_id = node.GetId()
-                                        if "StandardMaterial" in node_id:
-                                            self.log(
-                                                f"[C4D] Found StandardMaterial node: {node_id}"
-                                            )
-                                            try:
+                                # Create default graph if needed
+                                if not node_mat.HasSpace(redshift_ns):
+                                    graph = node_mat.CreateDefaultGraph(redshift_ns)
+                                    self.log("[C4D] Created default Redshift node graph")
+                                else:
+                                    graph = node_mat.GetGraph(redshift_ns)
+                                    self.log("[C4D] Using existing Redshift node graph")
+                                
+                                # Important: Update our reference to use the NodeMaterial
+                                mat = node_mat
+                            except Exception as e:
+                                self.log(f"[C4D] Error converting to NodeMaterial: {str(e)}")
+                        
+                        # Make sure we have a valid NodeMaterial
+                        if node_mat is None:
+                            raise RuntimeError("Failed to obtain valid NodeMaterial")
+                        
+                        # Get the graph if we have a valid node_mat
+                        graph = node_mat.GetGraph(redshift_ns) if node_mat else None
+                        
+                        # Find the Standard Surface material node to set color
+                        if len(color) >= 3 and graph:
+                            root = graph.GetViewRoot()
+                            if root:
+                                # Try to find Standard Surface node
+                                for node in graph.GetNodes():
+                                    node_id = node.GetId()
+                                    if "StandardMaterial" in node_id:
+                                        self.log(
+                                            f"[C4D] Found StandardMaterial node: {node_id}"
+                                        )
+                                        try:
+                                            # R2025.1 recommended approach for setting parameters
+                                            with graph.BeginTransaction() as transaction:
                                                 # Set base color parameter
+                                                param_id = maxon.nodes.ParameterID("base_color")
+                                                color_value = maxon.Color(color[0], color[1], color[2])
+                                                
                                                 node.SetParameter(
-                                                    maxon.nodes.ParameterID(
-                                                        "base_color"
-                                                    ),
-                                                    maxon.Color(
-                                                        color[0], color[1], color[2]
-                                                    ),
-                                                    maxon.PROPERTYFLAGS_NONE,
+                                                    param_id,
+                                                    color_value,
+                                                    maxon.PARAMETERPRIORITY_ANIMATION
                                                 )
-                                                self.log(
-                                                    f"[C4D] Set color: [{color[0]}, {color[1]}, {color[2]}]"
-                                                )
-                                            except Exception as e:
-                                                self.log(
-                                                    f"[C4D] Error setting node color: {str(e)}"
-                                                )
-                                            break
+                                                
+                                                # Commit the transaction
+                                                if transaction.Commit():
+                                                    self.log(f"[C4D] Set color: [{color[0]}, {color[1]}, {color[2]}]")
+                                                else:
+                                                    self.log("[C4D] Failed to commit transaction for color change")
+                                        except Exception as e:
+                                            self.log(
+                                                f"[C4D] Error setting node color: {str(e)}"
+                                            )
+                                        break
                         except Exception as e:
                             self.log(
                                 f"[C4D] Error setting up Redshift node graph: {str(e)}"
