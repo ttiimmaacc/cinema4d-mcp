@@ -1742,14 +1742,29 @@ class C4DSocketServer(threading.Thread):
             return {"error": f"Failed to create effector: {str(e)}"}
 
     def handle_apply_mograph_fields(self, command):
-        """Handle apply_mograph_fields command with simplified field-target linking for R2025.1.
+        """Handle apply_mograph_fields command with enhanced field-target linking for R2025.1.
         
         This implementation creates fields and properly links them to target objects following
         the exact workflow documented in troubleshoot.md for maximum compatibility.
+        
+        In Cinema 4D 2025.1, fields require special handling:
+        1. Fields must be direct children of their target objects
+        2. Fields require either a Fields tag or Field Driver tag on the target
+        3. For the "Applied to: None" issue, the "Use Fields" checkbox must be enabled
+        4. Parameter IDs have been updated in 2025.1 from previous versions
+        
+        This implementation addresses all these issues and provides detailed diagnostics.
         """
         # Extract command parameters with defaults
         field_type = command.get("field_type", "spherical").lower()
-        field_name = command.get("field_name", f"{field_type.capitalize()} Field")
+        # Ensure field name includes the type (better for identification)
+        field_name = command.get("field_name", "")
+        if not field_name:
+            field_name = f"{field_type.capitalize()} Field"
+        # If a name was provided without "Field" suffix, add it for clarity
+        elif " Field" not in field_name and "Field" not in field_name:
+            field_name = f"{field_name} Field" 
+        
         target_name = command.get("target_name", "")
         parameters = command.get("parameters", {})
         field_mode = command.get("mode", "").lower()  # Optional mode (affecting clones/object/etc)
@@ -1791,6 +1806,11 @@ class C4DSocketServer(threading.Thread):
                 # Get command ID or default to spherical
                 field_command = field_commands.get(field_type, 440000243)  # Default to spherical
                 field_object_id = field_types.get(field_type, 1039384)     # Default to spherical
+                
+                # Critical logging for field type verification
+                self.log(f"[C4D] CRITICAL! Requested field type: '{field_type}'")
+                self.log(f"[C4D] CRITICAL! Using field object ID: {field_object_id}")
+                self.log(f"[C4D] CRITICAL! Field name to be used: '{field_name}'")
                 
                 # STEP 2: Find target object if specified
                 target = None
@@ -1839,12 +1859,50 @@ class C4DSocketServer(threading.Thread):
                 self.log(f"[C4D] Creating field directly with type ID: {field_object_id}")
                 field = c4d.BaseObject(field_object_id)
                 if field:
-                    # Set name IMMEDIATELY before inserting
+                    # CRITICAL CHECK: Verify object was created with right type
+                    actual_type = field.GetType()
+                    self.log(f"[C4D] CRITICAL! Created field actual type: {actual_type}")
+                    if actual_type != field_object_id:
+                        self.log(f"[C4D] WARNING! Field type mismatch: requested {field_object_id}, got {actual_type}")
+                    
+                    # Set name IMMEDIATELY before inserting and force it explicitly
+                    self.log(f"[C4D] CRITICAL! Setting field name to: '{field_name}'")
                     field.SetName(field_name)
-                    self.log(f"[C4D] Created field directly (Type: {field.GetType()}, Name: {field.GetName()})")
+                    
+                    # Double check name was applied
+                    name_result = field.GetName()
+                    self.log(f"[C4D] CRITICAL! Verification - field name is now: '{name_result}'")
+                    
+                    # Make the field visible in viewport by setting bits
+                    field.SetBit(c4d.BIT_ACTIVE, True)
+                    field.SetBit(c4d.BIT_VISIBLE, True)
+                    
+                    # CRITICAL: Insert field as child of target
+                    # Fields MUST be children of their targets in C4D 2025
+                    self.log(f"[C4D] CRITICAL! Inserting field as child of target: {target.GetName()}")
+                    
+                    # First insert into document to ensure it exists
                     doc.InsertObject(field)
-                    doc.SetActiveObject(field)  # Make it the active object
+                    # Then explicitly set its parent to the target
+                    field.InsertUnder(target)
+                    doc.AddUndo(c4d.UNDOTYPE_NEW, field)
+                    
+                    # Make it the active object
+                    doc.SetActiveObject(field)
                     c4d.EventAdd()
+                    
+                    # Final verification that field exists in scene
+                    parent_name = field.GetUp().GetName() if field.GetUp() else 'None'
+                    self.log(f"[C4D] CRITICAL! Field parent after insertion: {parent_name}")
+                    
+                    # Make sure field is a child of target
+                    if parent_name != target.GetName():
+                        self.log(f"[C4D] ERROR! Field parent mismatch! Expected: {target.GetName()}, Got: {parent_name}")
+                        # Try one more time to force parent-child relationship
+                        field.Remove()
+                        field.InsertUnderLast(target)
+                        c4d.EventAdd()
+                        self.log(f"[C4D] RETRY! Field parent now: {field.GetUp().GetName() if field.GetUp() else 'None'}")
                 
                 # Verify we got a field object
                 if not field:
@@ -1863,26 +1921,44 @@ class C4DSocketServer(threading.Thread):
                 # STEP 5: Set field parameters using direct parameter IDs
                 self.log("[C4D] Setting field parameters")
                 
-                # These are standard parameter IDs for Fields in R2025.1
-                # Using direct IDs instead of constants that might not be available
+                # Updated parameter IDs for Fields in R2025.1 as per troubleshoot.md
                 field_param_ids = {
-                    "strength": 1365, # Field Strength
-                    "falloff": 1367,  # Field Falloff
-                    "inner_offset": 1366, # Inner Offset
-                    "min": 1368,     # Min
-                    "max": 1369,     # Max
-                    "scale": 1111,   # Scale parameter
-                    "multiplier": 1370, # Multiplier
+                    "strength": 1391,  # Updated from 1365 for 2025.1
+                    "falloff": 1389,   # Updated from 1367 for 2025.1
+                    "inner_offset": 1388,  # Updated from 1366 for 2025.1
+                    "min": 1393,       # Updated from 1368 for 2025.1
+                    "max": 1394,       # Updated from 1369 for 2025.1
+                    "scale": 1111,     # Scale parameter (unchanged)
+                    "multiplier": 1370,  # Multiplier (unchanged)
+                }
+                
+                # Also try older IDs as fallback if the new ones don't work
+                field_param_ids_legacy = {
+                    "strength": 1365,  # Legacy Field Strength
+                    "falloff": 1367,   # Legacy Field Falloff
+                    "inner_offset": 1366,  # Legacy Inner Offset
+                    "min": 1368,       # Legacy Min
+                    "max": 1369,       # Legacy Max
                 }
                 
                 # Set parameters that were provided using direct parameter IDs
                 for param_name, param_id in field_param_ids.items():
-                    try:
-                        if param_name in parameters and isinstance(parameters[param_name], (int, float)):
+                    if param_name in parameters and isinstance(parameters[param_name], (int, float)):
+                        # Try with 2025.1 IDs first
+                        try:
                             field[param_id] = float(parameters[param_name])
                             self.log(f"[C4D] Set {param_name} (ID:{param_id}): {parameters[param_name]}")
-                    except Exception as param_error:
-                        self.log(f"[C4D] Warning: Could not set {param_name} (ID:{param_id}): {param_error}")
+                        except Exception as param_error:
+                            self.log(f"[C4D] Warning: Could not set {param_name} with updated ID {param_id}: {param_error}")
+                            
+                            # Try with legacy ID as fallback
+                            if param_name in field_param_ids_legacy:
+                                legacy_id = field_param_ids_legacy[param_name]
+                                try:
+                                    field[legacy_id] = float(parameters[param_name])
+                                    self.log(f"[C4D] Set {param_name} using legacy ID {legacy_id}: {parameters[param_name]}")
+                                except Exception as legacy_error:
+                                    self.log(f"[C4D] Error: Could not set {param_name} with legacy ID {legacy_id}: {legacy_error}")
                         
                 # Try to set special parameters based on field type
                 try:
@@ -1903,6 +1979,7 @@ class C4DSocketServer(threading.Thread):
                 
                 # STEP 6: Explicitly apply field to target following Cinema 4D's required workflow
                 field_linked = False
+                field_driver_success = False  # Initialize the Field Driver success flag
                 target_info = "None"
                 
                 if target:
@@ -1915,9 +1992,63 @@ class C4DSocketServer(threading.Thread):
                         self.log("[C4D] Ensuring field is in document")
                         doc.AddUndo(c4d.UNDOTYPE_NEW, field)
                         
-                        # Send required menu prepare message to target (critical for field initialization)
+                        # Send required menu prepare message to target and field (critical for field initialization)
                         self.log("[C4D] Preparing target for field")
                         target.Message(c4d.MSG_MENUPREPARE)
+                        field.Message(c4d.MSG_MENUPREPARE)
+                        
+                        # Try Field Driver tag approach first (recommended for Cinema 4D 2025.1+)
+                        field_driver_success = False
+                        try:
+                            # Field Driver Tag ID: 1059991 (per troubleshoot.md)
+                            self.log("[C4D] MODERN APPROACH: Attempting to use Field Driver tag (Cinema 4D 2025.1)")
+                            
+                            field_driver_tag = None
+                            for tag in target.GetTags():
+                                if tag.GetType() == 1059991:  # Field Driver Tag ID
+                                    field_driver_tag = tag
+                                    self.log("[C4D] Found existing Field Driver tag")
+                                    break
+                            
+                            # Create Field Driver tag if none exists
+                            if not field_driver_tag:
+                                self.log("[C4D] Creating new Field Driver tag")
+                                field_driver_tag = c4d.BaseTag(1059991)  # Field Driver Tag
+                                if field_driver_tag:
+                                    target.InsertTag(field_driver_tag)
+                                    doc.AddUndo(c4d.UNDOTYPE_NEW, field_driver_tag)
+                                    c4d.EventAdd()
+                            
+                            if field_driver_tag:
+                                # Try to link field to a parameter
+                                self.log("[C4D] Attempting to add field to Field Driver parameters")
+                                
+                                # For effectors, try to link to strength parameter
+                                if target.GetType() in [1018643, 1018644, 1018783]:  # Effector IDs
+                                    param_id = 1000  # Strength parameter ID (common for effectors)
+                                    self.log(f"[C4D] Linking field to effector strength: {param_id}")
+                                    if field_driver_tag.AddParameter(param_id, field):
+                                        field_driver_success = True
+                                        self.log("[C4D] Successfully linked field via Field Driver!")
+                                
+                                # For cloners, try to link based on mode
+                                elif target.GetType() == 1018544:  # Cloner object
+                                    param_map = {"position": 1001, "rotation": 1002, "scale": 1003}
+                                    param_id = param_map.get(field_mode, 1001)  # Default to position
+                                    self.log(f"[C4D] Linking field to cloner {field_mode}: {param_id}")
+                                    if field_driver_tag.AddParameter(param_id, field):
+                                        field_driver_success = True
+                                        self.log("[C4D] Successfully linked field via Field Driver!")
+                                
+                                if field_driver_success:
+                                    field_driver_tag.Message(c4d.MSG_UPDATE)
+                        except Exception as fd_err:
+                            self.log(f"[C4D] Field Driver approach failed: {fd_err}")
+                        
+                        # If Field Driver approach failed, continue with traditional Fields tag approach
+                        if field_driver_success:
+                            self.log("[C4D] Using Field Driver tag for field linkage (modern method)")
+                            field_linked = True
                         
                         # Approach 1: Check if a Fields tag already exists, or create one
                         fields_tag = target.GetTag(c4d.Tfields)
@@ -1970,6 +2101,14 @@ class C4DSocketServer(threading.Thread):
                                         
                                         # Insert layer into field list
                                         field_list.InsertLayer(field_layer)
+                                        
+                                        # CRITICAL: Enable "Use Fields" checkbox (ID 1058973)
+                                        # This is required for field activation - fixes "Applied to: None" issue
+                                        self.log("[C4D] Enabling Fields system via FIELDS_ENABLED")
+                                        try:
+                                            fields_tag[1058973] = True  # FIELDS_ENABLED
+                                        except Exception as e:
+                                            self.log(f"[C4D] Error enabling fields: {e}")
                                         
                                         # Assign field list back to tag (CRITICAL STEP)
                                         fields_tag[c4d.FIELDS] = field_list
@@ -2096,15 +2235,55 @@ class C4DSocketServer(threading.Thread):
                     doc.EndUndo()
                     c4d.EventAdd()
                 
-                # Return success with field info
+                # Final visibility check - ensure field is visible in object manager
+                if not field.GetBit(c4d.BIT_ACTIVE):
+                    self.log("[C4D] Field not visible in scene manager, forcing visibility")
+                    field.SetBit(c4d.BIT_ACTIVE, True)
+                    field.SetBit(c4d.BIT_VISIBLE, True)
+                    c4d.EventAdd()
+                
+                # Final parent check - ensure field is under target
+                if target and field.GetUp() != target:
+                    self.log(f"[C4D] Final hierarchy fix: Field parent is {field.GetUp().GetName() if field.GetUp() else 'None'}, expected {target.GetName()}")
+                    # Try one last time to fix hierarchy
+                    try:
+                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, field)
+                        field.Remove()
+                        field.InsertUnderLast(target)
+                        c4d.EventAdd()
+                        self.log(f"[C4D] Fixed hierarchy: Field parent now {field.GetUp().GetName() if field.GetUp() else 'None'}")
+                    except Exception as hier_err:
+                        self.log(f"[C4D] Hierarchy fix failed: {hier_err}")
+                
+                # CRITICAL FINAL VERIFICATION
+                self.log("[C4D] -------- FINAL VERIFICATION --------")
+                self.log(f"[C4D] Field type: {field_type} (ID: {field.GetType()})")
+                self.log(f"[C4D] Field name: {field.GetName()}")
+                self.log(f"[C4D] Target: {target_info}")
+                self.log(f"[C4D] Field linked to target: {field_linked}")
+                self.log(f"[C4D] Field parent: {field.GetUp().GetName() if field.GetUp() else 'None'}")
+                self.log(f"[C4D] Field is visible in scene: {field.GetBit(c4d.BIT_ACTIVE)}")
+                self.log(f"[C4D] Field driver tag used: {field_driver_success}")
+                self.log("[C4D] ------------------------------------")
+                
+                # Return success with enhanced field info and diagnostics
                 return {
                     "field": {
                         "name": field.GetName(),
                         "id": str(field.GetGUID()),
                         "type": field_type,
-                        "target": target_info,
+                        "created_type_id": field.GetType(),
+                        "target": target_info, 
                         "linked_to_target": field_linked,
-                        "created_effector": created_effector
+                        "created_effector": created_effector,
+                        "hierarchy_status": {
+                            "parent": field.GetUp().GetName() if field.GetUp() else "None",
+                            "expected_parent": target.GetName() if target else "None",
+                            "is_child_of_target": (field.GetUp() == target) if target and field.GetUp() else False,
+                            "visible_in_manager": field.GetBit(c4d.BIT_ACTIVE)
+                        },
+                        "linking_method": "field_driver" if field_driver_success else "traditional_fields",
+                        "field_driver_available": hasattr(c4d, "BaseTag") and c4d.BaseTag(1059991) is not None
                     }
                 }
                 
