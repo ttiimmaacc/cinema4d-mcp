@@ -1,7 +1,8 @@
 """
 Cinema 4D MCP Server Plugin
-Updated for Cinema 4D R2025 compatibility
-Version 0.1.6 - Improved Redshift material creation with NodeMaterial approach
+Updated for Cinema 4D R2025.1 compatibility
+Version 0.1.7 - Enhanced Redshift material creation and debugging with NodeMaterial
+Features all command handlers and improved Redshift material diagnostics
 """
 
 import c4d
@@ -228,8 +229,10 @@ class C4DSocketServer(threading.Thread):
                             response = self.handle_apply_shader(command)
                         elif command_type == "animate_camera":
                             response = self.handle_animate_camera(command)
-                        elif command["command"] == "validate_redshift_materials":
+                        elif command_type == "validate_redshift_materials":
                             response = self.handle_validate_redshift_materials(command)
+                        elif command_type == "debug_redshift_material":
+                            response = self.handle_debug_redshift_material(command)
                         else:
                             response = {"error": f"Unknown command: {command_type}"}
 
@@ -377,6 +380,104 @@ class C4DSocketServer(threading.Thread):
             return False
 
     # Basic commands
+    def handle_debug_redshift_material(self, command):
+        """Debug handler to test Redshift material creation directly."""
+        self.log("[C4D] DEBUG: Testing Redshift material creation...")
+        
+        try:
+            doc = c4d.documents.GetActiveDocument()
+            # Get diagnostic info
+            diagnostic = {
+                "c4d_version": c4d.GetC4DVersion(),
+                "has_redshift_module": hasattr(c4d.modules, "redshift"),
+                "plugin_info": []
+            }
+            
+            # Check for Redshift plugin
+            plugins = c4d.plugins.FilterPluginList(c4d.PLUGINTYPE_MATERIAL, True)
+            redshift_plugin_id = None
+            
+            for plugin in plugins:
+                plugin_name = plugin.GetName()
+                plugin_id = plugin.GetID()
+                diagnostic["plugin_info"].append({
+                    "name": plugin_name,
+                    "id": plugin_id
+                })
+                
+                if "redshift" in plugin_name.lower():
+                    redshift_plugin_id = plugin_id
+                    diagnostic["redshift_plugin_id"] = plugin_id
+            
+            # Create a test material
+            test_name = f"Debug_RS_{int(time.time())}"
+            material_type = "redshift" if redshift_plugin_id else "standard"
+            mat = None
+            
+            if redshift_plugin_id:
+                # Create Redshift material
+                self.log(f"[C4D] Creating test Redshift material with ID {redshift_plugin_id}")
+                mat = c4d.BaseMaterial(redshift_plugin_id)
+                mat.SetName(test_name)
+                
+                # Try to set up node graph
+                try:
+                    import maxon
+                    redshift_ns = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+                    node_mat = c4d.NodeMaterial(mat)
+                    if not node_mat.HasSpace(redshift_ns):
+                        node_mat.CreateDefaultGraph(redshift_ns)
+                    
+                    # Set color
+                    graph = node_mat.GetGraph(redshift_ns)
+                    if graph:
+                        for node in graph.GetNodes():
+                            if "StandardMaterial" in node.GetId():
+                                try:
+                                    node.SetParameter(
+                                        maxon.nodes.ParameterID("base_color"),
+                                        maxon.Vector(1.0, 0.0, 0.0)
+                                    )
+                                    break
+                                except:
+                                    pass
+                    
+                    # Validate
+                    diagnostic["has_node_graph"] = node_mat.HasSpace(redshift_ns)
+                    diagnostic["node_count"] = len(graph.GetNodes()) if graph else 0
+                    diagnostic["has_redshift_space"] = node_mat.HasSpace(redshift_ns)
+                except Exception as e:
+                    diagnostic["node_error"] = str(e)
+            else:
+                # Create standard material as fallback
+                self.log("[C4D] Creating standard material as fallback")
+                mat = c4d.BaseMaterial(c4d.Mmaterial)
+                mat.SetName(test_name)
+                mat[c4d.MATERIAL_COLOR_COLOR] = c4d.Vector(1, 0, 0)
+            
+            # Insert material into document
+            if mat:
+                doc.InsertMaterial(mat)
+                c4d.EventAdd()
+            
+            # Return detailed diagnostic information
+            return {
+                "status": "ok",
+                "message": "Debug Redshift material test complete",
+                "diagnostic": diagnostic,
+                "material_type": material_type,
+                "material_id": mat.GetType() if mat else None,
+                "material_name": test_name
+            }
+            
+        except Exception as e:
+            import traceback
+            return {
+                "status": "error",
+                "message": f"Error in debug Redshift material: {str(e)}",
+                "traceback": traceback.format_exc()
+            }
+    
     def handle_get_scene_info(self):
         """Handle get_scene_info command."""
         doc = c4d.documents.GetActiveDocument()
