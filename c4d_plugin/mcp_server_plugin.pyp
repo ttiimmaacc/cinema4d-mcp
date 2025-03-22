@@ -1742,10 +1742,10 @@ class C4DSocketServer(threading.Thread):
             return {"error": f"Failed to create effector: {str(e)}"}
 
     def handle_apply_mograph_fields(self, command):
-        """Handle apply_mograph_fields command with comprehensive target linking for R2025.1.
+        """Handle apply_mograph_fields command with simplified field-target linking for R2025.1.
         
-        This implementation creates and links fields to targets using multiple methods
-        for maximum compatibility with different object types and Cinema 4D workflows.
+        This implementation creates fields and properly links them to target objects following
+        the exact workflow documented in troubleshoot.md for maximum compatibility.
         """
         # Extract command parameters with defaults
         field_type = command.get("field_type", "spherical").lower()
@@ -1758,7 +1758,7 @@ class C4DSocketServer(threading.Thread):
         
         # Define function for main thread execution
         def create_field_direct(doc, field_type, field_name, target_name, parameters, field_mode):
-            """Create field and properly link it to target using multiple mechanisms."""
+            """Create field and properly link it to target following troubleshoot.md recommendations."""
             result = {}
             
             try:
@@ -1835,29 +1835,30 @@ class C4DSocketServer(threading.Thread):
                 self.log(f"[C4D] Creating field using command ID: {field_command}")
                 field = None
                 
-                # First try the command approach (most reliable for proper linking)
-                c4d.CallCommand(field_command)
-                
-                # Get the created field (should be active object now)
-                field = doc.GetActiveObject()
-                
-                # If command method failed, try direct object creation
-                if not field or field.GetName() == target.GetName():
-                    self.log("[C4D] Command method didn't create field, trying direct creation")
-                    field = c4d.BaseObject(field_object_id)
-                    if field:
-                        self.log(f"[C4D] Created field directly (Type: {field.GetType()})")
-                        doc.InsertObject(field)
-                        c4d.EventAdd()
+                # Create field using direct object creation for more reliable naming
+                self.log(f"[C4D] Creating field directly with type ID: {field_object_id}")
+                field = c4d.BaseObject(field_object_id)
+                if field:
+                    # Set name IMMEDIATELY before inserting
+                    field.SetName(field_name)
+                    self.log(f"[C4D] Created field directly (Type: {field.GetType()}, Name: {field.GetName()})")
+                    doc.InsertObject(field)
+                    doc.SetActiveObject(field)  # Make it the active object
+                    c4d.EventAdd()
                 
                 # Verify we got a field object
                 if not field:
                     self.log("[C4D] Failed to create field, field is None")
                     return {"error": "Failed to create field object"}
                 
-                # Set field name
-                self.log(f"[C4D] Naming field: {field_name}")
-                field.SetName(field_name)
+                # Double-check the name was applied properly
+                if field.GetName() != field_name:
+                    self.log(f"[C4D] Field name mismatch, re-setting name: {field_name}")
+                    field.SetName(field_name)
+                    c4d.EventAdd()
+                
+                # Force update to ensure name is applied
+                c4d.EventAdd()
                 
                 # STEP 5: Set field parameters using direct parameter IDs
                 self.log("[C4D] Setting field parameters")
@@ -1926,6 +1927,8 @@ class C4DSocketServer(threading.Thread):
                             if fields_tag:
                                 target.InsertTag(fields_tag)
                                 doc.AddUndo(c4d.UNDOTYPE_NEW, fields_tag)
+                                # Force update after tag creation
+                                c4d.EventAdd()
                         
                         if fields_tag:
                             self.log("[C4D] Working with Fields tag")
@@ -1953,17 +1956,17 @@ class C4DSocketServer(threading.Thread):
                             if field_layer:
                                 # Set field layer parameters (as recommended in troubleshoot.md)
                                 try:
-                                    # Initialize layer parameters for proper behavior
-                                    field_layer[c4d.FIELDLAYER_MULTIPLYSTRENGTH] = 1.0
-                                    
-                                    # Set proper layer properties 
-                                    if "strength" in parameters:
-                                        field_layer[c4d.FIELDLAYER_STRENGTH] = float(parameters["strength"])
-                                        
-                                    # CRITICAL: Link field to layer 
+                                    # CRITICAL: Link field to layer FIRST  
                                     self.log(f"[C4D] Linking field '{field.GetName()}' to layer")
                                     if field_layer.SetLinkedObject(field):
                                         self.log(f"[C4D] Field linked to layer successfully")
+                                        
+                                        # Initialize layer parameters for proper behavior AFTER linking
+                                        field_layer[c4d.FIELDLAYER_MULTIPLYSTRENGTH] = 1.0
+                                        
+                                        # Set proper layer properties 
+                                        if "strength" in parameters:
+                                            field_layer[c4d.FIELDLAYER_STRENGTH] = float(parameters["strength"])
                                         
                                         # Insert layer into field list
                                         field_list.InsertLayer(field_layer)
@@ -1971,6 +1974,9 @@ class C4DSocketServer(threading.Thread):
                                         # Assign field list back to tag (CRITICAL STEP)
                                         fields_tag[c4d.FIELDS] = field_list
                                         doc.AddUndo(c4d.UNDOTYPE_CHANGE, fields_tag)
+                                        
+                                        # Send explicit update message to fields_tag
+                                        fields_tag.Message(c4d.MSG_UPDATE)
                                         
                                         # Success!
                                         field_linked = True
@@ -2008,13 +2014,16 @@ class C4DSocketServer(threading.Thread):
                                         
                                         # Link layer to field
                                         if eff_layer and eff_layer.SetLinkedObject(field):
-                                            # Set layer parameters
+                                            # Set layer parameters AFTER linking
                                             eff_layer[c4d.FIELDLAYER_MULTIPLYSTRENGTH] = 1.0
                                             
                                             # Add to list and apply back to effector
                                             eff_list.InsertLayer(eff_layer)
                                             target[param_id] = eff_list
                                             doc.AddUndo(c4d.UNDOTYPE_CHANGE, target)
+                                            
+                                            # Force update on the target
+                                            target.Message(c4d.MSG_UPDATE)
                                             
                                             # Success with this parameter
                                             field_linked = True
@@ -2056,7 +2065,7 @@ class C4DSocketServer(threading.Thread):
                                 
                                 # Link and configure
                                 if cloner_layer and cloner_layer.SetLinkedObject(field):
-                                    # Set layer parameters
+                                    # Set layer parameters AFTER linking
                                     cloner_layer[c4d.FIELDLAYER_MULTIPLYSTRENGTH] = 1.0
                                     
                                     # Add to list and apply back to cloner
@@ -2064,15 +2073,19 @@ class C4DSocketServer(threading.Thread):
                                     target[param_id] = cloner_list
                                     doc.AddUndo(c4d.UNDOTYPE_CHANGE, target)
                                     
+                                    # Send update message directly to cloner
+                                    target.Message(c4d.MSG_UPDATE)
+                                    
                                     field_linked = True
                                     self.log(f"[C4D] Field linked to cloner via {param_key} parameter")
                             except Exception as e:
                                 self.log(f"[C4D] Error linking to cloner: {e}")
                         
-                        # CRITICAL: Send update message to target
+                        # CRITICAL: Send final update messages to both target and field
                         if field_linked:
-                            self.log("[C4D] Sending update message to target")
+                            self.log("[C4D] Sending final update messages")
                             target.Message(c4d.MSG_UPDATE)
+                            field.Message(c4d.MSG_UPDATE)
                         
                     except Exception as e:
                         self.log(f"[C4D] Error in field linking process: {e}")
