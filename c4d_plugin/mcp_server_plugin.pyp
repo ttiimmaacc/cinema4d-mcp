@@ -141,6 +141,16 @@ class C4DSocketServer(threading.Thread):
                 self.log(f"[C4D] Main thread execution timed out after {elapsed:.2f}s")
                 return {"error": f"Execution on main thread timed out after {timeout}s"}
 
+        # Improved result handling
+        if result_container["result"] is None:
+            self.log("[C4D] Warning: Function execution completed but returned None")
+            # Return a structured response instead of None
+            return {
+                "status": "completed",
+                "result": None,
+                "warning": "Function returned None",
+            }
+
         return result_container["result"]
 
     def run(self):
@@ -486,9 +496,9 @@ class C4DSocketServer(threading.Thread):
         if not name:
             self.log(f"[C4D] Warning: Empty object name provided")
             return None
-            
+
         self.log(f"[C4D] Searching for object with name: '{name}'")
-        
+
         # Recursive function to search through hierarchy
         def search_recursive(obj, search_name, search_name_lower):
             while obj:
@@ -496,30 +506,32 @@ class C4DSocketServer(threading.Thread):
                 if obj.GetName() == search_name:
                     self.log(f"[C4D] Found exact match: '{obj.GetName()}'")
                     return obj
-                    
+
                 # Check case-insensitive match
                 if obj.GetName().lower() == search_name_lower:
                     self.log(f"[C4D] Found case-insensitive match: '{obj.GetName()}'")
                     return obj
-                
+
                 # Check children
                 child = obj.GetDown()
                 if child:
                     found = search_recursive(child, search_name, search_name_lower)
                     if found:
                         return found
-                
+
                 # Move to next sibling
                 obj = obj.GetNext()
-            
+
             return None
-        
+
         # Start search from the root level
         name_lower = name.lower()
         result = search_recursive(doc.GetFirstObject(), name, name_lower)
-        
+
         if result:
-            self.log(f"[C4D] Found object: '{result.GetName()}' (Type: {result.GetType()})")
+            self.log(
+                f"[C4D] Found object: '{result.GetName()}' (Type: {result.GetType()})"
+            )
             return result
         else:
             self.log(f"[C4D] No object found with name '{name}'")
@@ -948,10 +960,12 @@ class C4DSocketServer(threading.Thread):
 
                 # For Cinema 4D R2025.1, we need to get settings as BaseContainer
                 try:
-                    self.log("[C4D] Using R2025.1 approach for rendering with BaseContainer settings")
+                    self.log(
+                        "[C4D] Using R2025.1 approach for rendering with BaseContainer settings"
+                    )
                     # Get the render data as a BaseContainer
                     settings = rd.GetDataInstance()  # Gets the BaseContainer
-                    
+
                     # Use BaseContainer for render settings
                     c4d.documents.RenderDocument(
                         doc,
@@ -962,7 +976,7 @@ class C4DSocketServer(threading.Thread):
                     )
                 except Exception as e:
                     self.log(f"[C4D] Error with R2025.1 rendering approach: {str(e)}")
-                    
+
                     # Fall back to traditional method if needed
                     try:
                         self.log("[C4D] Falling back to traditional rendering approach")
@@ -1086,20 +1100,22 @@ class C4DSocketServer(threading.Thread):
                     c4d.FORMAT_C4DEXPORT,
                 ):
                     return {"error": f"Failed to save document to {file_path}"}
-                
+
                 # R2025.1 fix: Update document name and path to fix "Untitled-1" issue
                 try:
                     # Update the document name
                     doc.SetDocumentName(os.path.basename(file_path))
-                    
+
                     # Update document path
                     doc.SetDocumentPath(os.path.dirname(file_path))
-                    
+
                     # Ensure UI is updated
                     c4d.EventAdd()
                     self.log(f"[C4D] Updated document name and path for {file_path}")
                 except Exception as e:
-                    self.log(f"[C4D] Warning: Could not update document name/path: {str(e)}")
+                    self.log(
+                        f"[C4D] Warning: Could not update document name/path: {str(e)}"
+                    )
 
                 return {
                     "success": True,
@@ -1169,7 +1185,9 @@ class C4DSocketServer(threading.Thread):
             # Try alternative parameter names
             code = command.get("script", "")
             if not code:
-                self.log("[C4D] Error: No Python code provided in 'code' or 'script' parameters")
+                self.log(
+                    "[C4D] Error: No Python code provided in 'code' or 'script' parameters"
+                )
                 return {"error": "No Python code provided"}
 
         # For security, limit available modules
@@ -1280,14 +1298,16 @@ class C4DSocketServer(threading.Thread):
                     grid_size = (
                         int(count ** (1 / 3)) or 1
                     )  # Cube root for even distribution
-                    
+
                     # Use correct R2025.1 MoGraph constants path
                     try:
                         # R2025.1 approach using modules.mograph namespace
                         cloner[c4d.modules.mograph.MG_GRID_COUNT_X] = grid_size
                         cloner[c4d.modules.mograph.MG_GRID_COUNT_Y] = grid_size
                         cloner[c4d.modules.mograph.MG_GRID_COUNT_Z] = grid_size
-                        self.log("[C4D] Set grid counts using c4d.modules.mograph namespace")
+                        self.log(
+                            "[C4D] Set grid counts using c4d.modules.mograph namespace"
+                        )
                     except Exception as e:
                         # Fallback to traditional constants if needed
                         self.log(f"[C4D] Error with mograph module: {str(e)}")
@@ -1295,7 +1315,9 @@ class C4DSocketServer(threading.Thread):
                             cloner[c4d.MG_GRID_COUNT_X] = grid_size
                             cloner[c4d.MG_GRID_COUNT_Y] = grid_size
                             cloner[c4d.MG_GRID_COUNT_Z] = grid_size
-                            self.log("[C4D] Set grid counts using traditional constants")
+                            self.log(
+                                "[C4D] Set grid counts using traditional constants"
+                            )
                         except Exception as e2:
                             self.log(f"[C4D] Could not set grid counts: {str(e2)}")
                     # Set some reasonable spacing
@@ -1312,14 +1334,16 @@ class C4DSocketServer(threading.Thread):
                     else:
                         # No object specified, fall back to grid mode
                         cloner[c4d.ID_MG_MOTIONGENERATOR_MODE] = 1  # Grid
-                        
+
                         # Use correct R2025.1 MoGraph constants path
                         try:
                             # R2025.1 approach using modules.mograph namespace
                             cloner[c4d.modules.mograph.MG_GRID_COUNT_X] = 3
                             cloner[c4d.modules.mograph.MG_GRID_COUNT_Y] = 3
                             cloner[c4d.modules.mograph.MG_GRID_COUNT_Z] = 3
-                            self.log("[C4D] Set default grid counts using c4d.modules.mograph namespace")
+                            self.log(
+                                "[C4D] Set default grid counts using c4d.modules.mograph namespace"
+                            )
                         except Exception as e:
                             # Fallback to traditional constants if needed
                             self.log(f"[C4D] Error with mograph module: {str(e)}")
@@ -1327,9 +1351,13 @@ class C4DSocketServer(threading.Thread):
                                 cloner[c4d.MG_GRID_COUNT_X] = 3
                                 cloner[c4d.MG_GRID_COUNT_Y] = 3
                                 cloner[c4d.MG_GRID_COUNT_Z] = 3
-                                self.log("[C4D] Set default grid counts using traditional constants")
+                                self.log(
+                                    "[C4D] Set default grid counts using traditional constants"
+                                )
                             except Exception as e2:
-                                self.log(f"[C4D] Could not set default grid counts: {str(e2)}")
+                                self.log(
+                                    f"[C4D] Could not set default grid counts: {str(e2)}"
+                                )
 
                 # Add a default child object to clone if none exists
                 # (otherwise cloner won't show anything)
@@ -1418,20 +1446,40 @@ class C4DSocketServer(threading.Thread):
                                 # Try R2025.1 module path first
                                 if mode_id == 0:  # Linear
                                     additional_props["count"] = current_obj[
-                                        c4d.modules.mograph.MG_LINEAR_COUNT if hasattr(c4d.modules, "mograph") else c4d.MG_LINEAR_COUNT
+                                        (
+                                            c4d.modules.mograph.MG_LINEAR_COUNT
+                                            if hasattr(c4d.modules, "mograph")
+                                            else c4d.MG_LINEAR_COUNT
+                                        )
                                     ]
                                 elif mode_id == 1:  # Grid
                                     if hasattr(c4d.modules, "mograph"):
-                                        additional_props["count_x"] = current_obj[c4d.modules.mograph.MG_GRID_COUNT_X]
-                                        additional_props["count_y"] = current_obj[c4d.modules.mograph.MG_GRID_COUNT_Y]
-                                        additional_props["count_z"] = current_obj[c4d.modules.mograph.MG_GRID_COUNT_Z]
+                                        additional_props["count_x"] = current_obj[
+                                            c4d.modules.mograph.MG_GRID_COUNT_X
+                                        ]
+                                        additional_props["count_y"] = current_obj[
+                                            c4d.modules.mograph.MG_GRID_COUNT_Y
+                                        ]
+                                        additional_props["count_z"] = current_obj[
+                                            c4d.modules.mograph.MG_GRID_COUNT_Z
+                                        ]
                                     else:
-                                        additional_props["count_x"] = current_obj[c4d.MG_GRID_COUNT_X]
-                                        additional_props["count_y"] = current_obj[c4d.MG_GRID_COUNT_Y]
-                                        additional_props["count_z"] = current_obj[c4d.MG_GRID_COUNT_Z]
+                                        additional_props["count_x"] = current_obj[
+                                            c4d.MG_GRID_COUNT_X
+                                        ]
+                                        additional_props["count_y"] = current_obj[
+                                            c4d.MG_GRID_COUNT_Y
+                                        ]
+                                        additional_props["count_z"] = current_obj[
+                                            c4d.MG_GRID_COUNT_Z
+                                        ]
                                 elif mode_id == 2:  # Radial
                                     additional_props["count"] = current_obj[
-                                        c4d.modules.mograph.MG_POLY_COUNT if hasattr(c4d.modules, "mograph") else c4d.MG_POLY_COUNT
+                                        (
+                                            c4d.modules.mograph.MG_POLY_COUNT
+                                            if hasattr(c4d.modules, "mograph")
+                                            else c4d.MG_POLY_COUNT
+                                        )
                                     ]
                             except Exception as e:
                                 self.log(f"[C4D] Error getting cloner counts: {str(e)}")
@@ -1720,36 +1768,54 @@ class C4DSocketServer(threading.Thread):
             applied_to = "None"
 
             try:
-                # Step 1: Map field type to proper SDK constants
-                # Define these manually if not available in the SDK
-                # Based on MoGraph documentation in R2025, these are the correct IDs
-                Fsphere = 1039384  # Spherical Field
-                Fbox = 1039385  # Box Field
-                Fcylinder = 1039386  # Cylindrical Field
-                Ftorus = 1039387  # Torus Field
-                Fcone = 1039388  # Cone Field
-                Flinear = 1039389  # Linear Field
-                Fradial = 1039390  # Radial Field
-                Fsound = 1039391  # Sound Field
-                Fnoise = 1039394  # Noise Field
-
-                field_constants = {
-                    "spherical": Fsphere,  # Spherical Field
-                    "box": Fbox,  # Box Field
-                    "cylindrical": Fcylinder,  # Cylindrical Field
-                    "torus": Ftorus,  # Torus Field
-                    "cone": Fcone,  # Cone Field
-                    "linear": Flinear,  # Linear Field
-                    "radial": Fradial,  # Radial Field
-                    "sound": Fsound,  # Sound Field
-                    "noise": Fnoise,  # Noise Field
-                }
+                # Step 1: Map field type to proper SDK constants using module approach for R2025.1
+                self.log("[C4D] Determining correct field object ID")
+                
+                if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
+                    # Modern approach using modules (R2025.1)
+                    self.log("[C4D] Using R2025.1 modules approach for field constants")
+                    try:
+                        field_constants = {
+                            "spherical": c4d.modules.mograph.Fsphere,
+                            "box": c4d.modules.mograph.Fbox,
+                            "cylindrical": c4d.modules.mograph.Fcylinder, 
+                            "torus": c4d.modules.mograph.Ftorus,
+                            "cone": c4d.modules.mograph.Fcone,
+                            "linear": c4d.modules.mograph.Flinear,
+                            "radial": c4d.modules.mograph.Fradial,
+                            "sound": c4d.modules.mograph.Fsound,
+                            "noise": c4d.modules.mograph.Fnoise
+                        }
+                    except Exception as e:
+                        self.log(f"[C4D] Error accessing modules.mograph constants: {e}")
+                        # Fall through to hardcoded IDs
+                        field_constants = {}
+                else:
+                    self.log("[C4D] Modules approach not available")
+                    field_constants = {}
+                
+                # Fallback to hardcoded IDs if module constants not available
+                if not field_constants:
+                    self.log("[C4D] Using hardcoded field IDs")
+                    # Define these manually based on MoGraph documentation
+                    field_constants = {
+                        "spherical": 1039384,  # Spherical Field
+                        "box": 1039385,        # Box Field
+                        "cylindrical": 1039386, # Cylindrical Field
+                        "torus": 1039387,      # Torus Field
+                        "cone": 1039388,       # Cone Field
+                        "linear": 1039389,     # Linear Field
+                        "radial": 1039390,     # Radial Field
+                        "sound": 1039391,      # Sound Field
+                        "noise": 1039394       # Noise Field
+                    }
 
                 # Get the proper field type constant or default to spherical
-                field_type_id = field_constants.get(field_type, Fsphere)
+                default_field = field_constants.get("spherical", 1039384)
+                field_type_id = field_constants.get(field_type, default_field)
                 self.log(f"[C4D] Using field type: {field_type} (ID: {field_type_id})")
 
-                # Step 2: Create the field object using proper SDK approach
+                # Step 2: Create the field object and INSERT it into the document FIRST
                 self.log(f"[C4D] Creating {field_type} field object")
                 field = c4d.BaseObject(field_type_id)
                 if not field:
@@ -1758,26 +1824,27 @@ class C4DSocketServer(threading.Thread):
                     return result
 
                 field.SetName(field_name)
-
-                # Step 3: Set field parameters
-                if "strength" in parameters and isinstance(
-                    parameters["strength"], (int, float)
-                ):
+                
+                # Set field parameters BEFORE inserting
+                if "strength" in parameters and isinstance(parameters["strength"], (int, float)):
                     field[c4d.FIELD_STRENGTH] = float(parameters["strength"])
                     self.log(f"[C4D] Set strength: {parameters['strength']}")
 
-                if "falloff" in parameters and isinstance(
-                    parameters["falloff"], (int, float)
-                ):
+                if "falloff" in parameters and isinstance(parameters["falloff"], (int, float)):
                     field[c4d.FIELD_FALLOFF] = float(parameters["falloff"])
                     self.log(f"[C4D] Set falloff: {parameters['falloff']}")
-
-                # Step 4: Insert field into document (must do this first)
+                
+                # Critical step: INSERT the field into document FIRST
+                # This is essential for field to persist
                 self.log("[C4D] Inserting field into document")
                 doc.InsertObject(field)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, field)
+                
+                # Update C4D
+                c4d.EventAdd()
+                self.log(f"[C4D] Field object created successfully: {field.GetName()}")
 
-                # Step 5: Find target if specified
+                # Step 3: Find target if specified
                 if target_name:
                     self.log(f"[C4D] Looking for target: {target_name}")
                     target = self.find_object_by_name(doc, target_name)
@@ -1787,96 +1854,87 @@ class C4DSocketServer(threading.Thread):
                     else:
                         self.log(f"[C4D] Found target: {target.GetName()}")
 
-                # Step 6: Apply field to target if found - using correct SDK approach
+                # Step 4: Apply field to target if found - using best practice from MoGraph-docs.md
                 if target:
                     self.log(f"[C4D] Creating Fields tag for {target.GetName()}")
+                    
+                    # Create Fields tag
                     tag = c4d.BaseTag(c4d.Tfields)
-
                     if not tag:
                         self.log("[C4D] Failed to create Fields tag")
                     else:
-                        # Insert tag into target object
+                        # Insert tag into target object FIRST 
+                        self.log(f"[C4D] Inserting Fields tag into {target.GetName()}")
                         target.InsertTag(tag)
                         doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
-
-                        # Explicitly follow the SDK procedure for Fields
-                        # 1. Get the field list (create if needed)
-                        self.log("[C4D] Getting/creating FieldList")
-                        field_list = tag[c4d.FIELDS]
-
-                        if not field_list or not isinstance(field_list, c4d.FieldList):
-                            field_list = c4d.FieldList()
-                            self.log("[C4D] Created new FieldList")
-
-                        # 2. Create a proper Field Layer using the modules.mograph namespace
+                        
+                        # Create FieldList - important: do this AFTER inserting tag
+                        self.log("[C4D] Creating new FieldList")
+                        field_list = c4d.FieldList()
+                        
+                        # Create FieldLayer for the field object
                         self.log("[C4D] Creating FieldLayer")
                         try:
-                            # Using proper namespace from SDK documentation
-                            if hasattr(c4d.modules, "mograph"):
-                                field_layer = c4d.modules.mograph.FieldLayer(
-                                    c4d.FLfield
-                                )
-                                self.log(
-                                    "[C4D] Created field layer using c4d.modules.mograph"
-                                )
+                            # Use correct namespace based on C4D version
+                            if hasattr(c4d, "modules") and hasattr(c4d.modules, "mograph"):
+                                self.log("[C4D] Using c4d.modules.mograph.FieldLayer")
+                                field_layer = c4d.modules.mograph.FieldLayer(c4d.FLfield)
                             else:
-                                # Fallback if mograph module not available
+                                self.log("[C4D] Using c4d.FieldLayer fallback")
                                 field_layer = c4d.FieldLayer(c4d.FLfield)
-                                self.log(
-                                    "[C4D] Created field layer using c4d.FieldLayer"
-                                )
-
+                                
                             if not field_layer:
                                 self.log("[C4D] Failed to create FieldLayer")
                                 raise RuntimeError("Failed to create FieldLayer")
-
-                            # 3. Link the field object to the layer
-                            self.log(
-                                f"[C4D] Linking field '{field.GetName()}' to layer"
-                            )
-                            success = field_layer.SetLinkedObject(field)
-                            if not success:
-                                self.log(
-                                    "[C4D] Warning: SetLinkedObject returned False"
-                                )
-
-                            # 4. Insert the layer into the field list
+                                
+                            # CRITICAL: Link field to layer - this is the key connection
+                            self.log(f"[C4D] Linking field '{field.GetName()}' to layer")
+                            result = field_layer.SetLinkedObject(field)
+                            if not result:
+                                self.log("[C4D] Warning: SetLinkedObject returned False")
+                                
+                            # Add layer to field list
                             self.log("[C4D] Inserting layer into field list")
                             field_list.InsertLayer(field_layer)
-
-                            # 5. Assign the modified field list back to the tag
-                            self.log("[C4D] Setting field list on tag")
+                            
+                            # Update the tag with the field list
+                            self.log("[C4D] Setting field list back to tag")
                             tag[c4d.FIELDS] = field_list
-
-                            # Mark as applied and register undo
+                            
+                            # Register for undo
                             doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
+                            
+                            # Force an update to actually apply the changes
+                            c4d.EventAdd()
+                            
+                            # Record successful application
                             field_applied = True
                             applied_to = target.GetName()
-                            self.log(
-                                f"[C4D] Successfully applied field to {applied_to}"
-                            )
-
+                            self.log(f"[C4D] Successfully applied field to {applied_to}")
+                            
                         except Exception as e:
-                            self.log(f"[C4D] Error setting up field layer: {str(e)}")
+                            self.log(f"[C4D] Error in field application: {str(e)}")
                             import traceback
-
                             traceback.print_exc()
 
-                # Step 7: Update scene
-                self.log("[C4D] Calling EventAdd to update scene")
+                # Final step: Ensure scene is updated with all changes
+                self.log("[C4D] Final update to ensure all changes are applied")
                 c4d.EventAdd()
 
-                # Step 8: Prepare result
+                # Prepare response with field information
                 if field:
                     field_info = {
                         "name": field.GetName(),
                         "id": str(field.GetGUID()),
                         "type": field_type,
                         "applied_to": applied_to,
+                        "applied_successfully": field_applied,
                     }
 
                     if "strength" in parameters:
                         field_info["strength"] = parameters["strength"]
+                    if "falloff" in parameters:
+                        field_info["falloff"] = parameters["falloff"]
 
                     self.log(f"[C4D] Field creation complete: {field.GetName()}")
                     result["field"] = field_info
@@ -1889,7 +1947,6 @@ class C4DSocketServer(threading.Thread):
             except Exception as e:
                 self.log(f"[C4D] Error in create_field_safe: {str(e)}")
                 import traceback
-
                 traceback.print_exc()
                 result["error"] = f"Failed to apply MoGraph field: {str(e)}"
                 return result
@@ -1960,17 +2017,21 @@ class C4DSocketServer(threading.Thread):
             return {"error": f"Object not found: {object_name}"}
 
         def create_soft_body_safe(obj, name, stiffness, mass, object_name):
-            self.log(f"[C4D] Creating soft body dynamics tag '{name}' for object '{object_name}'")
-            
+            self.log(
+                f"[C4D] Creating soft body dynamics tag '{name}' for object '{object_name}'"
+            )
+
             # Get dynamics tag ID - same for all C4D versions
             dynamics_tag_id = 180000102  # This is the standard tag ID for dynamics
-            
+
             # Create Dynamics tag
             tag = c4d.BaseTag(dynamics_tag_id)
             if tag is None:
-                self.log(f"[C4D] Error: Failed to create Dynamics Body tag with ID {dynamics_tag_id}")
+                self.log(
+                    f"[C4D] Error: Failed to create Dynamics Body tag with ID {dynamics_tag_id}"
+                )
                 raise RuntimeError("Failed to create Dynamics Body tag")
-                
+
             tag.SetName(name)
             self.log(f"[C4D] Successfully created dynamics tag: {name}")
 
@@ -2093,9 +2154,9 @@ class C4DSocketServer(threading.Thread):
                     "landscape": 5119,
                     "extrude": 5116,
                 }
-                
+
             shape_type_id = shape_types.get(shape_type, shape_types.get("metaball"))
-            
+
             self.log(f"[C4D] Creating abstract shape of type: {shape_type}")
             shape = c4d.BaseObject(shape_type_id)
             if shape is None:
@@ -2113,12 +2174,12 @@ class C4DSocketServer(threading.Thread):
                     sphere = c4d.BaseObject(c4d.objects.Osphere)
                 else:
                     sphere = c4d.BaseObject(c4d.Osphere)
-                    
+
                 sphere.SetName("Metaball Sphere")
                 sphere.SetAbsScale(c4d.Vector(0.5, 0.5, 0.5))
                 sphere.InsertUnder(shape)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, sphere)
-                
+
             elif shape_type in ("loft", "sweep"):
                 # Create profile spline
                 if hasattr(c4d, "objects"):
@@ -2127,11 +2188,11 @@ class C4DSocketServer(threading.Thread):
                 else:
                     spline = c4d.BaseObject(c4d.Osplinecircle)
                     path = c4d.BaseObject(c4d.Osplinenside)
-                    
+
                 spline.SetName("Profile Spline")
                 spline.InsertUnder(shape)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, spline)
-                
+
                 path.SetName("Path Spline")
                 path.SetAbsPos(c4d.Vector(0, 50, 0))
                 path.InsertUnder(shape)
@@ -2169,10 +2230,10 @@ class C4DSocketServer(threading.Thread):
             else:
                 self.log("[C4D] Using traditional constants for light creation")
                 light = c4d.BaseObject(c4d.Olight)
-                
+
             if light is None:
                 return {"error": "Failed to create light object"}
-                
+
             light.SetName(name)
 
             light_type_map = {
@@ -2903,11 +2964,13 @@ if rs_mat:
 
                 # Using R2025.1 SDK approach for creating Redshift NodeMaterial
                 try:
-                    self.log("[C4D] Creating Redshift material using R2025.1 SDK approach")
-                    
+                    self.log(
+                        "[C4D] Creating Redshift material using R2025.1 SDK approach"
+                    )
+
                     # Determine the Redshift material ID to use
                     rs_id = 1036224  # Default known Redshift material ID
-                    
+
                     if hasattr(c4d, "ID_REDSHIFT_MATERIAL"):
                         rs_id = c4d.ID_REDSHIFT_MATERIAL
                         self.log(f"[C4D] Using c4d.ID_REDSHIFT_MATERIAL: {rs_id}")
@@ -2916,29 +2979,32 @@ if rs_mat:
                         self.log(f"[C4D] Using detected plugin ID: {rs_id}")
                     else:
                         self.log(f"[C4D] Using default Redshift ID: {rs_id}")
-                        
+
                     # Step 1: Create a material with the Redshift Material ID
                     mat = c4d.BaseMaterial(rs_id)
-                    
+
                     if not mat:
                         raise RuntimeError("Failed to create base Redshift material")
-                        
+
                     # Set the name immediately
                     mat.SetName(name)
-                    
+
                     # Verify we got a valid Redshift material
                     if mat and mat.GetType() == rs_id:
-                        self.log(f"[C4D] Successfully created Redshift material, type: {mat.GetType()}")
+                        self.log(
+                            f"[C4D] Successfully created Redshift material, type: {mat.GetType()}"
+                        )
                         redshift_material_created = True
                         material_type = "redshift"
                         success = True
                     else:
                         self.log("[C4D] Failed to create valid Redshift material")
                         material_type = "standard"
-                        
+
                 except Exception as e:
                     self.log(f"[C4D] Redshift material creation error: {str(e)}")
                     import traceback
+
                     traceback.print_exc()
                     material_type = "standard"
 
@@ -2967,8 +3033,10 @@ if rs_mat:
                             # This is critical as per the R2025.1 SDK documentation
                             node_mat = c4d.NodeMaterial(mat)
                             if not node_mat:
-                                raise RuntimeError("Failed to create NodeMaterial wrapper")
-                            
+                                raise RuntimeError(
+                                    "Failed to create NodeMaterial wrapper"
+                                )
+
                             # Step 3: Create the default graph using the NodeMaterial
                             if not node_mat.HasSpace(redshift_ns):
                                 graph = node_mat.CreateDefaultGraph(redshift_ns)
@@ -2976,7 +3044,7 @@ if rs_mat:
                             else:
                                 graph = node_mat.GetGraph(redshift_ns)
                                 self.log("[C4D] Using existing Redshift node graph")
-                                
+
                             # Important: Update our reference to use the NodeMaterial
                             mat = node_mat
 
