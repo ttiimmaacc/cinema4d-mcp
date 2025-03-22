@@ -1828,25 +1828,43 @@ class C4DSocketServer(threading.Thread):
                 self.log(f"[C4D] Naming field: {field_name}")
                 field.SetName(field_name)
                 
-                # STEP 5: Set field parameters
+                # STEP 5: Set field parameters using direct parameter IDs
                 self.log("[C4D] Setting field parameters")
-                # Map from parameter names to C4D constants
-                param_map = {
-                    "strength": c4d.FIELD_STRENGTH,
-                    "falloff": c4d.FIELD_FALLOFF,
-                    "inner_offset": c4d.FIELD_INNER_OFFSET,
-                    "min": c4d.FIELD_MIN,
-                    "max": c4d.FIELD_MAX,
-                    "multiplier": c4d.FIELD_MULTIPLIER,
-                    "direction_scale": c4d.FIELD_DIRECTIONSCALE,
-                    "direction_mode": c4d.FIELD_DIRECTIONMODE
+                
+                # These are standard parameter IDs for Fields in R2025.1
+                # Using direct IDs instead of constants that might not be available
+                field_param_ids = {
+                    "strength": 1365, # Field Strength (was c4d.FIELD_STRENGTH)
+                    "falloff": 1367,  # Field Falloff (was c4d.FIELD_FALLOFF)
+                    "inner_offset": 1366, # Inner Offset (was c4d.FIELD_INNER_OFFSET)
+                    "min": 1368,     # Min (was c4d.FIELD_MIN)
+                    "max": 1369,     # Max (was c4d.FIELD_MAX)
+                    "scale": 1111,   # Scale parameter
+                    "multiplier": 1370, # Multiplier (was c4d.FIELD_MULTIPLIER)
                 }
                 
-                # Set parameters that were provided
-                for param_name, c4d_param in param_map.items():
-                    if param_name in parameters and isinstance(parameters[param_name], (int, float)):
-                        field[c4d_param] = float(parameters[param_name])
-                        self.log(f"[C4D] Set {param_name}: {parameters[param_name]}")
+                # Set parameters that were provided using direct parameter IDs
+                for param_name, param_id in field_param_ids.items():
+                    try:
+                        if param_name in parameters and isinstance(parameters[param_name], (int, float)):
+                            field[param_id] = float(parameters[param_name])
+                            self.log(f"[C4D] Set {param_name} (ID:{param_id}): {parameters[param_name]}")
+                    except Exception as param_error:
+                        self.log(f"[C4D] Warning: Could not set {param_name} (ID:{param_id}): {param_error}")
+                        
+                # Try to set special parameters based on field type
+                try:
+                    # Common field type-specific parameters
+                    if field_type == "spherical":
+                        if "radius" in parameters:
+                            field[1111] = float(parameters["radius"])  # Radius param ID
+                    elif field_type == "box":
+                        if "size" in parameters and isinstance(parameters["size"], list) and len(parameters["size"]) >= 3:
+                            field[1001] = parameters["size"][0]  # Width
+                            field[1002] = parameters["size"][1]  # Height
+                            field[1003] = parameters["size"][2]  # Depth
+                except Exception as e:
+                    self.log(f"[C4D] Warning: Could not set type-specific parameters: {e}")
                 
                 # Make sure changes are applied
                 c4d.EventAdd()
