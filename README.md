@@ -53,13 +53,14 @@ chmod +x bin/cinema4d-mcp-wrapper
 
 To set up the Cinema 4D plugin, follow these steps:
 
-1. **Copy the Plugin File**: Copy the `c4d_plugins/mcp_server_plugin.pyp` file to Cinema 4D's plugin folder. The path varies depending on your operating system:
+1. **Copy the Plugin File**: Copy the `c4d_plugin/mcp_server_plugin.pyp` file to Cinema 4D's plugin folder. The path varies depending on your operating system:
+
    - macOS: `/Users/USERNAME/Library/Preferences/Maxon/Maxon Cinema 4D/plugins/`
    - Windows: `C:\Users\USERNAME\AppData\Roaming\Maxon\Maxon Cinema 4D\plugins\`
 
 2. **Start the Socket Server**:
    - Open Cinema 4D.
-   - Goto Extensins > Socket Server Plugin
+   - Go to Extensions > Socket Server Plugin
    - You should see a Socket Server Control dialog window. Click Start Server.
 
 ### Claude Desktop Configuration
@@ -67,6 +68,7 @@ To set up the Cinema 4D plugin, follow these steps:
 To configure Claude Desktop, you need to modify its configuration file:
 
 1. **Open the Configuration File**:
+
    - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
    - Alternatively, use the Settings menu in Claude Desktop (Settings > Developer > Edit Config).
@@ -82,23 +84,22 @@ To configure Claude Desktop, you need to modify its configuration file:
    }
    ```
 3. **Restart Claude Desktop** after updating the configuration file.
-  <details>
+<details>
 
   <summary>[TODO] For published server</summary>
 
-   ```json
-   {
-     "mcpServers": {
-       "cinema4d": {
-         "command": "cinema4d-mcp-wrapper",
-         "args": []
-       }
-     }
-   }
-   ```
+```json
+{
+  "mcpServers": {
+    "cinema4d": {
+      "command": "cinema4d-mcp-wrapper",
+      "args": []
+    }
+  }
+}
+```
 
    </details>
-
 
 ## Usage
 
@@ -113,12 +114,15 @@ To test the Cinema 4D socket server directly from the command line:
 ```bash
 python main.py
 ```
+
 ---
+
 You should see output confirming the server's successful start and connection to Cinema 4D.
 
 ## Troubleshooting & Debugging
 
 1. Check the log files:
+
    ```bash
    tail -f ~/Library/Logs/Claude/mcp*.log
    ```
@@ -126,11 +130,13 @@ You should see output confirming the server's successful start and connection to
 2. Verify Cinema 4D shows connections in its console after you open Claude Desktop.
 
 3. Test the wrapper script directly:
+
    ```bash
    cinema4d-mcp-wrapper
    ```
 
 4. If there are errors finding the mcp module, install it system-wide:
+
    ```bash
    pip install mcp
    ```
@@ -140,7 +146,7 @@ You should see output confirming the server's successful start and connection to
    npx @modelcontextprotocol/inspector uv --directory /Users/username/cinema4d-mcp run cinema4d-mcp
    ```
 
-## Project File Structure 
+## Project File Structure
 
 ```
 cinema4d-mcp/
@@ -152,8 +158,8 @@ cinema4d-mcp/
 ├── setup.py
 ├── bin/
 │   └── cinema4d-mcp-wrapper
-├── c4d_plugins/
-│   └── cinema4d_socket_plugin.py
+├── c4d_plugin/
+│   └── mcp_server_plugin.pyp
 ├── src/
 │   └── cinema4d_mcp/
 │       ├── __init__.py
@@ -161,33 +167,70 @@ cinema4d-mcp/
 │       ├── config.py
 │       └── utils.py
 └── tests/
-    └── test_server.py
+    ├── test_server.py
+    ├── mcp_test_harness.jsonl
+    └── mcp_test_harness_gui.py
 ```
 
 ## Tool Commands
 
-- `add_primitive`: Add a primitive object to the Cinema 4D scene.
-- `apply_material`: Apply a material to an object.
-- `create_material`: Create a new material in Cinema 4D.
-- `execute_python_script`: Execute a Python script in Cinema 4D.
-- `get_scene_info`: Get information about the current Cinema 4D scene.
-- `list_objects`: List all objects in the current Cinema 4D scene with hierarchy.
-- `load_scene`: Load a Cinema 4D scene file.
-- `modify_object`: Modify properties of an existing object.
-- `render_frame`: Render the current frame.
-- `save_scene`: Save the current Cinema 4D scene.
-- `set_keyframe`: Set a keyframe for an object property.
-- `create_mograph_cloner`: Create a MoGraph Cloner object (linear, grid, radial).
-- `apply_mograph_fields`: Create and apply a MoGraph Field (spherical, box, etc.).
-- `add_effector`: Add a MoGraph Effector to the scene.
-- `create_light`: Add a light to the scene.
-- `apply_shader`: Create and apply a specialized shader material.
-- `animate_camera`: Create a camera animation.
-- `create_abstract_shape`: Create an organic, abstract shape.
-- `apply_dynamics`: Add dynamics (rigid or soft) to an object.
+### General Scene & Execution
+
+- `get_scene_info`: Get summary info about the active Cinema 4D scene.
+- `list_objects`: List all scene objects (with hierarchy).
+- `group_objects`: Group selected objects under a new null.
+- `execute_python`: Execute custom Python code inside Cinema 4D.
+- `save_scene`: Save the current Cinema 4D project to disk.
+- `load_scene`: Load a `.c4d` file into the scene.
+- `set_keyframe`: Set a keyframe on an objects property (position, rotation, etc.).
+
+### Object Creation & Modification
+
+- `add_primitive`: Add a primitive (cube, sphere, cone, etc.) to the scene.
+- `modify_object`: Modify transform or attributes of an existing object.
+- `create_abstract_shape`: Create an organic, non-standard abstract form.
+
+### Cameras & Animation
+
+- `create_camera`: Add a new camera to the scene.
+- `animate_camera`: Animate a camera along a path (linear or spline-based).
+
+### Lighting & Materials
+
+- `create_light`: Add a light (omni, spot, etc.) to the scene.
+- `create_material`: Create a standard Cinema 4D material.
+- `apply_material`: Apply a material to a target object.
+- `apply_shader`: Generate and apply a stylized or procedural shader.
+
+### Redshift Support
+
+- `validate_redshift_materials`: Check Redshift material setup and connections.
+
+### MoGraph & Fields
+
+- `create_mograph_cloner`: Add a MoGraph Cloner (linear, radial, grid, etc.).
+- `add_effector`: Add a MoGraph Effector (Random, Plain, etc.).
+- `apply_mograph_fields`: Add and link a MoGraph Field to objects.
+
+### Dynamics & Physics
+
+- `create_soft_body`: Add a Soft Body tag to an object.
+- `apply_dynamics`: Apply Rigid or Soft Body physics.
+
+### Rendering & Preview
+
+- `render_frame`: Render a frame and save it to disk (file-based output only).
+- `render_preview`: Render a quick preview and return base64 image (for AI).
+- `snapshot_scene`: Capture a snapshot of the scene (objects + preview image).
 
 ## Recent Fixes
 
+- Fixed "Applied to: None" issue with MoGraph fields
+  - Fixed field hierarchy by inserting directly under target object
+  - Implemented proper Field Driver tag connection for Cinema 4D 2025.1
+  - Added multiple field linkage approaches for maximum compatibility
+  - Enabled 'Use Fields' checkbox using multiple parameter IDs
+  - Fixed field visibility and parent-child relationship issues
 - Fixed Grid Cloner creation issue by providing correct parameter IDs
 - Fixed MoGraph Fields application by defining proper field type constants
 - Improved hierarchical display in list_objects command
