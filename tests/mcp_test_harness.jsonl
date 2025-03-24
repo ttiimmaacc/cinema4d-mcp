@@ -1,0 +1,15 @@
+{"command": "add_primitive", "primitive_type": "pyramid", "name": "Test_Pyramid", "position": [0, 0, 0], "size": [200, 200, 200]}
+{"command": "create_light", "light_type": "area", "name": "Test_Light", "from_test_harness": true, "position": [300, 400, 100]}
+{"command": "create_camera", "name": "Test_Camera", "position": [500, 300, 200]}
+{"command": "create_material", "name": "Test_Material", "color": [1.0, 0.5, 0.2]}
+{"command": "apply_material", "object_name": "Test_Pyramid", "material_name": "Test_Material"}
+{"command": "create_mograph_cloner", "name": "Test_Cloner", "mode": "grid", "count": [3, 1, 3], "clone_object_name": "Test_Pyramid"}
+{"command": "add_effector", "effector_type": "random", "name": "Test_RandomEffector", "target_name": "MoGraph Cloner"}
+{"command": "apply_mograph_fields", "field_type": "spherical", "field_name": "Test_Field", "target_name": "Test_RandomEffector", "parameters": {"position": [0, 100, 0],"scale": [1, 1, 1],"rotation": [0, 0, 0]}}
+{"command": "set_keyframe", "object_name": "Test_Light", "property": "position", "frame": 0, "value": [300, 400, 100]}
+{"command": "set_keyframe", "object_name": "Test_Light", "property": "position", "frame": 30, "value": [300, 200, 100]}
+{"command": "render_preview"}
+{"command": "get_scene_info"}
+{"command": "list_objects"}
+{"command": "snapshot_scene"}
+{"command": "save_scene", "file_path": "test_harness_scene.c4d"}

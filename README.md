@@ -107,7 +107,9 @@ To configure Claude Desktop, you need to modify its configuration file:
 2. Open Claude Desktop and look for the hammer icon 🔨 in the input box, indicating MCP tools are available.
 3. Use the available [Tool Commands](#tool-commands) to interact with Cinema 4D through Claude.
 
-## Test directly from the command line
+## Testing
+
+### Command Line Testing
 
 To test the Cinema 4D socket server directly from the command line:
 
@@ -115,9 +117,30 @@ To test the Cinema 4D socket server directly from the command line:
 python main.py
 ```
 
----
-
 You should see output confirming the server's successful start and connection to Cinema 4D.
+
+### Testing with MCP Test Harness
+
+The repository includes a simple test harness for running predefined command sequences:
+
+1. **Test Command File** (`tests/mcp_test_harness.jsonl`): Contains a sequence of commands in JSONL format that can be executed in order. Each line represents a single MCP command with its parameters.
+
+2. **GUI Test Runner** (`tests/mcp_test_harness_gui.py`): A simple Tkinter GUI for running the test commands:
+
+   ```bash
+   python tests/mcp_test_harness_gui.py
+   ```
+
+   The GUI allows you to:
+   - Select a JSONL test file
+   - Run the commands in sequence
+   - View the responses from Cinema 4D
+
+This test harness is particularly useful for:
+- Rapidly testing new commands
+- Verifying plugin functionality after updates
+- Recreating complex scenes for debugging
+- Testing compatibility across different Cinema 4D versions
 
 ## Troubleshooting & Debugging
 
