@@ -132,11 +132,13 @@ The repository includes a simple test harness for running predefined command seq
    ```
 
    The GUI allows you to:
+
    - Select a JSONL test file
    - Run the commands in sequence
    - View the responses from Cinema 4D
 
 This test harness is particularly useful for:
+
 - Rapidly testing new commands
 - Verifying plugin functionality after updates
 - Recreating complex scenes for debugging
@@ -245,6 +247,24 @@ cinema4d-mcp/
 - `render_frame`: Render a frame and save it to disk (file-based output only).
 - `render_preview`: Render a quick preview and return base64 image (for AI).
 - `snapshot_scene`: Capture a snapshot of the scene (objects + preview image).
+
+## Compatibility Plan & Roadmap
+
+| Cinema 4D Version | Python Version | Compatibility Status | Notes                                             |
+| ----------------- | -------------- | -------------------- | ------------------------------------------------- |
+| R21 / S22         | Python 2.7     | ❌ Not supported     | Legacy API and Python version too old             |
+| R23               | Python 3.7     | 🔍 Not planned       | Not currently tested                              |
+| S24 / R25 / S26   | Python 3.9     | ⚠️ Possible (TBD)    | Requires testing and fallbacks for missing APIs   |
+| 2023.0 / 2023.1   | Python 3.9     | 🧪 In progress       | Targeting fallback support for core functionality |
+| 2023.2            | Python 3.10    | 🧪 In progress       | Aligns with planned testing base                  |
+| 2024.0            | Python 3.11    | ✅ Supported         | Verified                                          |
+| 2025.0+           | Python 3.11    | ✅ Fully Supported   | Primary development target                        |
+
+### Compatibility Goals
+
+- **Short Term**: Ensure compatibility with C4D 2023.1+ (Python 3.9 and 3.10)
+- **Mid Term**: Add conditional handling for missing MoGraph and Field APIs
+- **Long Term**: Consider optional legacy plugin module for R23–S26 support if demand arises
 
 ## Recent Fixes
 
