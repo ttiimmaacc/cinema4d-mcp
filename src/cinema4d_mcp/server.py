@@ -460,9 +460,17 @@ async def save_scene(file_path: Optional[str] = None, ctx: Context = None) -> st
 
         if "error" in response:
             return f"❌ Error: {response['error']}"
-
-        save_info = response.get("save_info", {})
-        return f"✅ Scene saved to: {save_info.get('path', 'Default location')}"
+            
+        # C4D plugin returns "file_path" directly in the response, not in a "save_info" dictionary
+        if "file_path" in response:
+            return f"✅ Scene saved to: {response['file_path']}"
+        elif "success" in response and "message" in response:
+            return f"✅ {response['message']}"
+        elif "save_info" in response:
+            save_info = response.get("save_info", {})
+            return f"✅ Scene saved to: {save_info.get('path', 'Default location')}"
+        else:
+            return f"✅ Scene saved successfully"
 
 
 @mcp.tool()
