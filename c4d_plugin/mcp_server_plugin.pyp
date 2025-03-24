@@ -1,7 +1,7 @@
 """
 Cinema 4D MCP Server Plugin
 Updated for Cinema 4D R2025 compatibility
-Version 0.1.6 - Improved Redshift material creation with NodeMaterial approach
+Version 0.1.7 - Fixed MoGraph field linking and "Applied to: None" issues
 """
 
 import c4d
