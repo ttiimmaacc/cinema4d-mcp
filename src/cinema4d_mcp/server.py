@@ -909,6 +909,164 @@ async def execute_python_script(script: str, ctx: Context) -> str:
 """
 
 
+@mcp.tool()
+async def group_objects(
+    object_names: List[str], 
+    group_name: Optional[str] = None, 
+    ctx: Context = None
+) -> str:
+    """
+    Group multiple objects under a null object.
+
+    Args:
+        object_names: List of object names to group
+        group_name: Optional name for the group
+    """
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return "❌ Not connected to Cinema 4D"
+
+        # Prepare command
+        command = {
+            "command": "group_objects",
+            "object_names": object_names
+        }
+
+        if group_name:
+            command["group_name"] = group_name
+
+        # Send command to Cinema 4D
+        response = send_to_c4d(connection, command)
+
+        if "error" in response:
+            return f"❌ Error: {response['error']}"
+
+        group_info = response.get("group", {})
+        
+        # Format object list for display
+        objects_str = ", ".join(object_names)
+        if len(objects_str) > 50:
+            # Truncate if too long
+            objects_str = objects_str[:47] + "..."
+            
+        return f"""
+✅ Created group: {group_info.get('name', group_name or 'Group')}
+- **Objects**: {objects_str}
+- **Object Count**: {len(object_names)}
+"""
+
+
+@mcp.tool()
+async def render_preview(
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    frame: Optional[int] = None,
+    ctx: Context = None
+) -> str:
+    """
+    Render the current view and return a base64-encoded preview image.
+
+    Args:
+        width: Optional preview width in pixels
+        height: Optional preview height in pixels
+        frame: Optional frame number to render
+    """
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return "❌ Not connected to Cinema 4D"
+
+        # Prepare command
+        command = {"command": "render_preview"}
+        
+        if width:
+            command["width"] = width
+        if height:
+            command["height"] = height
+        if frame is not None:
+            command["frame"] = frame
+
+        # Set longer timeout for rendering
+        logger.info(f"Sending render_preview command with parameters: {command}")
+        
+        # Send command to Cinema 4D
+        response = send_to_c4d(connection, command)
+
+        if "error" in response:
+            return f"❌ Error: {response['error']}"
+
+        # Check if the response contains the base64 image data
+        if "image_data" not in response:
+            return "❌ Error: No image data returned from Cinema 4D"
+
+        # Get image dimensions
+        preview_width = response.get("width", width or "default")
+        preview_height = response.get("height", height or "default")
+        
+        # Display the image using markdown
+        image_data = response["image_data"]
+        image_format = response.get("format", "png")
+        
+        return f"""
+✅ Preview rendered
+- **Resolution**: {preview_width} x {preview_height}
+- **Format**: {image_format}
+
+![Preview Image](data:image/{image_format};base64,{image_data})
+"""
+
+
+@mcp.tool()
+async def snapshot_scene(
+    file_path: Optional[str] = None,
+    include_assets: bool = False,
+    ctx: Context = None
+) -> str:
+    """
+    Create a snapshot of the current scene state.
+
+    Args:
+        file_path: Optional path to save the snapshot
+        include_assets: Whether to include external assets in the snapshot
+    """
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return "❌ Not connected to Cinema 4D"
+
+        # Prepare command
+        command = {"command": "snapshot_scene"}
+        
+        if file_path:
+            command["file_path"] = file_path
+        
+        command["include_assets"] = include_assets
+
+        # Send command to Cinema 4D
+        response = send_to_c4d(connection, command)
+
+        if "error" in response:
+            return f"❌ Error: {response['error']}"
+
+        snapshot_info = response.get("snapshot", {})
+        
+        # Extract information
+        path = snapshot_info.get("path", file_path or "Default location")
+        size = snapshot_info.get("size", "Unknown")
+        timestamp = snapshot_info.get("timestamp", "Unknown")
+        
+        # Format assets information if available
+        assets_info = ""
+        if "assets" in snapshot_info:
+            assets_count = len(snapshot_info["assets"])
+            assets_info = f"\n- **Assets Included**: {assets_count}"
+        
+        return f"""
+✅ Scene snapshot created
+- **Path**: {path}
+- **Size**: {size}
+- **Timestamp**: {timestamp}{assets_info}
+"""
+
+
 @mcp.resource("c4d://primitives")
 def get_primitives_info() -> str:
     """Get information about available Cinema 4D primitives."""

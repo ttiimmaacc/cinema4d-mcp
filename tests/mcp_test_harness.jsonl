@@ -8,8 +8,9 @@
 {"command": "apply_mograph_fields", "field_type": "spherical", "field_name": "Test_Field", "target_name": "Test_RandomEffector", "parameters": {"position": [0, 100, 0],"scale": [1, 1, 1],"rotation": [0, 0, 0]}}
 {"command": "set_keyframe", "object_name": "Test_Light", "property": "position", "frame": 0, "value": [300, 400, 100]}
 {"command": "set_keyframe", "object_name": "Test_Light", "property": "position", "frame": 30, "value": [300, 200, 100]}
-{"command": "render_preview"}
+{"command": "group_objects", "object_names": ["Test_Pyramid", "Test_Light"], "group_name": "Test_Group"}
+{"command": "render_preview", "width": 800, "height": 600, "frame": 15}
 {"command": "get_scene_info"}
 {"command": "list_objects"}
-{"command": "snapshot_scene"}
+{"command": "snapshot_scene", "file_path": "test_harness_snapshot.c4d", "include_assets": true}
 {"command": "save_scene", "file_path": "test_harness_scene.c4d"}

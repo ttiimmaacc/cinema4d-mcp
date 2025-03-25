@@ -627,21 +627,28 @@ class C4DSocketServer(threading.Thread):
 
         # Optional: position the group null
         if isinstance(position, list) and len(position) == 3:
-            group_null.SetAbsPos(c4d.Vector(*position))
-            self.log(f"[C4D GROUP] Set group position to {position}")
+            try:
+                group_null.SetAbsPos(c4d.Vector(position[0], position[1], position[2]))
+                self.log(f"[C4D GROUP] Set group position to {position}")
+            except Exception as e:
+                self.log(f"[C4D GROUP] Error setting position: {str(e)}")
 
         elif center and objects_to_group:
             # Compute center of bounding boxes
-            center_vec = c4d.Vector()
+            center_vec = c4d.Vector(0, 0, 0)
             count = 0
             for obj in objects_to_group:
                 try:
-                    bbox = obj.GetRad()
-                    pos = obj.GetAbsPos()
-                    center_vec += pos + bbox
+                    # bbox = obj.GetRad()
+                    # pos = obj.GetAbsPos()
+                    # center_vec += pos + bbox
+                    center_vec += obj.GetMp()
                     count += 1
-                except:
-                    pass
+                except Exception as e:
+                    self.log(
+                        f"[C4D GROUP] Error calculating center for {obj.GetName()}: {str(e)}"
+                    )
+
             if count > 0:
                 average = center_vec / count
                 group_null.SetAbsPos(average)
@@ -650,12 +657,15 @@ class C4DSocketServer(threading.Thread):
         # Finalize
         c4d.EventAdd()
 
+        # Get the position vector
+        pos_vector = group_null.GetAbsPos()
+
         return {
             "group": {
                 "name": group_null.GetName(),
                 "children": grouped_names,
                 "id": str(group_null.GetGUID()),
-                "position": list(group_null.GetAbsPos()),
+                "position": [pos_vector.x, pos_vector.y, pos_vector.z],
             }
         }
 
