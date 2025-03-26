@@ -613,6 +613,12 @@ class C4DSocketServer(threading.Thread):
                 f"[C4D GROUP] Fallback: Grouping {len(objects_to_group)} selected objects."
             )
 
+            # Validate
+            if not objects_to_group:
+                return {
+                    "error": "No objects found to group (either not found by name or nothing selected)."
+                }
+
         # Create group null
         group_null = c4d.BaseObject(c4d.Onull)
         group_null.SetName(group_name)
@@ -840,6 +846,215 @@ class C4DSocketServer(threading.Thread):
             self.log(
                 f"[C4D] ## Warning ##: Could not add user data for original name: {str(e)}"
             )
+
+    def handle_render_preview_base64(self, frame=0, width=640, height=360):
+        """SDK 2025-compliant base64 renderer with error resolution"""
+        import c4d
+        import base64
+        import traceback
+
+        def _execute_render():
+            try:
+                doc = c4d.documents.GetActiveDocument()
+                if not doc:
+                    return {"error": "No active document"}
+
+                # 1. Camera Validation (Critical Fix)
+                if not doc.GetActiveBaseDraw().GetSceneCamera(doc):
+                    return {"error": "No active camera (create camera first)"}
+
+                # 2. RenderData Protocol Fix (SDK §9.1.3)
+                original_rd = doc.GetActiveRenderData()
+                if not original_rd:
+                    return {"error": "No render settings configured"}
+
+                rd_clone = original_rd.GetClone(c4d.COPYFLAGS_NONE)
+                if not rd_clone:
+                    return {"error": "RenderData clone failed"}
+
+                try:
+                    doc.InsertRenderData(rd_clone)
+                    doc.SetActiveRenderData(rd_clone)  # Required activation
+
+                    # 3. 2025-Specific Configuration
+                    settings = rd_clone.GetData()
+                    settings[c4d.RDATA_XRES] = width
+                    settings[c4d.RDATA_YRES] = height
+                    settings[c4d.RDATA_FRAMESEQUENCE] = (
+                        c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
+                    )
+
+                    # 4. Mandatory Flags (SDK §9.4.5)
+                    render_flags = (
+                        c4d.RENDERFLAGS_EXTERNAL
+                        | c4d.RENDERFLAGS_SHOWERRORS
+                        | 0x00040000  # EMBREE_STREAMING
+                        | c4d.RENDERFLAGS_NODOCUMENTCLONE
+                    )
+
+                    # 5. Bitmap Initialization (SDK §11.2.3)
+                    bmp = c4d.bitmaps.MultipassBitmap(width, height, c4d.COLORMODE_RGB)
+                    bmp.AddChannel(True, True)  # Required alpha
+
+                    # 6. Frame Synchronization
+                    doc.SetTime(c4d.BaseTime(frame, doc.GetFps()))
+                    doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
+
+                    # 7. Core Render Execution
+                    result = c4d.documents.RenderDocument(
+                        doc, settings, bmp, render_flags
+                    )
+                    if result != c4d.RENDERRESULT_OK:
+                        return {
+                            "error": f"Render failed: {self._render_code_to_str(result)}"
+                        }
+
+                    # 8. MemoryFile Handling Fix
+                    mem_file = c4d.storage.MemoryFileStruct()
+                    mem_file.SetMemoryWriteMode()
+                    if bmp.Save(mem_file, c4d.FILTER_PNG) != c4d.IMAGERESULT_OK:
+                        return {"error": "PNG encoding failed"}
+
+                    data, _ = mem_file.GetData()
+                    return {
+                        "success": True,
+                        "image_base64": f"data:image/png;base64,{base64.b64encode(data).decode()}",
+                    }
+
+                finally:
+                    # 9. Correct Resource Cleanup (SDK §9.1.4)
+                    if rd_clone:
+                        rd_clone.Remove()  # Fixed removal method
+                    if "bmp" in locals():
+                        bmp.FlushAll()
+                    c4d.EventAdd()
+
+            except Exception as e:
+                return {"error": f"Render failure: {str(e)}"}
+
+        return self.execute_on_main_thread(_execute_render, _timeout=120)
+
+    def handle_render_frame(self, frame=0, width=640, height=360, output_path=None):
+        """SDK 2025-compliant file renderer with safe fallback path and no deprecated fields"""
+        import c4d
+        import os
+
+        def _render_to_file():
+            nonlocal output_path, frame
+
+        try:
+            frame = int(float(frame))
+        except Exception:
+            self.log("[WARN] Invalid frame input; defaulting to 0")
+            frame = 0
+
+            try:
+                doc = c4d.documents.GetActiveDocument()
+                if not doc:
+                    return {"error": "[SDK-ERR-101] No active document"}
+
+                # 0. Resolve output_path
+                if not output_path:
+                    doc_path = doc.GetDocumentPath()
+                    if not doc_path:
+                        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+                        output_path = os.path.join(
+                            desktop, f"render_frame_{frame:04d}.png"
+                        )
+                        self.log(f"[PATH] No doc path, using fallback: {output_path}")
+                    else:
+                        output_path = os.path.join(doc_path, f"frame_{frame:04d}.png")
+
+                output_dir = os.path.dirname(output_path)
+                os.makedirs(output_dir, exist_ok=True)
+
+                # 1. RenderData Protocol (SDK §9.1.3)
+                original_rd = doc.GetActiveRenderData()
+                if not original_rd:
+                    return {"error": "[SDK-ERR-307] No render settings configured"}
+
+                rd_clone = original_rd.GetClone(c4d.COPYFLAGS_NONE)
+                if not rd_clone:
+                    return {"error": "[SDK-ERR-308] Clone failed"}
+
+                try:
+                    doc.InsertRenderData(rd_clone)
+                    doc.SetActiveRenderData(rd_clone)
+                    self.log(
+                        f"[RENDER] Active RenderData: {doc.GetActiveRenderData().GetName()}"
+                    )
+
+                    settings = rd_clone.GetData()
+                    settings[c4d.RDATA_PATH] = output_dir
+                    settings[c4d.RDATA_XRES] = width
+                    settings[c4d.RDATA_YRES] = height
+                    settings[c4d.RDATA_FRAMESEQUENCE] = (
+                        c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
+                    )
+
+                    # 2. Memory Threshold
+                    if width * height > 4_000_000:
+                        threshold = int(width * height * 4 * 1.5)
+                        c4d.GeSetMemoryThreshold(threshold)
+                        self.log(f"[MEMORY] Threshold set to: {threshold} bytes")
+                    else:
+                        self.log("[MEMORY] No threshold override needed")
+
+                    # 3. Bitmap
+                    bmp = c4d.bitmaps.MultipassBitmap(width, height, c4d.COLORMODE_RGB)
+                    bmp.AddChannel(True, True)
+
+                    # 4. Render
+                    render_flags = (
+                        c4d.RENDERFLAGS_EXTERNAL
+                        | c4d.RENDERFLAGS_SHOWERRORS
+                        | 0x00040000
+                        | c4d.RENDERFLAGS_NODOCUMENTCLONE
+                    )
+
+                    result = c4d.documents.RenderDocument(
+                        doc, settings, bmp, render_flags
+                    )
+                    if result != c4d.RENDERRESULT_OK:
+                        return {
+                            "error": f"[SDK-ERR-{400+result}] {self._render_code_to_str(result)}"
+                        }
+
+                    # 5. Save
+                    if not bmp.Save(output_path, c4d.FILTER_PNG):
+                        return {"error": f"[SDK-ERR-501] Failed to save {output_path}"}
+
+                    self.log(f"[PATH] Final output: {output_path}")
+                    return {"success": True, "path": output_path}
+
+                finally:
+                    if rd_clone:
+                        doc.SetActiveRenderData(original_rd)
+                        rd_clone.Remove()
+                    if "bmp" in locals():
+                        bmp.FlushAll()
+                    c4d.EventAdd()
+
+            except Exception as e:
+                return {"error": f"[SDK-ERR-999] {str(e)}"}
+
+        return self.execute_on_main_thread(_render_to_file, _timeout=300)
+
+    def _render_code_to_str(self, code):
+        """Convert Cinema4D render result codes to human-readable strings"""
+        codes = {
+            0: "Success",
+            1: "Out of memory",
+            2: "Command canceled",
+            3: "Missing assets",
+            4: "Rendering in progress",
+            5: "Invalid document",
+            6: "Version mismatch",
+            7: "Network error",
+            8: "Invalid parameters",
+            9: "IO error",
+        }
+        return codes.get(code, f"Unknown error ({code})")
 
     def handle_modify_object(self, command):
         """Handle modify_object command with full property support."""
@@ -1087,193 +1302,177 @@ class C4DSocketServer(threading.Thread):
         except Exception as e:
             return {"error": f"Failed to apply material: {str(e)}"}
 
-    def handle_render_preview_base64(self, frame=0, width=640, height=360):
-        """Render a preview of the scene to base64 PNG (in-memory) with proper render settings."""
-        import base64
+    def handle_render_to_file(self, doc, frame, width, height, output_path=None):
+        """Render a frame to file, with optional base64 and fallback output path."""
+        import os
+        import tempfile
         import time
+        import base64
+        import c4d.storage
         import traceback
 
-        doc = c4d.documents.GetActiveDocument()
+        try:
+            start_time = time.time()
 
-        def render_to_base64(doc, frame, width, height):
-            try:
-                # Clone and safely access render settings
-                render_data = doc.GetActiveRenderData()
-                if not render_data:
-                    return {"error": "No active render settings found"}
+            # Clone active render settings
+            render_data = doc.GetActiveRenderData()
+            if not render_data:
+                return {"error": "No active RenderData found"}
 
-                rd_clone = render_data.GetClone()
-                if not rd_clone:
-                    return {"error": "Failed to clone render settings"}
+            rd_clone = render_data.GetClone()
+            if not rd_clone:
+                return {"error": "Failed to clone render settings"}
 
-                settings = rd_clone.GetDataInstance()
-                settings.SetLong(c4d.RDATA_XRES, width)
-                settings.SetLong(c4d.RDATA_YRES, height)
+            # Update render settings
+            settings = rd_clone.GetData()
+            settings[c4d.RDATA_XRES] = float(width)
+            settings[c4d.RDATA_YRES] = float(height)
+            settings[c4d.RDATA_PATH] = output_path or os.path.join(
+                tempfile.gettempdir(), "temp_render_output.png"
+            )
 
-                # Apply frame and update passes
-                doc.SetTime(c4d.BaseTime(frame, doc.GetFps()))
-                doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
+            settings[c4d.RDATA_RENDERENGINE] = c4d.RDATA_RENDERENGINE_STANDARD
+            settings[c4d.RDATA_FRAMESEQUENCE] = c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
+            settings[c4d.RDATA_SAVEIMAGE] = False
 
-                # Prepare target bitmap
-                bmp = c4d.bitmaps.BaseBitmap()
-                if not bmp.Init(width, height):
-                    return {"error": "Failed to initialize bitmap"}
+            # render_data.SetData(settings)
+            # Create temp RenderData container
+            # Insert actual RenderData object into the scene with settings
+            temp_rd = c4d.documents.RenderData()
+            temp_rd.SetData(settings)
+            doc.InsertRenderData(temp_rd)
 
-                # Attempt rendering with BaseContainer (required for C4D 2025+)
-                render_result = c4d.documents.RenderDocument(
-                    doc,
-                    settings,  # ✅ Must be BaseContainer
-                    bmp,
-                    c4d.RENDERFLAGS_EXTERNAL | c4d.RENDERFLAGS_NODOCUMENTCLONE,
-                    None,
-                )
+            # Update document time/frame
+            if isinstance(frame, dict):
+                frame = frame.get("frame", 0)
+            doc.SetTime(c4d.BaseTime(frame, doc.GetFps()))
 
-                if not render_result:
-                    return {"error": "RenderDocument returned False"}
+            doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
 
-                # Export bitmap to base64
-                mem_file = c4d.storage.MemoryFileStruct()
-                mem_file.SetMemoryWriteMode()
-                if bmp.Save(mem_file, c4d.FILTER_PNG) != c4d.IMAGERESULT_OK:
-                    return {"error": "Failed to write PNG to memory"}
+            # Create target bitmap
+            bmp = c4d.bitmaps.BaseBitmap()
+            if not bmp.Init(int(width), int(height)):
+                return {"error": "Failed to initialize bitmap"}
 
-                data, size = mem_file.GetData()
-                if not data or size == 0:
-                    return {"error": "Memory buffer is empty"}
+            self.log(f"[RENDER] Rendering frame {frame} at {width}x{height}...")
+            self.log(f"[RENDER DEBUG] Using RenderData name: {temp_rd.GetName()}")
 
-                encoded = base64.b64encode(data).decode("utf-8")
+            self.log(
+                f"[RENDER DEBUG] Width: {settings[c4d.RDATA_XRES]}, Height: {settings[c4d.RDATA_YRES]}"
+            )
 
-                return {
-                    "success": True,
-                    "frame": frame,
-                    "resolution": f"{width}x{height}",
-                    "image_base64": f"data:image/png;base64,{encoded}",
-                    "render_time": round(time.time(), 2),
-                }
+            # Render to bitmap
+            result = c4d.documents.RenderDocument(
+                doc,
+                temp_rd.GetData(),
+                bmp,
+                c4d.RENDERFLAGS_EXTERNAL | c4d.RENDERFLAGS_NODOCUMENTCLONE,
+                None,
+            )
 
-            except Exception as e:
-                self.log("[C4D PREVIEW] Exception during base64 render")
-                self.log(traceback.format_exc())
-                return {"error": f"Render to base64 failed: {str(e)}"}
+            if not result:
+                self.log("[RENDER] RenderDocument returned False")
+                return {"error": "RenderDocument failed"}
 
-        return self.execute_on_main_thread(
-            render_to_base64, args=(doc, frame, width, height), _timeout=60
-        )
+            # Fallback path if needed
+            if not output_path:
+                doc_name = doc.GetDocumentName() or "untitled"
+                if doc_name.lower().endswith(".c4d"):
+                    doc_name = doc_name[:-4]
+                base_dir = doc.GetDocumentPath() or tempfile.gettempdir()
+                output_path = os.path.join(base_dir, f"{doc_name}_snapshot_{frame}.png")
 
-    def handle_render_frame(self, command):
-        """Render the current frame to file. No base64. File-based output only."""
-        import time
-        import tempfile
+            # Choose format based on extension
+            ext = os.path.splitext(output_path)[1].lower()
+            format_map = {
+                ".png": c4d.FILTER_PNG,
+                ".jpg": c4d.FILTER_JPG,
+                ".jpeg": c4d.FILTER_JPG,
+                ".tif": c4d.FILTER_TIF,
+                ".tiff": c4d.FILTER_TIF,
+            }
+            format_id = format_map.get(ext, c4d.FILTER_PNG)
 
-        doc = c4d.documents.GetActiveDocument()
-        frame = int(command.get("frame", 0))
-        width = int(command.get("width", 640))
-        height = int(command.get("height", 360))
-        output_path = command.get("output_path", None)
+            # Save image to file
+            if not bmp.Save(output_path, format_id):
+                self.log(f"[RENDER] Failed to save bitmap to file: {output_path}")
+                return {"error": f"Failed to save image to: {output_path}"}
 
-        def render_to_file(doc, frame, width, height, output_path):
-            try:
-                rd = doc.GetActiveRenderData()
-                settings = rd.GetDataInstance()
-                settings.SetLong(c4d.RDATA_XRES, width)
-                settings.SetLong(c4d.RDATA_YRES, height)
+            # Optionally encode to base64 if PNG
+            image_base64 = None
+            if format_id == c4d.FILTER_PNG:
+                mem_file = c4d.storage.MemoryFileWrite()
+                if mem_file.Open(1024 * 1024):
+                    if bmp.Save(mem_file, c4d.FILTER_PNG):
+                        raw_bytes = mem_file.GetValue()
+                        image_base64 = base64.b64encode(raw_bytes).decode("utf-8")
+                        self.log("[RENDER] Base64 preview generated")
+                    mem_file.Close()
 
-                doc.SetTime(c4d.BaseTime(frame, doc.GetFps()))
-                doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
+            elapsed = round(time.time() - start_time, 3)
 
-                bmp = c4d.bitmaps.BaseBitmap()
-                bmp.Init(width, height)
+            return {
+                "success": True,
+                "frame": frame,
+                "resolution": f"{width}x{height}",
+                "output_path": output_path,
+                "file_exists": os.path.exists(output_path),
+                "image_base64": image_base64,
+                "render_time": elapsed,
+            }
 
-                rd_data = settings
-
-                result = c4d.documents.RenderDocument(
-                    doc,
-                    rd.GetDataInstance(),
-                    bmp,
-                    c4d.RENDERFLAGS_EXTERNAL | c4d.RENDERFLAGS_NODOCUMENTCLONE,
-                    None,
-                )
-                if not result:
-                    return {"error": "RenderDocument returned False"}
-
-                # Auto-generate temp path if none provided
-                if not output_path:
-                    doc_name = doc.GetDocumentName() or "untitled"
-                    if doc_name.lower().endswith(".c4d"):
-                        doc_name = doc_name[:-4]
-                    base_dir = doc.GetDocumentPath() or tempfile.gettempdir()
-                    output_path = os.path.join(
-                        base_dir, f"{doc_name}_frame_{frame}.png"
-                    )
-
-                ext = os.path.splitext(output_path)[1].lower()
-                format_map = {
-                    ".png": c4d.FILTER_PNG,
-                    ".jpg": c4d.FILTER_JPG,
-                    ".jpeg": c4d.FILTER_JPG,
-                    ".tif": c4d.FILTER_TIF,
-                    ".tiff": c4d.FILTER_TIF,
-                }
-                format_id = format_map.get(ext, c4d.FILTER_PNG)
-
-                saved = bmp.Save(output_path, format_id)
-                if not saved:
-                    return {"error": f"Failed to save image to: {output_path}"}
-
-                return {
-                    "success": True,
-                    "frame": frame,
-                    "resolution": f"{width}x{height}",
-                    "output_path": output_path,
-                    "file_exists": os.path.exists(output_path),
-                }
-
-            except Exception as e:
-                import traceback
-
-                self.log(traceback.format_exc())
-                return {"error": f"Render failed: {str(e)}"}
-
-        return self.execute_on_main_thread(
-            render_to_file, args=(doc, frame, width, height, output_path), _timeout=60
-        )
+        except Exception as e:
+            self.log("[RENDER ] Exception during render_to_file")
+            self.log(traceback.format_exc())
+            return {"error": f"Exception during render: {str(e)}"}
 
     def handle_snapshot_scene(self, command=None):
-        """Combine object listing and rendered preview into one unified snapshot for AI context."""
+        """
+        Generates a snapshot of the current scene:
+        - Lists objects in the document
+        - Renders a preview image (returns file path + base64)
+        """
+        import time
 
         doc = c4d.documents.GetActiveDocument()
         frame = 0  # You can extend to accept from command if needed
 
-        self.log("[C4D] Running snapshot_scene: listing objects and rendering preview")
+        self.log(
+            "[C4D SNAPSHOT] Running snapshot_scene: listing objects and rendering preview"
+        )
 
         # --- 1. Get object list ---
         object_data = self.handle_list_objects()
         objects = object_data.get("objects", [])
 
         # --- 2. Render preview image ---
-        render_result = self.handle_render_frame(
-            {
-                "frame": frame,
-                "width": 640,
-                "height": 360,
-                # Don't set output_path unless you want saved files
-                # "output_path": "/Users/you/Desktop/snapshot.png"
-            }
+        render_result = self.execute_on_main_thread(
+            self.handle_render_to_file,
+            args=(doc, frame, 640, 360, None),
+            _timeout=60,
         )
 
-        if "error" in render_result:
-            self.log("[C4D] Snapshot render failed.")
-            return {"objects": objects, "render": {"error": render_result["error"]}}
+        if not render_result or "error" in render_result:
+            self.log(
+                f"[C4D SNAPSHOT] Snapshot render failed: {render_result.get('error')}"
+            )
+            return {
+                "objects": objects,
+                "render": {
+                    "error": render_result.get("error", "Unknown rendering error")
+                },
+            }
 
         # --- 3. Return combined context ---
+
         return {
             "objects": objects,
             "render": {
                 "frame": render_result.get("frame"),
                 "resolution": render_result.get("resolution"),
+                "output_path": render_result.get("output_path"),
+                "file_exists": render_result.get("file_exists", False),
                 "image_base64": render_result.get("image_base64"),
-                "output_path": render_result.get("output_path"),  # Optional
-                "file_exists": render_result.get("file_exists"),
                 "render_time": render_result.get("render_time"),
             },
         }
@@ -2271,27 +2470,43 @@ class C4DSocketServer(threading.Thread):
         """
         Handle create_mograph_cloner command.
         Creates a MoGraph Cloner object with the specified properties.
-        Based on Cinema 4D R2025 SDK documentation for MoGraph.
+        Supports backward-compatible grid mode and other standard modes.
         """
         doc = c4d.documents.GetActiveDocument()
         name = command.get("cloner_name", "MoGraph Cloner")
         mode = command.get("mode", "grid").lower()
-
-        # Ensure count is a number, not a list
-        count_value = command.get("count", 10)
-        # Convert to a single number if it's a list or tuple
-        if isinstance(count_value, (list, tuple)) and len(count_value) > 0:
-            count = float(count_value[0])
-        else:
-            count = float(count_value) if count_value else 10
-
         object_name = command.get("object_name", None)
 
+        # Normalize count early
+        raw_count = command.get("count", [3, 1, 3] if mode == "grid" else 10)
+
+        count_vec = None
+        count = None
+
+        if mode == "grid":
+            if isinstance(raw_count, (list, tuple)) and len(raw_count) == 3:
+                count_vec = c4d.Vector(*raw_count)
+            else:
+                self.log(
+                    f"[C4D CLONER] Invalid count for grid mode, using default [3, 1, 3]"
+                )
+                count_vec = c4d.Vector(3, 1, 3)
+        else:
+            try:
+                count = (
+                    int(raw_count)
+                    if not isinstance(raw_count, (list, tuple))
+                    else int(raw_count[0])
+                )
+            except Exception:
+                self.log(f"[C4D CLONER] Invalid count format, falling back to 10")
+                count = 10
+
         self.log(
-            f"[C4D CLONER] Creating MoGraph Cloner: {name}, Mode: {mode}, Count: {count}"
+            f"[C4D CLONER] Creating MoGraph Cloner: {name}, Mode: {mode}, Count: {raw_count}"
         )
 
-        # Find object to clone if specified
+        # Attempt to find object to clone
         clone_obj = None
         if object_name:
             clone_obj = self.find_object_by_name(doc, object_name)
@@ -2300,149 +2515,144 @@ class C4DSocketServer(threading.Thread):
                 return {"error": f"Object '{object_name}' not found."}
             self.log(f"[C4D CLONER] Found clone object: {object_name}")
 
-        # Define a function to run on the main thread:
-        def create_mograph_cloner_safe(doc, name, mode, count, clone_obj):
-            self.log("[C4D CLONER] Creating MoGraph Cloner on main thread")
+        # Main-thread-safe cloner creation logic
+        def create_mograph_cloner_safe(doc, name, mode, count, count_vec, clone_obj):
             try:
-                # Create cloner object
+                self.log("[C4D CLONER] Creating MoGraph Cloner on main thread")
                 cloner = c4d.BaseObject(c4d.Omgcloner)
                 if not cloner:
-                    self.log("[C4D CLONER] Failed to create Cloner object")
                     return {"error": "Failed to create Cloner object"}
 
                 cloner.SetName(name)
                 self.log(f"[C4D CLONER] Created cloner: {name}")
 
-                # Map mode strings to C4D mode IDs
                 mode_ids = {
-                    "linear": 0,  # Linear mode
-                    "radial": 2,  # Radial mode
-                    "grid": 1,  # Grid mode
-                    "object": 3,  # Object mode
+                    "linear": 0,
+                    "radial": 2,
+                    "grid": 1,
+                    "object": 3,
                 }
-                mode_id = mode_ids.get(mode, 0)  # Default to Linear
+                mode_id = mode_ids.get(mode, 0)
 
-                # First insert the cloner into the document so parameter changes take effect
                 doc.InsertObject(cloner)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, cloner)
-
-                # Set the distribution mode
-                self.log(f"[C4D CLONER] Setting cloner mode to: {mode} (ID: {mode_id})")
                 cloner[c4d.ID_MG_MOTIONGENERATOR_MODE] = mode_id
+                self.log(f"[C4D CLONER] Set mode: {mode} (ID: {mode_id})")
 
-                # Create a clone of the provided object, or a default cube
-                child_obj = None
+                # Create child
                 if clone_obj:
+                    child_obj = clone_obj.GetClone()
                     self.log(
                         f"[C4D CLONER] Cloning source object: {clone_obj.GetName()}"
                     )
-                    child_obj = clone_obj.GetClone()
                 else:
-                    self.log("[C4D CLONER] Creating default cube as clone source")
                     child_obj = c4d.BaseObject(c4d.Ocube)
                     child_obj.SetName("Default Cube")
                     child_obj.SetAbsScale(c4d.Vector(0.5, 0.5, 0.5))
+                    self.log("[C4D CLONER] Using default cube")
 
                 if not child_obj:
-                    self.log("[C4D CLONER] Failed to create child object for cloner")
-                    return {"error": "Failed to create child object for cloner"}
+                    return {"error": "Failed to create child object"}
 
-                # Insert the child object under the cloner (this is critical!)
-                self.log("[C4D CLONER] Inserting child object under cloner")
                 doc.InsertObject(child_obj)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, child_obj)
-
-                # Ensure proper hierarchy - this is the key part!
                 child_obj.InsertUnderLast(cloner)
 
-                # Set specific parameters based on mode
-                # Setting these parameters AFTER creating the hierarchy ensures they take effect
+                # Mode-specific configuration
                 if mode == "linear":
-                    self.log(
-                        f"[C4D CLONER] Configuring linear mode with count: {count}"
-                    )
                     cloner[c4d.MG_LINEAR_COUNT] = count
-                    # Set a reasonable default offset
                     cloner[c4d.MG_LINEAR_OFFSET] = 100
+                    self.log(f"[C4D CLONER] Set linear count: {count}")
 
                 elif mode == "grid":
-                    # Calculate dimensions for a reasonable grid based on total count
-                    grid_dim = max(1, int(round(count ** (1 / 3))))
-                    self.log(
-                        f"[C4D CLONER] Configuring grid mode with dimensions: {grid_dim}x{grid_dim}x{grid_dim}"
-                    )
-                    # Use the correct parameter IDs for grid mode in R2025
-                    # Define these manually if not available in the SDK
-                    # Based on MoGraph documentation, these are the correct IDs
-                    MG_GRID_COUNT_X = 1001
-                    MG_GRID_COUNT_Y = 1002
-                    MG_GRID_COUNT_Z = 1003
-                    MG_GRID_SIZE = 1010
+                    version = c4d.GetC4DVersion()
+                    try:
+                        # Use updated constants if available
+                        if version >= 202500 and hasattr(c4d, "MGGRIDARRAY_MODE"):
+                            cloner[c4d.MGGRIDARRAY_MODE] = 1
+                            cloner[c4d.MGGRIDARRAY_RESOLUTION] = count_vec
+                            cloner[c4d.MGGRIDARRAY_SIZE] = c4d.Vector(200, 200, 200)
+                            self.log(
+                                f"[C4D CLONER] Using 2025+ MGGRIDARRAY_*; resolution: {count_vec}"
+                            )
+                        else:
+                            import c4d.modules.mograph as mo
 
-                    cloner[MG_GRID_COUNT_X] = grid_dim
-                    cloner[MG_GRID_COUNT_Y] = grid_dim
-                    cloner[MG_GRID_COUNT_Z] = grid_dim
-                    # Set a reasonable size
-                    cloner[MG_GRID_SIZE] = c4d.Vector(100, 100, 100)
+                            cloner[c4d.ID_MG_MOTIONGENERATOR_MODE] = 1
+
+                            # Legacy grid count per axis
+                            if hasattr(c4d, "MG_GRID_COUNT_X"):
+                                cloner[c4d.MG_GRID_COUNT_X] = int(count_vec.x)
+                                cloner[c4d.MG_GRID_COUNT_Y] = int(count_vec.y)
+                                cloner[c4d.MG_GRID_COUNT_Z] = int(count_vec.z)
+                                self.log(
+                                    f"[C4D CLONER] Legacy counts: X={int(count_vec.x)}, Y={int(count_vec.y)}, Z={int(count_vec.z)}"
+                                )
+                            else:
+                                self.log(
+                                    "[C4D CLONER WARNING] MG_GRID_COUNT_* not available"
+                                )
+
+                            # Legacy size
+                            if hasattr(c4d, "MG_CLONER_SIZE"):
+                                cloner[c4d.MG_CLONER_SIZE] = c4d.Vector(200, 200, 200)
+                                self.log("[C4D CLONER] Set MG_CLONER_SIZE to 200")
+                            else:
+                                self.log(
+                                    "[C4D CLONER WARNING] MG_CLONER_SIZE not available"
+                                )
+                    except Exception as e:
+                        self.log(
+                            f"[C4D CLONER ERROR] Grid mode config failed: {str(e)}"
+                        )
 
                 elif mode == "radial":
-                    self.log(
-                        f"[C4D CLONER] Configuring radial mode with count: {count}"
-                    )
                     cloner[c4d.MG_POLY_COUNT] = count
-                    # Set a reasonable radius
                     cloner[c4d.MG_POLY_RADIUS] = 200
+                    self.log(f"[C4D CLONER] Set radial count: {count}")
 
                 elif mode == "object":
-                    self.log(f"[C4D CLONER] Configuring object mode")
-                    # For object mode, we would need a target object
-                    # This could be added in a future enhancement
+                    self.log("[C4D CLONER] Object mode not implemented")
 
-                # Ensure the cloner's iteration mode is set to iterate
-                # This determines how the cloner uses child objects
                 cloner[c4d.MGCLONER_MODE] = c4d.MGCLONER_MODE_ITERATE
-
-                # Update the document
-                self.log("[C4D CLONER] Calling EventAdd to update document")
                 c4d.EventAdd()
-
-                # Log summary of what was created
-                self.log(
-                    f"[C4D CLONER] Successfully created {mode} cloner with {count} instances"
-                )
 
                 return {
                     "name": cloner.GetName(),
                     "id": str(cloner.GetGUID()),
                     "type": mode,
-                    "count": count,
+                    "count": (
+                        count
+                        if count is not None
+                        else [int(count_vec.x), int(count_vec.y), int(count_vec.z)]
+                    ),
                     "type_id": cloner.GetType(),
                 }
+
             except Exception as e:
-                self.log(f"[C4D CLONER] Error in create_mograph_cloner_safe: {str(e)}")
                 import traceback
 
                 traceback.print_exc()
-                return {"error": f"Failed to create MoGraph Cloner: {str(e)}"}
+                return {"error": f"Exception during cloner creation: {str(e)}"}
 
         try:
-            # Execute the creation safely on the main thread with extended timeout
             self.log("[C4D CLONER] Dispatching cloner creation to main thread")
             cloner_info = self.execute_on_main_thread(
                 create_mograph_cloner_safe,
-                args=(doc, name, mode, count, clone_obj),
+                args=(doc, name, mode, count, count_vec, clone_obj),
                 _timeout=30,
             )
 
             if isinstance(cloner_info, dict) and "error" in cloner_info:
-                self.log(f"[C4D CLONER] Error from main thread: {cloner_info['error']}")
+                self.log(f"[C4D CLONER] Main thread error: {cloner_info['error']}")
                 return cloner_info
 
             self.log(f"[C4D CLONER] Cloner created successfully: {cloner_info}")
             return {"success": True, "cloner": cloner_info}
+
         except Exception as e:
-            self.log(f"[C4D CLONER] Exception creating MoGraph Cloner: {str(e)}")
-            return {"error": f"Failed to create MoGraph Cloner: {str(e)}"}
+            self.log(f"[C4D CLONER] Exception in handler: {str(e)}")
+            return {"error": f"Exception in cloner handler: {str(e)}"}
 
     def handle_list_objects(self):
         """Handle list_objects command with comprehensive object detection including MoGraph objects."""
@@ -2489,42 +2699,45 @@ class C4DSocketServer(threading.Thread):
                             try:
                                 # Try R2025.1 module path first
                                 if mode_id == 0:  # Linear
-                                    additional_props["count"] = current_obj[
-                                        (
-                                            c4d.modules.mograph.MG_LINEAR_COUNT
-                                            if hasattr(c4d.modules, "mograph")
-                                            else c4d.MG_LINEAR_COUNT
-                                        )
-                                    ]
+                                    if hasattr(c4d, "MG_LINEAR_COUNT"):
+                                        additional_props["count"] = current_obj[
+                                            c4d.MG_LINEAR_COUNT
+                                        ]
                                 elif mode_id == 1:  # Grid
-                                    if hasattr(c4d.modules, "mograph"):
-                                        additional_props["count_x"] = current_obj[
-                                            c4d.modules.mograph.MG_GRID_COUNT_X
+                                    if hasattr(c4d, "MGGRIDARRAY_RESOLUTION"):
+                                        resolution = current_obj[
+                                            c4d.MGGRIDARRAY_RESOLUTION
                                         ]
-                                        additional_props["count_y"] = current_obj[
-                                            c4d.modules.mograph.MG_GRID_COUNT_Y
+                                        additional_props["count_x"] = int(resolution.x)
+                                        additional_props["count_y"] = int(resolution.y)
+                                        additional_props["count_z"] = int(resolution.z)
+                                        # Fallback to legacy MG_GRID_COUNT_* if available
+                                    elif all(
+                                        hasattr(c4d, attr)
+                                        for attr in [
+                                            "MG_GRID_COUNT_X",
+                                            "MG_GRID_COUNT_Y",
+                                            "MG_GRID_COUNT_Z",
                                         ]
-                                        additional_props["count_z"] = current_obj[
-                                            c4d.modules.mograph.MG_GRID_COUNT_Z
-                                        ]
-                                    else:
-                                        additional_props["count_x"] = current_obj[
-                                            c4d.MG_GRID_COUNT_X
-                                        ]
-                                        additional_props["count_y"] = current_obj[
-                                            c4d.MG_GRID_COUNT_Y
-                                        ]
-                                        additional_props["count_z"] = current_obj[
-                                            c4d.MG_GRID_COUNT_Z
-                                        ]
-                                elif mode_id == 2:  # Radial
-                                    additional_props["count"] = current_obj[
-                                        (
-                                            c4d.modules.mograph.MG_POLY_COUNT
-                                            if hasattr(c4d.modules, "mograph")
-                                            else c4d.MG_POLY_COUNT
+                                    ):
+                                        additional_props["count_x"] = int(
+                                            current_obj[c4d.MG_GRID_COUNT_X]
                                         )
-                                    ]
+                                        additional_props["count_y"] = int(
+                                            current_obj[c4d.MG_GRID_COUNT_Y]
+                                        )
+                                        additional_props["count_z"] = int(
+                                            current_obj[c4d.MG_GRID_COUNT_Z]
+                                        )
+                                    else:
+                                        self.log(
+                                            "[C4D CLONER WARNING] No valid grid count parameters found"
+                                        )
+                                elif mode_id == 2:  # Radial
+                                    if hasattr(c4d, "MG_POLY_COUNT"):
+                                        additional_props["count"] = current_obj[
+                                            c4d.MG_POLY_COUNT
+                                        ]
                             except Exception as e:
                                 self.log(
                                     f"[C4D CLONER] Error getting cloner counts: {str(e)}"

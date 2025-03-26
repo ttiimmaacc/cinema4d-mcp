@@ -54,7 +54,7 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
 
     # Set appropriate timeout based on command type
     command_type = command.get("command", "")
-    
+
     # Long-running operations need longer timeouts
     if command_type in ["render_frame", "apply_mograph_fields"]:
         timeout = 120  # 2 minutes for render operations
@@ -70,48 +70,61 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
 
         # Set socket timeout
         connection.sock.settimeout(timeout)
-        
+
         # Receive response
         response_data = b""
         start_time = time.time()
         max_time = start_time + timeout
-        
+
         # Log for long-running operations
         if command_type in ["render_frame", "apply_mograph_fields"]:
-            logger.info(f"Waiting for response from {command_type} (timeout: {timeout}s)")
-        
+            logger.info(
+                f"Waiting for response from {command_type} (timeout: {timeout}s)"
+            )
+
         while time.time() < max_time:
             try:
                 chunk = connection.sock.recv(4096)
                 if not chunk:
                     # If we receive an empty chunk, the connection might be closed
                     if not response_data:
-                        logger.error(f"Connection closed by Cinema 4D during {command_type}")
-                        return {"error": f"Connection closed by Cinema 4D during {command_type}"}
+                        logger.error(
+                            f"Connection closed by Cinema 4D during {command_type}"
+                        )
+                        return {
+                            "error": f"Connection closed by Cinema 4D during {command_type}"
+                        }
                     break
-                    
+
                 response_data += chunk
-                
+
                 # For long operations, log progress on data receipt
                 elapsed = time.time() - start_time
-                if command_type in ["render_frame", "apply_mograph_fields"] and elapsed > 5:
-                    logger.debug(f"Received partial data for {command_type} ({len(response_data)} bytes, {elapsed:.1f}s elapsed)")
-                
+                if (
+                    command_type in ["render_frame", "apply_mograph_fields"]
+                    and elapsed > 5
+                ):
+                    logger.debug(
+                        f"Received partial data for {command_type} ({len(response_data)} bytes, {elapsed:.1f}s elapsed)"
+                    )
+
                 if b"\n" in chunk:  # Message complete when we see a newline
                     logger.debug(f"Received complete response for {command_type}")
                     break
-                    
+
             except socket.timeout:
                 logger.error(f"Socket timeout while receiving data for {command_type}")
-                return {"error": f"Timeout waiting for response from Cinema 4D ({timeout}s) for {command_type}"}
+                return {
+                    "error": f"Timeout waiting for response from Cinema 4D ({timeout}s) for {command_type}"
+                }
 
         # Parse and return response
         if not response_data:
             logger.error(f"No response received from Cinema 4D for {command_type}")
             return {"error": f"No response received from Cinema 4D for {command_type}"}
-            
+
         response_text = response_data.decode("utf-8").strip()
-        
+
         try:
             return json.loads(response_text)
         except json.JSONDecodeError as e:
@@ -122,7 +135,9 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
 
     except socket.timeout:
         logger.error(f"Socket timeout during {command_type} ({timeout}s)")
-        return {"error": f"Timeout communicating with Cinema 4D ({timeout}s) for {command_type}"}
+        return {
+            "error": f"Timeout communicating with Cinema 4D ({timeout}s) for {command_type}"
+        }
     except Exception as e:
         logger.error(f"Communication error during {command_type}: {str(e)}")
         return {"error": f"Communication error: {str(e)}"}
@@ -279,7 +294,7 @@ async def list_objects(ctx: Context) -> str:
         object_list = []
         for obj in objects:
             # Calculate indentation based on object's depth in hierarchy
-            indent = "  " * obj.get('depth', 0)
+            indent = "  " * obj.get("depth", 0)
             object_list.append(f"{indent}- **{obj['name']}** ({obj['type']})")
 
         return f"""
@@ -460,7 +475,7 @@ async def save_scene(file_path: Optional[str] = None, ctx: Context = None) -> st
 
         if "error" in response:
             return f"❌ Error: {response['error']}"
-            
+
         # C4D plugin returns "file_path" directly in the response, not in a "save_info" dictionary
         if "file_path" in response:
             return f"✅ Scene saved to: {response['file_path']}"
@@ -599,10 +614,10 @@ async def apply_mograph_fields(
 
         if field_name:
             command["field_name"] = field_name
-            
+
         if parameters:
             command["parameters"] = parameters
-        
+
         # Log the command for debugging
         logger.info(f"Sending apply_mograph_fields command: {command}")
 
@@ -617,18 +632,18 @@ async def apply_mograph_fields(
 
         # Extract field info from response
         field_info = response.get("field", {})
-        
+
         # Build a response message
-        field_name = field_info.get('name', f"{field_type.capitalize()} Field")
-        applied_to = field_info.get('applied_to', 'None')
-        
+        field_name = field_info.get("name", f"{field_type.capitalize()} Field")
+        applied_to = field_info.get("applied_to", "None")
+
         # Additional parameters if available
         params_info = ""
         if "strength" in field_info:
             params_info += f"\n- **Strength**: {field_info.get('strength')}"
         if "falloff" in field_info:
             params_info += f"\n- **Falloff**: {field_info.get('falloff')}"
-            
+
         return f"""
 ✅ Created {field_type} field
 - **Name**: {field_name}
@@ -754,10 +769,10 @@ async def create_light(
 
 @mcp.tool()
 async def apply_shader(
-    shader_type: str, 
+    shader_type: str,
     material_name: Optional[str] = None,
-    object_name: Optional[str] = None, 
-    ctx: Context = None
+    object_name: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     Create and apply a specialized shader material.
@@ -771,14 +786,11 @@ async def apply_shader(
         if not connection.connected:
             return "❌ Not connected to Cinema 4D"
 
-        command = {
-            "command": "apply_shader", 
-            "shader_type": shader_type
-        }
+        command = {"command": "apply_shader", "shader_type": shader_type}
 
         if material_name:
             command["material_name"] = material_name
-            
+
         if object_name:
             command["object_name"] = object_name
 
@@ -797,11 +809,11 @@ async def apply_shader(
 
 @mcp.tool()
 async def animate_camera(
-    animation_type: str, 
+    animation_type: str,
     camera_name: Optional[str] = None,
     positions: Optional[List[List[float]]] = None,
     frames: Optional[List[int]] = None,
-    ctx: Context = None
+    ctx: Context = None,
 ) -> str:
     """
     Create a camera animation.
@@ -822,29 +834,29 @@ async def animate_camera(
         # Add camera name if provided
         if camera_name:
             command["camera_name"] = camera_name
-            
+
         # Handle positions and frames if provided
         if positions:
             command["positions"] = positions
-            
+
             # Generate frames if not provided (starting at 0 with 15 frame intervals)
             if not frames:
                 frames = [i * 15 for i in range(len(positions))]
-                
+
             command["frames"] = frames
-                
+
         if animation_type == "orbit":
             # For orbit animations, we need to generate positions in a circle
             # if none are provided
             if not positions:
                 # Create a set of default positions for an orbit animation
                 radius = 200  # Default orbit radius
-                height = 100   # Default height
-                points = 12    # Number of points around the circle
-                
+                height = 100  # Default height
+                points = 12  # Number of points around the circle
+
                 orbit_positions = []
                 orbit_frames = []
-                
+
                 # Create positions in a circle
                 for i in range(points):
                     angle = (i / points) * 2 * 3.14159  # Convert to radians
@@ -853,7 +865,7 @@ async def animate_camera(
                     y = height
                     orbit_positions.append([x, y, z])
                     orbit_frames.append(i * 10)  # 10 frames between positions
-                    
+
                 command["positions"] = orbit_positions
                 command["frames"] = orbit_frames
 
@@ -865,16 +877,18 @@ async def animate_camera(
 
         # Get the camera animation info
         camera_info = response.get("camera_animation", {})
-        
+
         # Build a response message
         frames_info = ""
         if "frame_range" in camera_info:
-            frames_info = f"\n- **Frame Range**: {camera_info.get('frame_range', [0, 0])}"
-            
+            frames_info = (
+                f"\n- **Frame Range**: {camera_info.get('frame_range', [0, 0])}"
+            )
+
         keyframe_info = ""
         if "keyframe_count" in camera_info:
             keyframe_info = f"\n- **Keyframes**: {camera_info.get('keyframe_count', 0)}"
-            
+
         return f"""
 ✅ Created {animation_type} camera animation
 - **Camera**: {camera_info.get('camera', 'Animated Camera')}{keyframe_info}{frames_info}
@@ -911,9 +925,7 @@ async def execute_python_script(script: str, ctx: Context) -> str:
 
 @mcp.tool()
 async def group_objects(
-    object_names: List[str], 
-    group_name: Optional[str] = None, 
-    ctx: Context = None
+    object_names: List[str], group_name: Optional[str] = None, ctx: Context = None
 ) -> str:
     """
     Group multiple objects under a null object.
@@ -927,10 +939,7 @@ async def group_objects(
             return "❌ Not connected to Cinema 4D"
 
         # Prepare command
-        command = {
-            "command": "group_objects",
-            "object_names": object_names
-        }
+        command = {"command": "group_objects", "object_names": object_names}
 
         if group_name:
             command["group_name"] = group_name
@@ -942,13 +951,13 @@ async def group_objects(
             return f"❌ Error: {response['error']}"
 
         group_info = response.get("group", {})
-        
+
         # Format object list for display
         objects_str = ", ".join(object_names)
         if len(objects_str) > 50:
             # Truncate if too long
             objects_str = objects_str[:47] + "..."
-            
+
         return f"""
 ✅ Created group: {group_info.get('name', group_name or 'Group')}
 - **Objects**: {objects_str}
@@ -961,7 +970,7 @@ async def render_preview(
     width: Optional[int] = None,
     height: Optional[int] = None,
     frame: Optional[int] = None,
-    ctx: Context = None
+    ctx: Context = None,
 ) -> str:
     """
     Render the current view and return a base64-encoded preview image.
@@ -977,7 +986,7 @@ async def render_preview(
 
         # Prepare command
         command = {"command": "render_preview"}
-        
+
         if width:
             command["width"] = width
         if height:
@@ -987,7 +996,7 @@ async def render_preview(
 
         # Set longer timeout for rendering
         logger.info(f"Sending render_preview command with parameters: {command}")
-        
+
         # Send command to Cinema 4D
         response = send_to_c4d(connection, command)
 
@@ -1001,11 +1010,11 @@ async def render_preview(
         # Get image dimensions
         preview_width = response.get("width", width or "default")
         preview_height = response.get("height", height or "default")
-        
+
         # Display the image using markdown
         image_data = response["image_data"]
         image_format = response.get("format", "png")
-        
+
         return f"""
 ✅ Preview rendered
 - **Resolution**: {preview_width} x {preview_height}
@@ -1017,9 +1026,7 @@ async def render_preview(
 
 @mcp.tool()
 async def snapshot_scene(
-    file_path: Optional[str] = None,
-    include_assets: bool = False,
-    ctx: Context = None
+    file_path: Optional[str] = None, include_assets: bool = False, ctx: Context = None
 ) -> str:
     """
     Create a snapshot of the current scene state.
@@ -1034,10 +1041,10 @@ async def snapshot_scene(
 
         # Prepare command
         command = {"command": "snapshot_scene"}
-        
+
         if file_path:
             command["file_path"] = file_path
-        
+
         command["include_assets"] = include_assets
 
         # Send command to Cinema 4D
@@ -1047,18 +1054,18 @@ async def snapshot_scene(
             return f"❌ Error: {response['error']}"
 
         snapshot_info = response.get("snapshot", {})
-        
+
         # Extract information
         path = snapshot_info.get("path", file_path or "Default location")
         size = snapshot_info.get("size", "Unknown")
         timestamp = snapshot_info.get("timestamp", "Unknown")
-        
+
         # Format assets information if available
         assets_info = ""
         if "assets" in snapshot_info:
             assets_count = len(snapshot_info["assets"])
             assets_info = f"\n- **Assets Included**: {assets_count}"
-        
+
         return f"""
 ✅ Scene snapshot created
 - **Path**: {path}
