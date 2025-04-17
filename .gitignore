@@ -35,3 +35,11 @@ ENV/
 .DS_Store
 Thumbs.db
 **/CLAUDE.local.md
+
+# Aider
+.aider*
+.aider.chat.history.md
+.aider.history
+.aider.tags.cache.v3/
+.aider.tags.cache.v4/
+tests/.aider.history
