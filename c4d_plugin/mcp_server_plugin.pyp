@@ -1,7 +1,7 @@
 """
 Cinema 4D MCP Server Plugin
 Updated for Cinema 4D R2025 compatibility
-Version 0.1.7 - Fixed MoGraph field linking and "Applied to: None" issues
+Version 0.1.8 - Added core logic for context-awareness
 """
 
 import c4d
@@ -15,6 +15,7 @@ import queue
 import os
 import sys
 import base64
+import traceback
 
 PLUGIN_ID = 1057843  # Unique plugin ID for SpecialEventAdd
 
@@ -43,6 +44,18 @@ class C4DSocketServer(threading.Thread):
         self.running = False
         self.msg_queue = msg_queue  # Queue to communicate with UI
         self.daemon = True  # Ensures cleanup on shutdown
+
+        # --- ADDED FOR CONTEXT AWARENESS ---
+        self._object_name_registry = (
+            {}
+        )  # Maps GUID -> requested_name AND requested_name -> GUID (less robust) Keep for compatibility
+
+        self._name_to_guid_registry = (
+            {}
+        )  # Maps requested_name.lower() or actual_name.lower() -> guid
+        self._guid_to_name_registry = (
+            {}
+        )  # Maps guid -> {'requested_name': str, 'actual_name': str}
 
     def log(self, message):
         """Send log messages to UI via queue and trigger an event."""
@@ -394,91 +407,245 @@ class C4DSocketServer(threading.Thread):
 
         return type_map.get(type_id, f"Object (Type: {type_id})")
 
-    def find_object_by_name(self, doc, name):
-        """Find an object by name with C4D 2025 compatibility."""
-        if not name:
-            self.log("[C4D] ## Warning ##: Empty object name provided")
+    def find_object_by_name(self, doc, name_or_guid, use_guid=False):
+        """Find object by GUID (preferred) or name, using local registry first. FIX for recursion and GUID format check."""
+        if not name_or_guid:
+            self.log("[C4D FIND] Cannot find object: No name or GUID provided.")
             return None
+        if not doc:
+            self.log("[C4D FIND] ## Error ##: No document provided for search.")
+            return None
+        if not hasattr(self, "_name_to_guid_registry"):
+            self._name_to_guid_registry = {}
+        if not hasattr(self, "_guid_to_name_registry"):
+            self._guid_to_name_registry = {}
 
-        name = name.strip()
-        self.log(f"[C4D] Looking for object with name: '{name}'")
+        search_term = str(name_or_guid).strip()
+        self.log(
+            f"[C4D FIND] Attempting to find: '{search_term}' (Treat as GUID: {use_guid})"
+        )
 
-        all_objects = self._get_all_objects(doc)
+        # --- GUID Search Logic ---
+        if use_guid:
+            guid_to_find = search_term
+            # --- GUID format check ---
+            # C4D GUIDs converted with str() are typically long numbers (sometimes negative).
+            # Check if it's likely numeric and long enough. Hyphen is NOT required.
+            is_valid_guid_format = False
+            if guid_to_find:  # Check if not empty
+                try:
+                    int(guid_to_find)  # Check if it can be interpreted as an integer
+                    if len(guid_to_find) > 10:  # Check if it's reasonably long
+                        is_valid_guid_format = True
+                except ValueError:
+                    is_valid_guid_format = False  # Not purely numeric
 
-        # Method 1: Registry lookup by name -> GUID
-        if hasattr(self, "_object_name_registry"):
-            obj_id = self._object_name_registry.get(name)
-            if isinstance(obj_id, str):
-                for obj in all_objects:
-                    if str(obj.GetGUID()) == obj_id:
-                        self.log(
-                            f"[C4D] Found object via registry: '{obj.GetName()}' (requested as '{name}')"
+            if not is_valid_guid_format:
+                self.log(
+                    f"[C4D FIND] ## Warning ##: Invalid format/length for GUID search: '{guid_to_find}'. Treating as name."
+                )
+                use_guid = False  # Fallback to name search
+            else:
+                # Try direct C4D SearchObject
+                obj_from_search = doc.SearchObject(guid_to_find)
+                if obj_from_search:
+                    self.log(
+                        f"[C4D FIND] Success (GUID Scene Search): Found '{obj_from_search.GetName()}' (GUID: {guid_to_find})"
+                    )
+                    current_actual_name = obj_from_search.GetName()
+                    reg_entry = self._guid_to_name_registry.get(guid_to_find)
+                    if (
+                        not reg_entry
+                        or reg_entry.get("actual_name") != current_actual_name
+                    ):
+                        req_name = (
+                            reg_entry.get("requested_name", current_actual_name)
+                            if reg_entry
+                            else current_actual_name
                         )
-                        return obj
+                        self.register_object_name(obj_from_search, req_name)
+                    return obj_from_search
 
-        # Method 2: Direct name search (case-insensitive)
-        for obj in all_objects:
-            if obj.GetName().strip().lower() == name.lower():
-                self.log(f"[C4D] Found object via direct name: '{obj.GetName()}'")
+                # Manual iteration fallback
+                self.log(
+                    f"[C4D FIND] Info: doc.SearchObject failed for GUID {guid_to_find}. Iterating manually..."
+                )
+                all_objects = self._get_all_objects(doc)
+                found_obj_manual = None
+                for obj_iter in all_objects:
+                    try:
+                        iter_guid = str(obj_iter.GetGUID())
+                        if iter_guid == guid_to_find:
+                            self.log(
+                                f"[C4D FIND] Success (GUID Manual Iteration): Found '{obj_iter.GetName()}' (GUID: {guid_to_find})"
+                            )
+                            found_obj_manual = obj_iter
+                            break
+                    except Exception as e_iter:
+                        self.log(
+                            f"[C4D FIND] Error checking GUID during iteration for '{obj_iter.GetName()}': {e_iter}"
+                        )
+
+                if found_obj_manual:
+                    current_actual_name = found_obj_manual.GetName()
+                    reg_entry = self._guid_to_name_registry.get(guid_to_find)
+                    if (
+                        reg_entry
+                        and reg_entry.get("actual_name") != current_actual_name
+                    ):
+                        req_name = reg_entry.get("requested_name", current_actual_name)
+                        self.register_object_name(found_obj_manual, req_name)
+                    elif not reg_entry:
+                        self.register_object_name(
+                            found_obj_manual, found_obj_manual.GetName()
+                        )
+                    return found_obj_manual
+
+                # If both failed, cleanup registry
+                self.log(
+                    f"[C4D FIND] Failed (GUID): Object with GUID '{guid_to_find}' not found by SearchObject or Manual Iteration."
+                )
+                if guid_to_find in self._guid_to_name_registry:
+                    self.log(
+                        f"[C4D FIND] Cleaning registry for supposedly existing but unfound GUID {guid_to_find}."
+                    )
+                    reg_entry = self._guid_to_name_registry.pop(guid_to_find, None)
+                    if reg_entry:
+                        req_name_lower = reg_entry.get("requested_name", "").lower()
+                        act_name_lower = reg_entry.get("actual_name", "").lower()
+                        if req_name_lower:
+                            self._name_to_guid_registry.pop(req_name_lower, None)
+                        if act_name_lower and act_name_lower != req_name_lower:
+                            self._name_to_guid_registry.pop(act_name_lower, None)
+                return None
+
+        # --- Name Search Logic (Keep as is from previous correction) ---
+        name_to_find_lower = search_term.lower()
+
+        # Check registry by name -> GUID -> Object
+        guid_from_registry = self._name_to_guid_registry.get(name_to_find_lower)
+        if guid_from_registry:
+            obj_from_guid_lookup = self.find_object_by_name(
+                doc, guid_from_registry, use_guid=True
+            )
+            if obj_from_guid_lookup:
+                stored_names = self._guid_to_name_registry.get(guid_from_registry, {})
+                actual_name_reg = stored_names.get("actual_name", "").lower()
+                requested_name_reg = stored_names.get("requested_name", "").lower()
+                found_name_actual = obj_from_guid_lookup.GetName().lower()
+                if name_to_find_lower in [
+                    actual_name_reg,
+                    requested_name_reg,
+                    found_name_actual,
+                ]:
+                    self.log(
+                        f"[C4D FIND] Success (Registry Name '{search_term}' -> GUID {guid_from_registry}): Found '{obj_from_guid_lookup.GetName()}'"
+                    )
+                    if found_name_actual != actual_name_reg:
+                        self.register_object_name(
+                            obj_from_guid_lookup,
+                            stored_names.get("requested_name", search_term),
+                        )
+                    return obj_from_guid_lookup
+                else:
+                    self.log(
+                        f"[C4D FIND] ## Warning ## Registry inconsistency for name '{search_term}'. Continuing search."
+                    )
+            else:
+                self.log(
+                    f"[C4D FIND] ## Warning ## Name '{search_term}' maps to non-existent GUID. Cleaning registry."
+                )
+                self._name_to_guid_registry.pop(name_to_find_lower, None)
+                reg_entry = self._guid_to_name_registry.pop(guid_from_registry, None)
+                if reg_entry:
+                    other_name_key = (
+                        "actual_name"
+                        if name_to_find_lower
+                        == reg_entry.get("requested_name", "").lower()
+                        else "requested_name"
+                    )
+                    other_name_val = reg_entry.get(other_name_key, "").lower()
+                    if other_name_val:
+                        self._name_to_guid_registry.pop(other_name_val, None)
+
+        # Direct name search
+        all_objects_name = self._get_all_objects(doc)
+        for obj in all_objects_name:
+            if obj.GetName().strip().lower() == name_to_find_lower:
+                self.log(
+                    f"[C4D FIND] Success (Direct Name Search): Found '{obj.GetName()}'"
+                )
+                self.register_object_name(obj, search_term)
                 return obj
 
-        # Method 3: Search via Comment Tag (e.g. "MCP_NAME:Box") - Older versions R21–R24
-        self.log(f"[C4D] Looking for object via comment tag with '{name}'")
+        # Comment Tag Search
+        self.log(f"[C4D FIND] Trying comment tag search for '{search_term}'")
         if hasattr(c4d, "Tcomment"):
-            for obj in all_objects:
+            for obj in all_objects_name:
                 for tag in obj.GetTags():
                     if tag.GetType() == c4d.Tcomment:
                         try:
                             tag_text = tag[c4d.COMMENTTAG_TEXT]
                             if tag_text and tag_text.startswith("MCP_NAME:"):
                                 tagged_name = tag_text[9:].strip()
-                                if tagged_name.lower() == name.lower():
+                                if tagged_name.lower() == name_to_find_lower:
                                     self.log(
-                                        f"[C4D] Found object via comment tag: {obj.GetName()}"
+                                        f"[C4D FIND] Success (Comment Tag): Found '{obj.GetName()}'"
                                     )
+                                    self.register_object_name(obj, search_term)
                                     return obj
                         except Exception as e:
-                            self.log(f"[**ERROR**] Error reading comment tag: {str(e)}")
+                            self.log(f"Error reading comment tag: {e}")
 
-        # Method 4: Check User Data for "mcp_original_name"
-        for obj in all_objects:
+        # User Data Search
+        self.log(f"[C4D FIND] Trying user data search for '{search_term}'")
+        for obj in all_objects_name:
             try:
                 userdata = obj.GetUserDataContainer()
                 if userdata:
-                    for entry in userdata:
-                        if entry[c4d.DESC_NAME] == "mcp_original_name":
-                            data_id = entry[c4d.DESC_ID]
-                            if obj[data_id].strip().lower() == name.lower():
-                                self.log(
-                                    f"[C4D] Found object via user data: {obj.GetName()}"
-                                )
-                                return obj
+                    for i in range(len(userdata)):
+                        desc_id_tuple = obj.GetUserDataContainer()[i]
+                        if (
+                            isinstance(desc_id_tuple, tuple)
+                            and len(desc_id_tuple) > c4d.DESC_NAME
+                        ):
+                            if desc_id_tuple[c4d.DESC_NAME] == "mcp_original_name":
+                                desc_id = desc_id_tuple[c4d.DESC_ID]
+                                if obj[desc_id].strip().lower() == name_to_find_lower:
+                                    self.log(
+                                        f"[C4D FIND] Success (User Data): Found '{obj.GetName()}'"
+                                    )
+                                    self.register_object_name(obj, search_term)
+                                    return obj
             except Exception as e:
-                self.log(f"[**ERROR**] Error checking user data: {str(e)}")
+                self.log(f"Error checking user data for '{obj.GetName()}': {e}")
 
-        # Method 5: Fallback - try fuzzy name matching as a last resort
+        # Fuzzy Name Search
+        self.log(f"[C4D FIND] Trying fuzzy name matching for '{search_term}'")
         similar_objects = []
-        for obj in all_objects:
-            obj_name = obj.GetName().strip().lower()
-            name_l = name.lower()
+        for obj in all_objects_name:
+            obj_name_lower = obj.GetName().strip().lower()
             if (
-                name_l in obj_name
-                or obj_name in name_l
-                or obj_name.startswith(name_l)
-                or name_l.startswith(obj_name)
+                name_to_find_lower in obj_name_lower
+                or obj_name_lower in name_to_find_lower
+                or obj_name_lower.startswith(name_to_find_lower)
+                or name_to_find_lower.startswith(obj_name_lower)
             ):
-                similarity = abs(len(obj_name) - len(name_l))
+                similarity = abs(len(obj_name_lower) - len(name_to_find_lower))
                 similar_objects.append((obj, similarity))
-
         if similar_objects:
-            closest_match = sorted(similar_objects, key=lambda pair: pair[1])[0][0]
+            similar_objects.sort(key=lambda pair: pair[1])
+            closest_match = similar_objects[0][0]
             self.log(
-                f"[C4D] Fallback match: Using '{closest_match.GetName()}' for requested '{name}'"
+                f"[C4D FIND] Success (Fuzzy Fallback): Using '{closest_match.GetName()}' for '{search_term}'"
             )
+            self.register_object_name(closest_match, search_term)
             return closest_match
 
-        # Final: Not found
-        self.log(f"[C4D] Object not found: '{name}'")
+        # Final failure
+        self.log(
+            f"[C4D FIND] Failed: Object '{search_term}' not found after all checks."
+        )
         return None
 
     def _get_all_objects(self, doc):
@@ -570,8 +737,6 @@ class C4DSocketServer(threading.Thread):
                             )
 
             # Check for other MoGraph objects if needed
-            # (Add specific searches here if certain objects are still missed)
-
         except Exception as e:
             self.log(f"[**ERROR**] Error in MoGraph direct search: {str(e)}")
 
@@ -581,277 +746,536 @@ class C4DSocketServer(threading.Thread):
         return all_objects
 
     def handle_group_objects(self, command):
-        """
-        Handle group_objects command.
-        - Groups provided objects under a new null.
-        - Supports optional group position.
-        - Can center null based on children bounds.
-        - Can fallback to grouping currently selected objects.
-        """
+        """Handle group_objects command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
 
-        group_name = command.get("group_name", "Group")
-        object_names = command.get("object_names", [])  # Optional
-        position = command.get("position", None)  # Optional
-        center = command.get("center", False)  # Optional flag
+        requested_group_name = command.get("group_name", "Group")
+        object_identifiers = command.get("object_names", [])
+        position = command.get("position", None)
+        center = command.get("center", False)
+        keep_world_pos = command.get("keep_world_position", True)
 
-        # Determine which objects to group
-        if object_names:
-            objects_to_group = []
-            for name in object_names:
-                obj = self.find_object_by_name(doc, name)
+        objects_to_group = []
+        identifiers_found_guids = set()
+        identifiers_not_found = []
+
+        if object_identifiers:
+            self.log(f"[GROUP] Received identifiers: {object_identifiers}")
+            for identifier in object_identifiers:
+                if not identifier:
+                    continue
+
+                identifier_str = str(identifier).strip()
+                # --- REVISED: Detect GUID format correctly ---
+                use_current_id_as_guid = False
+                if "-" in identifier_str and len(identifier_str) > 30:
+                    use_current_id_as_guid = True
+                elif identifier_str.isdigit() or (
+                    identifier_str.startswith("-") and identifier_str[1:].isdigit()
+                ):
+                    if len(identifier_str) > 10:
+                        use_current_id_as_guid = True
+
+                self.log(
+                    f"[GROUP] Finding object by identifier: '{identifier_str}' (Treat as GUID: {use_current_id_as_guid})"
+                )
+                # --- Pass the correct flag to find_object_by_name ---
+                obj = self.find_object_by_name(
+                    doc, identifier_str, use_guid=use_current_id_as_guid
+                )
+
                 if obj:
-                    objects_to_group.append(obj)
+                    obj_guid = str(obj.GetGUID())
+                    if obj_guid not in identifiers_found_guids:
+                        objects_to_group.append(obj)
+                        identifiers_found_guids.add(obj_guid)
+                        self.log(
+                            f"[GROUP] Found object: '{obj.GetName()}' (GUID: {obj_guid})"
+                        )
+                    else:
+                        self.log(
+                            f"[GROUP] Info: Object '{obj.GetName()}' (GUID: {obj_guid}) already added."
+                        )
                 else:
-                    self.log(f"[C4D GROUP] Warning: Object not found: {name}")
+                    self.log(
+                        f"[GROUP] ## Warning ##: Object identifier not found: '{identifier_str}' (Searched as GUID: {use_current_id_as_guid})"
+                    )
+                    identifiers_not_found.append(identifier_str)
         else:
-            # Fallback: use currently selected objects
-            objects_to_group = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
-            if not objects_to_group:
-                return {"error": "No objects selected or specified to group."}
-            self.log(
-                f"[C4D GROUP] Fallback: Grouping {len(objects_to_group)} selected objects."
+            objects_to_group = doc.GetActiveObjects(
+                c4d.GETACTIVEOBJECTFLAGS_SELECTIONORDER
+                | c4d.GETACTIVEOBJECTFLAGS_TOPLEVEL
             )
-
-            # Validate
             if not objects_to_group:
                 return {
-                    "error": "No objects found to group (either not found by name or nothing selected)."
+                    "error": "No objects selected (top-level) or specified via 'object_names'."
                 }
+            self.log(
+                f"[GROUP] Fallback: Grouping {len(objects_to_group)} selected top-level objects."
+            )
 
-        # Create group null
-        group_null = c4d.BaseObject(c4d.Onull)
-        group_null.SetName(group_name)
-        doc.InsertObject(group_null)
+        if not objects_to_group:
+            error_msg = "No valid objects found to group."
+            if identifiers_not_found:
+                error_msg += f" Identifiers not found: {identifiers_not_found}"
+            return {"error": error_msg}
 
-        # Re-parent objects under the null
-        grouped_names = []
-        for obj in objects_to_group:
-            grouped_names.append(obj.GetName())
-            obj.Remove()
-            obj.InsertUnder(group_null)
+        # --- Grouping Logic ---
+        group_null = None
+        try:
+            doc.StartUndo()
+            group_null = c4d.BaseObject(c4d.Onull)
+            group_null.SetName(requested_group_name)
+            doc.InsertObject(group_null, None, None)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, group_null)
 
-        # Optional: position the group null
-        if isinstance(position, list) and len(position) == 3:
-            try:
-                group_null.SetAbsPos(c4d.Vector(position[0], position[1], position[2]))
-                self.log(f"[C4D GROUP] Set group position to {position}")
-            except Exception as e:
-                self.log(f"[C4D GROUP] Error setting position: {str(e)}")
+            grouped_actual_names = []
+            grouped_guids = []
+            original_matrices = {}
 
-        elif center and objects_to_group:
-            # Compute center of bounding boxes
-            center_vec = c4d.Vector(0, 0, 0)
-            count = 0
-            for obj in objects_to_group:
-                try:
-                    # bbox = obj.GetRad()
-                    # pos = obj.GetAbsPos()
-                    # center_vec += pos + bbox
-                    center_vec += obj.GetMp()
-                    count += 1
-                except Exception as e:
+            # Calculate center
+            group_center_pos = c4d.Vector(0)
+            if center:
+                min_vec, max_vec = c4d.Vector(float("inf")), c4d.Vector(float("-inf"))
+                count = 0
+                for obj in objects_to_group:
+                    try:
+                        rad, mp = obj.GetRad(), obj.GetMp()
+                        min_vec.x, min_vec.y, min_vec.z = (
+                            min(min_vec.x, mp.x - rad.x),
+                            min(min_vec.y, mp.y - rad.y),
+                            min(min_vec.z, mp.z - rad.z),
+                        )
+                        max_vec.x, max_vec.y, max_vec.z = (
+                            max(max_vec.x, mp.x + rad.x),
+                            max(max_vec.y, mp.y + rad.y),
+                            max(max_vec.z, mp.z + rad.z),
+                        )
+                        count += 1
+                    except Exception as e_bounds:
+                        self.log(
+                            f"[GROUP] Warning: Error getting bounds for '{obj.GetName()}': {e_bounds}"
+                        )
+                if count > 0:
+                    group_center_pos = (min_vec + max_vec) * 0.5
+                    self.log(f"[GROUP] Calculated center for null: {group_center_pos}")
+                else:
+                    center = False
                     self.log(
-                        f"[C4D GROUP] Error calculating center for {obj.GetName()}: {str(e)}"
+                        "[GROUP] Warning: Could not calculate center, disabling centering."
                     )
 
-            if count > 0:
-                average = center_vec / count
-                group_null.SetAbsPos(average)
-                self.log(f"[C4D GROUP] Centered group to position: {average}")
+            # Reparent
+            for obj in reversed(objects_to_group):
+                try:
+                    obj_name = obj.GetName()
+                    obj_guid = str(obj.GetGUID())
+                    grouped_actual_names.append(obj_name)
+                    grouped_guids.append(obj_guid)
+                    if keep_world_pos:
+                        original_matrices[obj_guid] = obj.GetMg()
+                    obj.Remove()
+                    obj.InsertUnder(group_null)
+                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
+                except Exception as e_reparent:
+                    self.log(
+                        f"[**ERROR**] Failed to reparent object '{obj_name}': {e_reparent}"
+                    )
 
-        # Finalize
-        c4d.EventAdd()
+            # Set Position
+            if isinstance(position, list) and len(position) == 3:
+                try:
+                    target_pos = c4d.Vector(
+                        float(position[0]), float(position[1]), float(position[2])
+                    )
+                    group_null.SetAbsPos(target_pos)
+                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, group_null)
+                except (ValueError, TypeError) as e_pos:
+                    self.log(
+                        f"[GROUP] Warning: Invalid position value '{position}': {e_pos}"
+                    )
+            elif center:
+                group_null.SetAbsPos(group_center_pos)
+                doc.AddUndo(c4d.UNDOTYPE_CHANGE, group_null)
 
-        # Get the position vector
-        pos_vector = group_null.GetAbsPos()
+            # Adjust children
+            if keep_world_pos:
+                null_mg_inv = ~group_null.GetMg()
+                for child in group_null.GetChildren():
+                    child_guid = str(child.GetGUID())
+                    if child_guid in original_matrices:
+                        new_ml = null_mg_inv * original_matrices[child_guid]
+                        child.SetMl(new_ml)
+                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, child)
+                    else:
+                        self.log(
+                            f"[GROUP] ## Warning ## Original matrix not found for child '{child.GetName()}'."
+                        )
 
-        return {
-            "group": {
-                "name": group_null.GetName(),
-                "children": grouped_names,
-                "id": str(group_null.GetGUID()),
-                "position": [pos_vector.x, pos_vector.y, pos_vector.z],
+            doc.EndUndo()
+            c4d.EventAdd()
+
+            # --- Contextual Return ---
+            actual_group_name = group_null.GetName()
+            group_guid = str(group_null.GetGUID())
+            pos_vector = group_null.GetAbsPos()
+            self.register_object_name(group_null, requested_group_name)
+            response = {
+                "group": {
+                    "requested_name": requested_group_name,
+                    "actual_name": actual_group_name,
+                    "guid": group_guid,
+                    "children_actual_names": grouped_actual_names,
+                    "children_guids": grouped_guids,
+                    "position": [pos_vector.x, pos_vector.y, pos_vector.z],
+                    "centered": center,
+                    "kept_world_position": keep_world_pos,
+                }
             }
-        }
+            if identifiers_not_found:
+                response["warnings"] = [
+                    f"Object identifier not found: '{idf}'"
+                    for idf in identifiers_not_found
+                ]
+            return response
+
+        except Exception as e:
+            doc.EndUndo()
+            error_msg = f"Error during grouping: {str(e)}"
+            self.log(f"[**ERROR**] {error_msg}\n{traceback.format_exc()}")
+            if group_null and group_null.GetDown() is None:
+                try:
+                    doc.AddUndo(c4d.UNDOTYPE_DELETE, group_null)
+                    group_null.Remove()
+                except:
+                    pass
+            return {"error": error_msg, "traceback": traceback.format_exc()}
 
     def handle_add_primitive(self, command):
         """Handle add_primitive command."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}  # Added check
 
         primitive_type = command.get("primitive_type") or command.get("type") or "cube"
         primitive_type = primitive_type.lower()
 
-        name = (
+        # Use provided name or generate one
+        requested_name = (
             command.get("name")
             or command.get("object_name")
-            or f"MCP_{primitive_type.capitalize()}"
+            or f"MCP_{primitive_type.capitalize()}_{int(time.time()) % 1000}"  # Generate unique name
         )
 
-        position = command.get("position", [0, 0, 0])
-        size = command.get("size", [50, 50, 50])
+        position_list = command.get("position", [0, 0, 0])
+        size_list = command.get("size", [50, 50, 50])  # Default size
 
-        # Create the appropriate primitive object
-        obj = None
-        if primitive_type == "cube":
-            obj = c4d.BaseObject(c4d.Ocube)
-            obj[c4d.PRIM_CUBE_LEN] = c4d.Vector(*size)
-
-        elif primitive_type == "sphere":
-            obj = c4d.BaseObject(c4d.Osphere)
-            obj[c4d.PRIM_SPHERE_RAD] = size[0] / 2
-
-        elif primitive_type == "cone":
-            obj = c4d.BaseObject(c4d.Ocone)
-            obj[c4d.PRIM_CONE_TRAD] = 0
-            obj[c4d.PRIM_CONE_BRAD] = size[0] / 2
-            obj[c4d.PRIM_CONE_HEIGHT] = size[1]
-
-        elif primitive_type == "cylinder":
-            obj = c4d.BaseObject(c4d.Ocylinder)
-            obj[c4d.PRIM_CYLINDER_RADIUS] = size[0] / 2
-            obj[c4d.PRIM_CYLINDER_HEIGHT] = size[1]
-
-        elif primitive_type == "plane":
-            obj = c4d.BaseObject(c4d.Oplane)
-            obj[c4d.PRIM_PLANE_WIDTH] = size[0]
-            obj[c4d.PRIM_PLANE_HEIGHT] = size[1]
-
-        elif primitive_type == "pyramid":
-            obj = c4d.BaseObject(c4d.Opyramid)
-
-            # Use PRIM_PYRAMID_LEN for C4D 2023+ compatibility
-            if hasattr(c4d, "PRIM_PYRAMID_LEN"):
-                obj[c4d.PRIM_PYRAMID_LEN] = c4d.Vector(*size)
-            else:
-                # Fallback for older versions (in case someone backports)
-                if hasattr(c4d, "PRIM_PYRAMID_WIDTH"):
-                    obj[c4d.PRIM_PYRAMID_WIDTH] = size[0]
-                if hasattr(c4d, "PRIM_PYRAMID_HEIGHT"):
-                    obj[c4d.PRIM_PYRAMID_HEIGHT] = size[1]
-                if hasattr(c4d, "PRIM_PYRAMID_DEPTH"):
-                    obj[c4d.PRIM_PYRAMID_DEPTH] = size[2]
-
-        elif primitive_type == "disk":
-            obj = c4d.BaseObject(c4d.Odisk)
-            obj[c4d.PRIM_DISK_LEN] = c4d.Vector(0, size[0] / 2, size[1])
-
-        elif primitive_type == "tube":
-            obj = c4d.BaseObject(c4d.Otube)
-            obj[c4d.PRIM_TUBE_RADIUS] = size[0] / 2  # Outer radius
-            obj[c4d.PRIM_TUBE_IRADIUS] = size[1] / 2  # Inner radius
-            obj[c4d.PRIM_TUBE_HEIGHT] = size[2]  # Height
-
-        elif primitive_type == "torus":
-            obj = c4d.BaseObject(c4d.Otorus)
-            obj[c4d.PRIM_TORUS_OUTERRAD] = size[0] / 2  # Ring radius
-            obj[c4d.PRIM_TORUS_INNERRAD] = size[1] / 2  # Pipe radius
-
-        elif primitive_type == "platonic":
-            obj = c4d.BaseObject(c4d.Oplatonic)
-            obj[c4d.PRIM_PLATONIC_TYPE] = (
-                c4d.PRIM_PLATONIC_TYPE_TETRA
-            )  # Choose type: TETRA, OCTA, HEXA, ICOSA
-            obj[c4d.PRIM_PLATONIC_RAD] = size[0] / 2  # Radius
-
+        # --- Safely parse position and size ---
+        position = [0.0, 0.0, 0.0]
+        if isinstance(position_list, list) and len(position_list) >= 3:
+            try:
+                position = [float(p) for p in position_list[:3]]
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid position data {position_list}")
         else:
-            # Default to cube if type not recognized
-            print(f"Unknown primitive_type: {primitive_type}, defaulting to cube.")
-            obj = c4d.BaseObject(c4d.Ocube)
-            obj[c4d.PRIM_CUBE_LEN] = c4d.Vector(*size)
+            self.log(f"Warning: Position data not a list of 3: {position_list}")
 
-        # Set position
-        if len(position) >= 3:
-            obj.SetAbsPos(c4d.Vector(position[0], position[1], position[2]))
+        size = [50.0, 50.0, 50.0]
+        if isinstance(size_list, list) and len(size_list) > 0:
+            try:
+                size_raw = [float(s) for s in size_list if s is not None]
+                if not size_raw:
+                    raise ValueError("Empty size list after filtering None")
+                sx = size_raw[0]
+                sy = size_raw[1] if len(size_raw) > 1 else sx
+                sz = size_raw[2] if len(size_raw) > 2 else sx
+                size = [sx, sy, sz]
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid size data {size_list}")
+        elif isinstance(size_list, (int, float)):  # Allow single size value
+            size = [float(size_list)] * 3
+        else:
+            self.log(f"Warning: Size data not a list or number: {size_list}")
 
-        # Set name
-        obj.SetName(name)
+        obj = None
+        try:  # Wrap object creation/setting in try-except
+            # Create the appropriate primitive object
+            if primitive_type == "cube":
+                obj = c4d.BaseObject(c4d.Ocube)
+                obj[c4d.PRIM_CUBE_LEN] = c4d.Vector(*size)
+            elif primitive_type == "sphere":
+                obj = c4d.BaseObject(c4d.Osphere)
+                obj[c4d.PRIM_SPHERE_RAD] = size[0] / 2.0  # Use float division
+            elif primitive_type == "cone":
+                obj = c4d.BaseObject(c4d.Ocone)
+                obj[c4d.PRIM_CONE_TRAD] = 0
+                obj[c4d.PRIM_CONE_BRAD] = size[0] / 2.0
+                obj[c4d.PRIM_CONE_HEIGHT] = size[1]
+            elif primitive_type == "cylinder":
+                obj = c4d.BaseObject(c4d.Ocylinder)
+                obj[c4d.PRIM_CYLINDER_RADIUS] = size[0] / 2.0
+                obj[c4d.PRIM_CYLINDER_HEIGHT] = size[1]
+            elif primitive_type == "plane":
+                obj = c4d.BaseObject(c4d.Oplane)
+                obj[c4d.PRIM_PLANE_WIDTH] = size[0]
+                obj[c4d.PRIM_PLANE_HEIGHT] = size[1]
+            elif primitive_type == "pyramid":
+                obj = c4d.BaseObject(c4d.Opyramid)
+                if hasattr(c4d, "PRIM_PYRAMID_LEN"):
+                    obj[c4d.PRIM_PYRAMID_LEN] = c4d.Vector(*size)
+                else:
+                    if hasattr(c4d, "PRIM_PYRAMID_WIDTH"):
+                        obj[c4d.PRIM_PYRAMID_WIDTH] = size[0]
+                    if hasattr(c4d, "PRIM_PYRAMID_HEIGHT"):
+                        obj[c4d.PRIM_PYRAMID_HEIGHT] = size[1]
+                    if hasattr(c4d, "PRIM_PYRAMID_DEPTH"):
+                        obj[c4d.PRIM_PYRAMID_DEPTH] = size[2]
+            elif primitive_type == "disk":
+                obj = c4d.BaseObject(c4d.Odisk)
+                # Use ORAD/IRAD for Disk
+                obj[c4d.PRIM_DISK_ORAD] = size[0] / 2.0
+                obj[c4d.PRIM_DISK_IRAD] = 0  # Default inner radius
+            elif primitive_type == "tube":
+                obj = c4d.BaseObject(c4d.Otube)
+                obj[c4d.PRIM_TUBE_RADIUS] = size[0] / 2.0
+                obj[c4d.PRIM_TUBE_IRADIUS] = size[1] / 2.0
+                obj[c4d.PRIM_TUBE_HEIGHT] = size[2]
+            elif primitive_type == "torus":
+                obj = c4d.BaseObject(c4d.Otorus)
+                # Use RINGRAD/PIPERAD for Torus
+                obj[c4d.PRIM_TORUS_RINGRAD] = size[0] / 2.0
+                obj[c4d.PRIM_TORUS_PIPERAD] = size[1] / 2.0
+            elif primitive_type == "platonic":
+                obj = c4d.BaseObject(c4d.Oplatonic)
+                obj[c4d.PRIM_PLATONIC_TYPE] = c4d.PRIM_PLATONIC_TYPE_TETRA
+                obj[c4d.PRIM_PLATONIC_RAD] = size[0] / 2.0
+            else:
+                self.log(
+                    f"Unknown primitive_type: {primitive_type}, defaulting to cube."
+                )
+                obj = c4d.BaseObject(c4d.Ocube)
+                obj[c4d.PRIM_CUBE_LEN] = c4d.Vector(*size)
 
-        # Add to doc
-        doc.InsertObject(obj)
-        doc.SetActiveObject(obj)
-        c4d.EventAdd()
+            if obj is None:  # Check if object creation failed
+                return {
+                    "error": f"Failed to create base object for type '{primitive_type}'"
+                }
 
-        # Return information about the created object
-        return {
-            "object": {
-                "name": obj.GetName(),
-                "id": str(obj.GetGUID()),
-                "position": [obj.GetAbsPos().x, obj.GetAbsPos().y, obj.GetAbsPos().z],
+            # Set common properties
+            obj.SetName(requested_name)
+            obj.SetAbsPos(c4d.Vector(*position))
+
+            # Add to doc and finalize
+            doc.InsertObject(obj)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, obj)  # Add Undo step
+            doc.SetActiveObject(obj)  # Make it active
+            c4d.EventAdd()
+
+            # --- MODIFIED FOR CONTEXT ---
+            actual_name = obj.GetName()
+            guid = str(obj.GetGUID())
+            pos_vec = obj.GetAbsPos()
+            obj_type_name = self.get_object_type_name(obj)
+
+            # Register the object
+            self.register_object_name(obj, requested_name)
+
+            # Return contextual information
+            return {
+                "object": {
+                    "requested_name": requested_name,
+                    "actual_name": actual_name,
+                    "guid": guid,
+                    "type": obj_type_name,
+                    "type_id": obj.GetType(),
+                    "position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                }
             }
-        }
+
+        except Exception as e:
+            # Catch errors during object creation or property setting
+            self.log(
+                f"[**ERROR**] Error adding primitive '{requested_name}': {str(e)}\n{traceback.format_exc()}"
+            )
+            # Clean up object if created but not inserted
+            if obj and not obj.GetDocument():
+                try:
+                    obj.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Failed to add primitive: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def register_object_name(self, obj, requested_name):
-        """Register an object with its requested name for more reliable lookup later."""
+        """Register object GUID, actual name, and requested name for context tracking."""
+        if not obj or not isinstance(obj, c4d.BaseObject):
+            self.log("[C4D REG] Invalid object provided for registration.")
+            return
+        # Ensure registries exist (redundant if __init__ is correct, but safe)
+        if not hasattr(self, "_name_to_guid_registry"):
+            self._name_to_guid_registry = {}
+        if not hasattr(self, "_guid_to_name_registry"):
+            self._guid_to_name_registry = {}
+        # Keep original for compatibility if needed
         if not hasattr(self, "_object_name_registry"):
             self._object_name_registry = {}
 
-        if not hasattr(self, "_name_to_guid_registry"):
-            self._name_to_guid_registry = {}
-
-        if not hasattr(self, "_guid_to_name_registry"):
-            self._guid_to_name_registry = {}
-
-        # Store both by GUID (most reliable) and by requested name
-        obj_id = str(obj.GetGUID())
-        actual_name = obj.GetName()
-
-        # Store a mapping from requested name to GUID
-        self._name_to_guid_registry[requested_name] = obj_id
-
-        # Store a mapping from GUID to both names
-        self._guid_to_name_registry[obj_id] = {
-            "requested_name": requested_name,
-            "actual_name": actual_name,
-        }
-
-        # Also store a mapping from actual name to GUID for fallback
-        if actual_name != requested_name:
-            self._name_to_guid_registry[actual_name] = obj_id
-
-        # Log the registration
-        self.log(
-            f"[C4D] Registered object: Requested name '{requested_name}', Actual name '{actual_name}', GUID: {obj_id}"
-        )
-
-        # Backward compatibility
-        self._object_name_registry[obj_id] = requested_name
-        self._object_name_registry[requested_name] = obj_id
-
-        # Attempt to store the original name in user data for extra robustness
         try:
-            # First check if we already have our tag
-            has_tag = False
-            userdata = obj.GetUserDataContainer()
-            if userdata:
-                for data_id in range(len(userdata)):
-                    if userdata[data_id][c4d.DESC_NAME] == "mcp_original_name":
-                        has_tag = True
-                        break
+            # Ensure the object is part of a document before getting GUID
+            if not obj.GetDocument():
+                self.log(
+                    f"[C4D REG] ## Warning ##: Object '{obj.GetName()}' not in document, cannot get reliable GUID."
+                )
+                return  # Skip registration if not in doc
 
-            # Only add if we don't already have it
-            if not has_tag:
-                # Create a user data element to store the original name
-                bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_STRING)
-                if bc:
-                    bc[c4d.DESC_NAME] = "mcp_original_name"
-                    bc[c4d.DESC_SHORT_NAME] = "MCP Name"
-                    element = obj.AddUserData(bc)
-                    if element:
-                        obj[element] = requested_name
-                        self.log(
-                            f"[C4D] Stored original name '{requested_name}' in object user data"
-                        )
-        except Exception as e:
+            obj_id = str(obj.GetGUID())
+            actual_name = obj.GetName()
+
+            if not obj_id or len(obj_id) < 10:  # Basic check for non-empty GUID
+                self.log(
+                    f"[C4D REG] ## Warning ##: Got potentially invalid GUID '{obj_id}' for object '{actual_name}'. Cannot register."
+                )
+                return
+
+            if not requested_name:
+                self.log(
+                    f"[C4D REG] ## Warning ## Empty requested name provided for '{actual_name}', using actual name."
+                )
+                requested_name = actual_name
+
+            # Prepare names for registry check (lower case)
+            req_name_lower = requested_name.lower()
+            act_name_lower = actual_name.lower()
+
+            # Clean up potentially stale entries for these names in _name_to_guid_registry
+            for name_lower in {req_name_lower, act_name_lower}:
+                old_guid = self._name_to_guid_registry.pop(name_lower, None)
+                if old_guid and old_guid != obj_id:
+                    self.log(
+                        f"[C4D REG] Cleaning old name->guid mapping: '{name_lower}' pointed to {old_guid}, now points to {obj_id}"
+                    )
+                    # Also remove the reverse mapping for the old GUID if it exists
+                    old_reg_entry = self._guid_to_name_registry.get(old_guid)
+                    if old_reg_entry:
+                        old_req_lower_check = old_reg_entry.get(
+                            "requested_name", ""
+                        ).lower()
+                        old_act_lower_check = old_reg_entry.get(
+                            "actual_name", ""
+                        ).lower()
+                        if (
+                            old_req_lower_check == name_lower
+                            or old_act_lower_check == name_lower
+                        ):
+                            self._guid_to_name_registry.pop(old_guid, None)
+                            self.log(
+                                f"[C4D REG] Removed stale guid->name entry for {old_guid}"
+                            )
+
+            # Clean up potentially stale entry for this GUID in _guid_to_name_registry
+            old_name_entry = self._guid_to_name_registry.pop(obj_id, None)
+            if old_name_entry:
+                # Remove old name mappings associated with this GUID from _name_to_guid_registry
+                self._name_to_guid_registry.pop(
+                    old_name_entry.get("requested_name", "").lower(), None
+                )
+                self._name_to_guid_registry.pop(
+                    old_name_entry.get("actual_name", "").lower(), None
+                )
+                self.log(
+                    f"[C4D REG] Cleaning old guid->name mapping for {obj_id} (was pointing to '{old_name_entry.get('actual_name')}')."
+                )
+
+            # Add the new mappings to the *new* registries
+            self._name_to_guid_registry[req_name_lower] = obj_id
+            if (
+                act_name_lower != req_name_lower
+            ):  # Avoid duplicate key if names are same
+                self._name_to_guid_registry[act_name_lower] = obj_id
+
+            self._guid_to_name_registry[obj_id] = {
+                "requested_name": requested_name,
+                "actual_name": actual_name,
+            }
+
+            # --- Keep Original Registry Logic (for backward compatibility) ---
+            # If old registry structure is needed for some reason
+            self._object_name_registry[obj_id] = requested_name
+            self._object_name_registry[requested_name] = obj_id
+
             self.log(
-                f"[C4D] ## Warning ##: Could not add user data for original name: {str(e)}"
+                f"[C4D REG] Registered: Req='{requested_name}', Act='{actual_name}', GUID={obj_id}"
+            )
+
+            # User Data
+            try:
+                has_tag = False
+                userdata = obj.GetUserDataContainer()
+                if userdata:
+                    for data_index in range(len(userdata)):
+                        desc_entry = userdata[data_index]
+                        # Check if it's a valid description element before accessing DESC_NAME
+                        if (
+                            isinstance(desc_entry, tuple)
+                            and len(desc_entry) > c4d.DESC_NAME
+                        ):  # Handle tuple structure
+                            if desc_entry[c4d.DESC_NAME] == "mcp_original_name":
+                                has_tag = True
+                                break
+                        elif hasattr(desc_entry, "__getitem__") and c4d.DESC_NAME < len(
+                            desc_entry
+                        ):  # Handle potential sequence access
+                            if desc_entry[c4d.DESC_NAME] == "mcp_original_name":
+                                has_tag = True
+                                break
+
+                if not has_tag:
+                    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_STRING)
+                    if bc:
+                        bc[c4d.DESC_NAME] = "mcp_original_name"
+                        bc[c4d.DESC_SHORT_NAME] = "MCP Name"
+                        element = obj.AddUserData(bc)
+                        if element:
+                            # Make sure element is a DescID before using it as an index
+                            if isinstance(element, c4d.DescID):
+                                obj[element] = requested_name
+                                self.log(
+                                    f"[C4D] Stored original name '{requested_name}' in object user data"
+                                )
+                            else:
+                                # Handle case where AddUserData returns index directly (older C4D)
+                                try:
+                                    descid_from_index = obj.GetUserDataContainer()[
+                                        element
+                                    ][c4d.DESC_ID]
+                                    obj[descid_from_index] = requested_name
+                                    self.log(
+                                        f"[C4D] Stored original name '{requested_name}' in object user data (via index)"
+                                    )
+                                except Exception as e_ud_index:
+                                    self.log(
+                                        f"[C4D] ## Warning ##: AddUserData returned unexpected value '{element}', cannot set user data: {e_ud_index}"
+                                    )
+
+            except Exception as e:
+                # Catch potential errors during GetUserDataContainer or AddUserData
+                self.log(
+                    f"[C4D] ## Warning ##: Could not add/check user data for original name: {str(e)}\n{traceback.format_exc()}"
+                )
+
+        except Exception as e:
+            # Catch potential errors during GetGUID, GetName etc.
+            failed_name = requested_name or (obj.GetName() if obj else "UnknownObject")
+            self.log(
+                f"[**ERROR**] Failed to register object '{failed_name}': {e}\n{traceback.format_exc()}"
             )
 
     def handle_render_preview_base64(self, frame=0, width=640, height=360):
         """SDK 2025-compliant base64 renderer with error resolution"""
-        import c4d
-        import base64
-        import traceback
 
         def _execute_render():
             try:
@@ -934,112 +1358,6 @@ class C4DSocketServer(threading.Thread):
 
         return self.execute_on_main_thread(_execute_render, _timeout=120)
 
-    def handle_render_frame(self, frame=0, width=640, height=360, output_path=None):
-        """SDK 2025-compliant file renderer with safe fallback path and no deprecated fields"""
-        import c4d
-        import os
-
-        def _render_to_file():
-            nonlocal output_path, frame
-
-        try:
-            frame = int(float(frame))
-        except Exception:
-            self.log("[WARN] Invalid frame input; defaulting to 0")
-            frame = 0
-
-            try:
-                doc = c4d.documents.GetActiveDocument()
-                if not doc:
-                    return {"error": "[SDK-ERR-101] No active document"}
-
-                # 0. Resolve output_path
-                if not output_path:
-                    doc_path = doc.GetDocumentPath()
-                    if not doc_path:
-                        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-                        output_path = os.path.join(
-                            desktop, f"render_frame_{frame:04d}.png"
-                        )
-                        self.log(f"[PATH] No doc path, using fallback: {output_path}")
-                    else:
-                        output_path = os.path.join(doc_path, f"frame_{frame:04d}.png")
-
-                output_dir = os.path.dirname(output_path)
-                os.makedirs(output_dir, exist_ok=True)
-
-                # 1. RenderData Protocol (SDK §9.1.3)
-                original_rd = doc.GetActiveRenderData()
-                if not original_rd:
-                    return {"error": "[SDK-ERR-307] No render settings configured"}
-
-                rd_clone = original_rd.GetClone(c4d.COPYFLAGS_NONE)
-                if not rd_clone:
-                    return {"error": "[SDK-ERR-308] Clone failed"}
-
-                try:
-                    doc.InsertRenderData(rd_clone)
-                    doc.SetActiveRenderData(rd_clone)
-                    self.log(
-                        f"[RENDER] Active RenderData: {doc.GetActiveRenderData().GetName()}"
-                    )
-
-                    settings = rd_clone.GetData()
-                    settings[c4d.RDATA_PATH] = output_dir
-                    settings[c4d.RDATA_XRES] = width
-                    settings[c4d.RDATA_YRES] = height
-                    settings[c4d.RDATA_FRAMESEQUENCE] = (
-                        c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
-                    )
-
-                    # 2. Memory Threshold
-                    if width * height > 4_000_000:
-                        threshold = int(width * height * 4 * 1.5)
-                        c4d.GeSetMemoryThreshold(threshold)
-                        self.log(f"[MEMORY] Threshold set to: {threshold} bytes")
-                    else:
-                        self.log("[MEMORY] No threshold override needed")
-
-                    # 3. Bitmap
-                    bmp = c4d.bitmaps.MultipassBitmap(width, height, c4d.COLORMODE_RGB)
-                    bmp.AddChannel(True, True)
-
-                    # 4. Render
-                    render_flags = (
-                        c4d.RENDERFLAGS_EXTERNAL
-                        | c4d.RENDERFLAGS_SHOWERRORS
-                        | 0x00040000
-                        | c4d.RENDERFLAGS_NODOCUMENTCLONE
-                    )
-
-                    result = c4d.documents.RenderDocument(
-                        doc, settings, bmp, render_flags
-                    )
-                    if result != c4d.RENDERRESULT_OK:
-                        return {
-                            "error": f"[SDK-ERR-{400+result}] {self._render_code_to_str(result)}"
-                        }
-
-                    # 5. Save
-                    if not bmp.Save(output_path, c4d.FILTER_PNG):
-                        return {"error": f"[SDK-ERR-501] Failed to save {output_path}"}
-
-                    self.log(f"[PATH] Final output: {output_path}")
-                    return {"success": True, "path": output_path}
-
-                finally:
-                    if rd_clone:
-                        doc.SetActiveRenderData(original_rd)
-                        rd_clone.Remove()
-                    if "bmp" in locals():
-                        bmp.FlushAll()
-                    c4d.EventAdd()
-
-            except Exception as e:
-                return {"error": f"[SDK-ERR-999] {str(e)}"}
-
-        return self.execute_on_main_thread(_render_to_file, _timeout=300)
-
     def _render_code_to_str(self, code):
         """Convert Cinema4D render result codes to human-readable strings"""
         codes = {
@@ -1057,709 +1375,722 @@ class C4DSocketServer(threading.Thread):
         return codes.get(code, f"Unknown error ({code})")
 
     def handle_modify_object(self, command):
-        """Handle modify_object command with full property support."""
+        """Handle modify_object command with full property support and GUID option."""
         doc = c4d.documents.GetActiveDocument()
-        # Support both 'object_name' and 'name'
-        object_name = command.get("object_name") or command.get("name") or ""
+        if not doc:
+            return {"error": "No active document"}
+
         properties = command.get("properties", {})
+        if not properties:
+            return {"error": "No properties provided to modify."}
 
-        # Find the object by name
-        obj = self.find_object_by_name(doc, object_name)
-        if obj is None:
-            return {"error": f"Object not found: {object_name}"}
-
-        # Apply modifications
-        modified = {}
-
-        # Position
-        pos = properties.get("position")
-        if isinstance(pos, list) and len(pos) >= 3:
-            obj.SetAbsPos(c4d.Vector(pos[0], pos[1], pos[2]))
-            modified["position"] = pos
-        print(f"Incoming position: {modified.get('position')}")
-
-        # Rotation (in degrees)
-        rot = properties.get("rotation")
-        if isinstance(rot, list) and len(rot) >= 3:
-            rot_rad = [c4d.utils.DegToRad(r) for r in rot]
-            obj.SetRelRot(c4d.Vector(*rot_rad))
-            modified["rotation"] = rot
-        print(f"Rotation: {modified.get('rotation')}")
-
-        # Scale
-        scale = properties.get("scale")
-        if isinstance(scale, list) and len(scale) >= 3:
-            obj.SetRelScale(c4d.Vector(scale[0], scale[1], scale[2]))
-            modified["scale"] = scale
-        print(f"Scale: {modified.get('scale')}")
-
-        # Color (if object has a base color channel)
-        color = properties.get("color")
-        if isinstance(color, list) and len(color) >= 3:
-            try:
-                obj[c4d.ID_BASEOBJECT_COLOR] = c4d.Vector(color[0], color[1], color[2])
-                modified["color"] = color
-            except Exception as e:
-                print(f"Error setting color: {str(e)}")
-        print(f"Color: {modified.get('color')}")
-
-        # Rename
-        new_name = properties.get("name")
-        if isinstance(new_name, str) and new_name.strip():
-            old_name = obj.GetName()
-            obj.SetName(new_name)
-            modified["name"] = {"from": old_name, "to": new_name}
-        print(f"Name change: {modified.get('name')}")
-
-        # Size primitives
-        size = properties.get("size")
-        if isinstance(size, list) and len(size) >= 3:
-            obj_type = obj.GetType()
-            try:
-                if obj_type == c4d.Ocube:
-                    obj[c4d.PRIM_CUBE_LEN] = c4d.Vector(*size)
-                    modified["size"] = size
-                elif obj_type == c4d.Osphere:
-                    obj[c4d.PRIM_SPHERE_RAD] = size[0] / 2
-                    modified["size"] = size
-                elif obj_type == c4d.Ocone:
-                    obj[c4d.PRIM_CONE_BRAD] = size[0] / 2
-                    obj[c4d.PRIM_CONE_HEIGHT] = size[1]
-                    modified["size"] = size
-                elif obj_type == c4d.Ocylinder:
-                    obj[c4d.PRIM_CYLINDER_RADIUS] = size[0] / 2
-                    obj[c4d.PRIM_CYLINDER_HEIGHT] = size[1]
-                    modified["size"] = size
-                elif obj_type == c4d.Oplane:
-                    obj[c4d.PRIM_PLANE_WIDTH] = size[0]
-                    obj[c4d.PRIM_PLANE_HEIGHT] = size[1]
-                    modified["size"] = size
-            except Exception as e:
-                print(f"Error modifying size: {str(e)}")
-        print(f"Size: {modified.get('size')}")
-
-        # Update the document
-        c4d.EventAdd()
-
-        return {
-            "object": {
-                "name": obj.GetName(),
-                "id": str(obj.GetGUID()),
-                "modified": modified,
+        # --- MODIFIED: Identify target object ---
+        identifier = None
+        use_guid = False
+        if command.get("guid"):
+            identifier = command.get("guid")
+            use_guid = True
+            self.log(f"[MODIFY] Using GUID identifier: '{identifier}'")
+        elif command.get("object_name"):
+            identifier = command.get("object_name")
+            use_guid = False
+            self.log(f"[MODIFY] Using Name identifier: '{identifier}'")
+        elif command.get(
+            "name"
+        ):  # Fallback check in case 'name' is used for identification
+            identifier = command.get("name")
+            use_guid = False
+            self.log(f"[MODIFY] Using 'name' key as Name identifier: '{identifier}'")
+        else:
+            return {
+                "error": "No object identifier ('guid', 'object_name', or 'name') provided."
             }
-        }
+
+        # Find the object using the determined identifier and flag
+        obj = self.find_object_by_name(doc, identifier, use_guid=use_guid)
+        if obj is None:
+            search_type = "GUID" if use_guid else "Name"
+            return {
+                "error": f"Object '{identifier}' (searched by {search_type}) not found."
+            }
+
+        # Apply modifications (using original logic)
+        modified = {}
+        name_before = obj.GetName()  # Store original name
+        something_changed = False
+
+        try:  # Wrap property modifications in try-except
+            # Position
+            pos = properties.get("position")
+            if isinstance(pos, list) and len(pos) >= 3:
+                try:
+                    new_pos = c4d.Vector(float(pos[0]), float(pos[1]), float(pos[2]))
+                    if obj.GetAbsPos() != new_pos:
+                        obj.SetAbsPos(new_pos)
+                        modified["position"] = [new_pos.x, new_pos.y, new_pos.z]
+                        something_changed = True
+                except (ValueError, TypeError) as e:
+                    self.log(f"Warning: Invalid position value '{pos}': {e}")
+
+            # Rotation (in degrees)
+            rot = properties.get("rotation")
+            if isinstance(rot, list) and len(rot) >= 3:
+                try:
+                    new_rot_deg = [float(r) for r in rot[:3]]
+                    new_rot_rad = c4d.Vector(
+                        *[c4d.utils.DegToRad(r) for r in new_rot_deg]
+                    )
+                    obj.SetAbsRot(new_rot_rad)  # Use Absolute rotation
+                    modified["rotation"] = new_rot_deg
+                    something_changed = True
+                except (ValueError, TypeError) as e:
+                    self.log(f"Warning: Invalid rotation value '{rot}': {e}")
+
+            # Scale
+            scale = properties.get("scale")
+            if isinstance(scale, list) and len(scale) >= 3:
+                try:
+                    new_scale = c4d.Vector(
+                        float(scale[0]), float(scale[1]), float(scale[2])
+                    )
+                    if obj.GetAbsScale() != new_scale:
+                        obj.SetAbsScale(new_scale)
+                        modified["scale"] = [new_scale.x, new_scale.y, new_scale.z]
+                        something_changed = True
+                except (ValueError, TypeError) as e:
+                    self.log(f"Warning: Invalid scale value '{scale}': {e}")
+
+            # Color (if object has a base color channel)
+            color = properties.get("color")
+            if isinstance(color, list) and len(color) >= 3:
+                try:
+                    new_color = c4d.Vector(
+                        max(0.0, min(1.0, float(color[0]))),
+                        max(0.0, min(1.0, float(color[1]))),
+                        max(0.0, min(1.0, float(color[2]))),
+                    )
+                    if (
+                        obj.IsCorrectType(c4d.Opoint)
+                        or obj.IsCorrectType(c4d.Opolygon)
+                        or obj.IsCorrectType(c4d.Ospline)
+                        or obj.IsCorrectType(c4d.Onull)
+                    ):
+                        if obj[c4d.ID_BASEOBJECT_COLOR] != new_color:
+                            obj[c4d.ID_BASEOBJECT_USECOLOR] = (
+                                c4d.ID_BASEOBJECT_USECOLOR_ON
+                            )
+                            obj[c4d.ID_BASEOBJECT_COLOR] = new_color
+                            modified["color"] = [new_color.x, new_color.y, new_color.z]
+                            something_changed = True
+                    else:
+                        self.log(
+                            f"Warning: Cannot set display color for object type {obj.GetType()} ('{name_before}')"
+                        )
+                except (ValueError, TypeError, AttributeError) as e:
+                    self.log(f"Warning: Error setting color for '{name_before}': {e}")
+
+            # Size primitives
+            size = properties.get("size")
+            if isinstance(size, list) and len(size) > 0:
+                obj_type = obj.GetType()
+                size_applied = False
+                new_size_applied = []
+                try:
+                    safe_size = [float(s) for s in size if s is not None]
+                    if not safe_size:
+                        raise ValueError("No valid numeric sizes")
+                    sx = safe_size[0]
+                    sy = safe_size[1] if len(safe_size) > 1 else sx
+                    sz = safe_size[2] if len(safe_size) > 2 else sx
+
+                    if obj_type == c4d.Ocube:
+                        new_val = c4d.Vector(sx, sy, sz)
+                        if obj[c4d.PRIM_CUBE_LEN] != new_val:
+                            obj[c4d.PRIM_CUBE_LEN] = new_val
+                            size_applied = True
+                            new_size_applied = [sx, sy, sz]
+                    elif obj_type == c4d.Osphere:
+                        new_val = sx / 2.0
+                        if obj[c4d.PRIM_SPHERE_RAD] != new_val:
+                            obj[c4d.PRIM_SPHERE_RAD] = new_val
+                            size_applied = True
+                            new_size_applied = [sx]
+                    elif obj_type == c4d.Ocone:
+                        new_brad, new_h = sx / 2.0, sy
+                        if (
+                            obj[c4d.PRIM_CONE_BRAD] != new_brad
+                            or obj[c4d.PRIM_CONE_HEIGHT] != new_h
+                        ):
+                            obj[c4d.PRIM_CONE_BRAD] = new_brad
+                            obj[c4d.PRIM_CONE_HEIGHT] = new_h
+                            size_applied = True
+                            new_size_applied = [sx, sy]
+                    elif obj_type == c4d.Ocylinder:
+                        new_r, new_h = sx / 2.0, sy
+                        if (
+                            obj[c4d.PRIM_CYLINDER_RADIUS] != new_r
+                            or obj[c4d.PRIM_CYLINDER_HEIGHT] != new_h
+                        ):
+                            obj[c4d.PRIM_CYLINDER_RADIUS] = new_r
+                            obj[c4d.PRIM_CYLINDER_HEIGHT] = new_h
+                            size_applied = True
+                            new_size_applied = [sx, sy]
+                    elif obj_type == c4d.Oplane:
+                        new_w, new_h = sx, sy
+                        if (
+                            obj[c4d.PRIM_PLANE_WIDTH] != new_w
+                            or obj[c4d.PRIM_PLANE_HEIGHT] != new_h
+                        ):
+                            obj[c4d.PRIM_PLANE_WIDTH] = new_w
+                            obj[c4d.PRIM_PLANE_HEIGHT] = new_h
+                            size_applied = True
+                            new_size_applied = [sx, sy]
+                    # Add other primitives here if needed...
+
+                    if size_applied:
+                        modified["size"] = new_size_applied
+                        something_changed = True
+                    elif size:
+                        self.log(
+                            f"Info: 'size' property not applicable to object type {self.get_object_type_name(obj)} ('{name_before}')"
+                        )
+                except (TypeError, ValueError, IndexError, AttributeError) as e:
+                    self.log(
+                        f"Warning: Error modifying size for {name_before} (Type: {obj_type}): {e}"
+                    )
+
+            # Rename - process *after* other properties in case identifier was 'name'
+            requested_new_name = properties.get("name")
+            if isinstance(requested_new_name, str):
+                new_name_stripped = requested_new_name.strip()
+                if new_name_stripped and new_name_stripped != name_before:
+                    self.log(
+                        f"[MODIFY] Renaming '{name_before}' to '{new_name_stripped}'"
+                    )
+                    obj.SetName(new_name_stripped)
+                    name_after_rename = (
+                        obj.GetName()
+                    )  # Get actual name after C4D potentially changed it
+                    modified["name"] = {
+                        "from": name_before,
+                        "requested": new_name_stripped,
+                        "to": name_after_rename,
+                    }
+                    something_changed = True
+                    # Re-register with the *requested* new name for future lookups
+                    self.register_object_name(obj, new_name_stripped)
+
+            # --- Finalize ---
+            if something_changed:
+                doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)  # Add undo step for changes
+                c4d.EventAdd()
+            else:
+                self.log(f"No modifications applied to '{name_before}'")
+
+            # --- MODIFIED: Return Context ---
+            final_name = obj.GetName()
+            guid = str(obj.GetGUID())
+            pos_vec = obj.GetAbsPos()
+            rot_vec_rad = obj.GetAbsRot()
+            scale_vec = obj.GetAbsScale()
+
+            # Ensure registration is up-to-date if C4D renamed unexpectedly without request
+            if "name" not in modified and final_name != name_before:
+                self.log(
+                    f"Warning: Object name changed unexpectedly from '{name_before}' to '{final_name}'. Updating registry."
+                )
+                self.register_object_name(
+                    obj, name_before
+                )  # Re-register with original intent
+
+            return {
+                "object": {
+                    "requested_identifier": identifier,  # What was used to find the object
+                    "was_guid": use_guid,  # Was the identifier treated as a GUID?
+                    "actual_name": final_name,  # Current name after modifications
+                    "guid": guid,
+                    "name_before": name_before,  # Name before this operation started
+                    "modified_properties": modified,  # Dictionary of changes applied by this command
+                    # Include current state for confirmation
+                    "current_position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                    "current_rotation": [
+                        c4d.utils.RadToDeg(r)
+                        for r in [rot_vec_rad.x, rot_vec_rad.y, rot_vec_rad.z]
+                    ],
+                    "current_scale": [scale_vec.x, scale_vec.y, scale_vec.z],
+                }
+            }
+
+        except Exception as e:
+            # Catch unexpected errors during property access/setting
+            error_msg = f"Unexpected error modifying object '{name_before}': {str(e)}"
+            self.log(f"[**ERROR**] {error_msg}\n{traceback.format_exc()}")
+            return {"error": error_msg, "traceback": traceback.format_exc()}
 
     def handle_apply_material(self, command):
-        """Handle apply_material command."""
+        """Handle apply_material command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
+
         material_name = command.get("material_name", "")
-        object_name = command.get("object_name", "")
-        material_type = command.get("material_type", "standard")  # standard, redshift
-        projection_type = command.get(
-            "projection_type", "cubic"
-        )  # cubic, spherical, flat, etc.
-        auto_uv = command.get("auto_uv", False)  # generate UVs automatically
-        procedural = command.get("procedural", False)  # use procedural shaders
+        identifier = None
+        use_guid = False
 
-        # Find the object
-        obj = self.find_object_by_name(doc, object_name)
+        # --- GUID Detection Improved ---
+        if command.get("guid"):
+            identifier = command.get("guid")
+            use_guid = True
+            self.log(f"[APPLY MAT] Using GUID identifier: '{identifier}'")
+        elif command.get("object_name"):
+            identifier = command.get("object_name")
+            if "-" in str(identifier) and len(str(identifier)) > 30:
+                self.log(
+                    f"[APPLY MAT] Identifier '{identifier}' looks like GUID, treating as GUID."
+                )
+                use_guid = True
+            else:
+                use_guid = False
+                self.log(f"[APPLY MAT] Using Name identifier: '{identifier}'")
+        else:
+            return {"error": "No object identifier ('guid' or 'object_name') provided."}
+
+        # Find object
+        obj = self.find_object_by_name(doc, identifier, use_guid=use_guid)
         if obj is None:
-            return {"error": f"Object not found: {object_name}"}
+            search_type = "GUID" if use_guid else "Name"
+            return {
+                "error": f"Object '{identifier}' (searched by {search_type}) not found."
+            }
 
-        # Find the material
+        # Find material
         mat = self._find_material_by_name(doc, material_name)
         if mat is None:
             return {"error": f"Material not found: {material_name}"}
 
+        material_type = command.get("material_type", "standard").lower()
+        projection_type = command.get("projection_type", "cubic").lower()
+        auto_uv = command.get("auto_uv", False)
+        procedural = command.get("procedural", False)
+
         try:
-            # Create a texture tag
+            doc.StartUndo()
+
+            # Create and configure texture tag
             tag = c4d.TextureTag()
+            if not tag:
+                raise RuntimeError("Failed to create TextureTag")
             tag.SetMaterial(mat)
 
-            # Set projection type
-            if projection_type == "cubic":
-                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_CUBIC
-            elif projection_type == "spherical":
-                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_SPHERICAL
-            elif projection_type == "flat":
-                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_FLAT
-            elif projection_type == "cylindrical":
-                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_CYLINDRICAL
-            elif projection_type == "frontal":
-                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_FRONTAL
-            elif projection_type == "uvw":
-                tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_UVW
+            proj_map = {
+                "cubic": c4d.TEXTURETAG_PROJECTION_CUBIC,
+                "spherical": c4d.TEXTURETAG_PROJECTION_SPHERICAL,
+                "flat": c4d.TEXTURETAG_PROJECTION_FLAT,
+                "cylindrical": c4d.TEXTURETAG_PROJECTION_CYLINDRICAL,
+                "frontal": c4d.TEXTURETAG_PROJECTION_FRONTAL,
+                "uvw": c4d.TEXTURETAG_PROJECTION_UVW,
+            }
+            tag[c4d.TEXTURETAG_PROJECTION] = proj_map.get(
+                projection_type, c4d.TEXTURETAG_PROJECTION_UVW
+            )
 
-            # Add the tag to the object
             obj.InsertTag(tag)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
 
-            # Generate UVs automatically if needed
+            # Auto UV generation
             if auto_uv:
+                self.log(
+                    f"[APPLY MAT] Attempting auto UV generation for '{obj.GetName()}'"
+                )
                 try:
-                    # Create UVW tag if none exists
-                    uvw_tag = obj.GetTag(c4d.Tuvw)
-                    if not uvw_tag:
-                        uvw_tag = c4d.UVWTag(obj.GetPolygonCount())
-                        obj.InsertTag(uvw_tag)
+                    if obj.IsInstanceOf(c4d.Opolygon):
+                        uvw_tag = obj.GetTag(c4d.Tuvw)
+                        if not uvw_tag:
+                            uvw_tag = obj.MakeTag(c4d.Tuvw)
+                            if uvw_tag:
+                                doc.AddUndo(c4d.UNDOTYPE_NEW, uvw_tag)
+                            else:
+                                self.log("Warning: Failed to create UVW tag.")
 
-                    # Create a temporary UVW mapping object
-                    uvw_obj = c4d.BaseObject(c4d.Ouvw)
-                    doc.InsertObject(uvw_obj)
+                        if uvw_tag:
+                            c4d.plugins.CallCommand(12205)  # Optimal Cubic Mapping
+                            self.log("Executed Optimal (Cubic) UV mapping command.")
+                        else:
+                            self.log(
+                                "Warning: Could not get or create UVW tag for auto UV."
+                            )
+                    else:
+                        self.log(
+                            f"Warning: Auto UV skipped, object '{obj.GetName()}' not a polygon."
+                        )
+                except Exception as e_uv:
+                    self.log(
+                        f"[**ERROR**] Error during auto UV generation: {str(e_uv)}"
+                    )
 
-                    # Set source object
-                    uvw_obj[c4d.UVWMAPPING_MAPPING] = c4d.UVWMAPPING_MAPPING_CUBIC
-                    uvw_obj[c4d.UVWMAPPING_PROJECTION] = c4d.UVWMAPPING_PROJECTION_CUBIC
-                    uvw_obj[c4d.UVWMAPPING_TISOCPIC] = True
-                    uvw_obj[c4d.UVWMAPPING_FITSIZE] = True
-
-                    # Set the selection object
-                    selection = c4d.InExcludeData()
-                    selection.InsertObject(obj, 1)
-                    uvw_obj[c4d.UVWMAPPING_SELECTION] = selection
-
-                    # Generate UVs
-                    c4d.CallButton(uvw_obj, c4d.UVWMAPPING_GENERATE)
-
-                    # Remove temp object
-                    doc.RemoveObject(uvw_obj)
-                except Exception as e:
-                    print(f"[**ERROR**] Error creating UVs: {str(e)}")
-
-            # Handle Redshift material setup if needed
+            # Handle Redshift
             if (
                 material_type == "redshift"
                 and hasattr(c4d, "modules")
                 and hasattr(c4d.modules, "redshift")
             ):
+                self.log(
+                    f"[APPLY MAT] Checking Redshift setup for material '{mat.GetName()}'"
+                )
                 try:
                     redshift = c4d.modules.redshift
+                    rs_id = getattr(c4d, "ID_REDSHIFT_MATERIAL", 1036224)
 
-                    # Try to convert material to Redshift if it's not already
-                    if mat.GetType() != c4d.ID_REDSHIFT_MATERIAL:
-                        # Create new Redshift material
-                        rs_mat = c4d.BaseMaterial(c4d.ID_REDSHIFT_MATERIAL)
+                    if mat.GetType() != rs_id:
+                        self.log(
+                            f"Converting material '{mat.GetName()}' to Redshift (ID: {rs_id})"
+                        )
+                        rs_mat = c4d.BaseMaterial(rs_id)
+                        if not rs_mat:
+                            raise RuntimeError("Failed to create Redshift material")
+
                         rs_mat.SetName(f"RS_{mat.GetName()}")
+                        doc.InsertMaterial(rs_mat)
+                        doc.AddUndo(c4d.UNDOTYPE_NEW, rs_mat)
 
-                        # Copy basic material properties like color
-                        color = mat[c4d.MATERIAL_COLOR_COLOR]
+                        try:
+                            if hasattr(c4d, "REDSHIFT_MATERIAL_DIFFUSE_COLOR"):
+                                rs_mat[c4d.REDSHIFT_MATERIAL_DIFFUSE_COLOR] = mat[
+                                    c4d.MATERIAL_COLOR_COLOR
+                                ]
+                        except Exception as e_color_copy:
+                            self.log(
+                                f"Warning: Could not copy color during RS conversion: {e_color_copy}"
+                            )
 
-                        # Use CreateDefaultGraph for reliable material setup
                         try:
                             import maxon
 
-                            rs_nodespace_id = maxon.Id(
+                            ns_id = maxon.Id(
                                 "com.redshift3d.redshift4c4d.class.nodespace"
                             )
-                            rs_mat.CreateDefaultGraph(rs_nodespace_id)
-                        except Exception as e:
-                            print(f"[**ERROR**] Error creating default graph: {str(e)}")
-
-                        # Access the Redshift material graph
-                        node_space = redshift.GetRSMaterialNodeSpace(rs_mat)
-                        root = redshift.GetRSMaterialRootShader(rs_mat)
-
-                        if root is None:
-                            raise Exception("Failed to get Redshift root shader")
+                            node_rs_mat = c4d.NodeMaterial(rs_mat)
+                            if node_rs_mat and not node_rs_mat.HasSpace(ns_id):
+                                node_rs_mat.CreateDefaultGraph(ns_id)
+                                self.log("Created default Redshift node graph.")
+                        except Exception as e_graph:
+                            self.log(
+                                f"Warning: Failed to create Redshift graph: {e_graph}"
+                            )
 
                         if procedural:
-                            # Create procedural texture nodes
-                            noise_shader = redshift.RSMaterialNodeCreator.CreateNode(
-                                node_space,
-                                redshift.RSMaterialNodeType.TEXTURE,
-                                "RS::TextureNode",
-                            )
-                            noise_shader[redshift.TEXTURE_TYPE] = redshift.TEXTURE_NOISE
+                            try:
+                                node_space = redshift.GetRSMaterialNodeSpace(rs_mat)
+                                root = redshift.GetRSMaterialRootShader(rs_mat)
+                                if node_space and root:
+                                    tex_node = (
+                                        redshift.RSMaterialNodeCreator.CreateNode(
+                                            node_space,
+                                            redshift.RSMaterialNodeType.TEXTURE,
+                                            "RS::TextureNode",
+                                        )
+                                    )
+                                    if tex_node:
+                                        tex_node[redshift.TEXTURE_TYPE] = (
+                                            redshift.TEXTURE_NOISE
+                                        )
+                                        redshift.CreateConnectionBetweenNodes(
+                                            node_space,
+                                            tex_node,
+                                            "outcolor",
+                                            root,
+                                            "diffuse_color",
+                                        )
+                                        self.log(
+                                            "Connected procedural Noise node to diffuse color."
+                                        )
+                                    else:
+                                        self.log(
+                                            "Warning: Failed to create procedural texture node."
+                                        )
+                            except Exception as e_proc:
+                                self.log(
+                                    f"Warning: Error setting up procedural RS nodes: {e_proc}"
+                                )
 
-                            # Connect procedural texture to output
-                            redshift.CreateConnectionBetweenNodes(
-                                node_space,
-                                noise_shader,
-                                "outcolor",
-                                root,
-                                "diffuse_color",
-                            )
-                        else:
-                            # Set color directly
-                            root[redshift.OUTPUT_COLOR] = color
-
-                        # Insert new material
-                        doc.InsertMaterial(rs_mat)
-
-                        # Update the tag to use the new material
                         tag.SetMaterial(rs_mat)
-                except Exception as e:
-                    print(f"[**ERROR**] Error setting up Redshift material: {str(e)}")
+                        mat = rs_mat
+                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
+                        self.log(
+                            f"Swapped tag to use new Redshift material '{rs_mat.GetName()}'"
+                        )
 
-            # Update the document
+                except Exception as e_rs_setup:
+                    self.log(
+                        f"[**ERROR**] Error during Redshift setup: {str(e_rs_setup)}"
+                    )
+
+            doc.EndUndo()
             c4d.EventAdd()
 
             return {
                 "success": True,
-                "message": f"Applied material '{material_name}' to object '{object_name}'",
-                "material_type": material_type,
-                "auto_uv": auto_uv,
-            }
-        except Exception as e:
-            return {"error": f"Failed to apply material: {str(e)}"}
-
-    def handle_render_to_file(self, doc, frame, width, height, output_path=None):
-        """Render a frame to file, with optional base64 and fallback output path."""
-        import os
-        import tempfile
-        import time
-        import base64
-        import c4d.storage
-        import traceback
-
-        try:
-            start_time = time.time()
-
-            # Clone active render settings
-            render_data = doc.GetActiveRenderData()
-            if not render_data:
-                return {"error": "No active RenderData found"}
-
-            rd_clone = render_data.GetClone()
-            if not rd_clone:
-                return {"error": "Failed to clone render settings"}
-
-            # Update render settings
-            settings = rd_clone.GetData()
-            settings[c4d.RDATA_XRES] = float(width)
-            settings[c4d.RDATA_YRES] = float(height)
-            settings[c4d.RDATA_PATH] = output_path or os.path.join(
-                tempfile.gettempdir(), "temp_render_output.png"
-            )
-
-            settings[c4d.RDATA_RENDERENGINE] = c4d.RDATA_RENDERENGINE_STANDARD
-            settings[c4d.RDATA_FRAMESEQUENCE] = c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
-            settings[c4d.RDATA_SAVEIMAGE] = False
-
-            # render_data.SetData(settings)
-            # Create temp RenderData container
-            # Insert actual RenderData object into the scene with settings
-            temp_rd = c4d.documents.RenderData()
-            temp_rd.SetData(settings)
-            doc.InsertRenderData(temp_rd)
-
-            # Update document time/frame
-            if isinstance(frame, dict):
-                frame = frame.get("frame", 0)
-            doc.SetTime(c4d.BaseTime(frame, doc.GetFps()))
-
-            doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
-
-            # Create target bitmap
-            bmp = c4d.bitmaps.BaseBitmap()
-            if not bmp.Init(int(width), int(height)):
-                return {"error": "Failed to initialize bitmap"}
-
-            self.log(f"[RENDER] Rendering frame {frame} at {width}x{height}...")
-            self.log(f"[RENDER DEBUG] Using RenderData name: {temp_rd.GetName()}")
-
-            self.log(
-                f"[RENDER DEBUG] Width: {settings[c4d.RDATA_XRES]}, Height: {settings[c4d.RDATA_YRES]}"
-            )
-
-            # Render to bitmap
-            result = c4d.documents.RenderDocument(
-                doc,
-                temp_rd.GetData(),
-                bmp,
-                c4d.RENDERFLAGS_EXTERNAL | c4d.RENDERFLAGS_NODOCUMENTCLONE,
-                None,
-            )
-
-            if not result:
-                self.log("[RENDER] RenderDocument returned False")
-                return {"error": "RenderDocument failed"}
-
-            # Fallback path if needed
-            if not output_path:
-                doc_name = doc.GetDocumentName() or "untitled"
-                if doc_name.lower().endswith(".c4d"):
-                    doc_name = doc_name[:-4]
-                base_dir = doc.GetDocumentPath() or tempfile.gettempdir()
-                output_path = os.path.join(base_dir, f"{doc_name}_snapshot_{frame}.png")
-
-            # Choose format based on extension
-            ext = os.path.splitext(output_path)[1].lower()
-            format_map = {
-                ".png": c4d.FILTER_PNG,
-                ".jpg": c4d.FILTER_JPG,
-                ".jpeg": c4d.FILTER_JPG,
-                ".tif": c4d.FILTER_TIF,
-                ".tiff": c4d.FILTER_TIF,
-            }
-            format_id = format_map.get(ext, c4d.FILTER_PNG)
-
-            # Save image to file
-            if not bmp.Save(output_path, format_id):
-                self.log(f"[RENDER] Failed to save bitmap to file: {output_path}")
-                return {"error": f"Failed to save image to: {output_path}"}
-
-            # Optionally encode to base64 if PNG
-            image_base64 = None
-            if format_id == c4d.FILTER_PNG:
-                mem_file = c4d.storage.MemoryFileWrite()
-                if mem_file.Open(1024 * 1024):
-                    if bmp.Save(mem_file, c4d.FILTER_PNG):
-                        raw_bytes = mem_file.GetValue()
-                        image_base64 = base64.b64encode(raw_bytes).decode("utf-8")
-                        self.log("[RENDER] Base64 preview generated")
-                    mem_file.Close()
-
-            elapsed = round(time.time() - start_time, 3)
-
-            return {
-                "success": True,
-                "frame": frame,
-                "resolution": f"{width}x{height}",
-                "output_path": output_path,
-                "file_exists": os.path.exists(output_path),
-                "image_base64": image_base64,
-                "render_time": elapsed,
+                "message": f"Applied material '{mat.GetName()}' to object '{obj.GetName()}'.",
+                "object_name": obj.GetName(),
+                "object_guid": str(obj.GetGUID()),
+                "material_name": mat.GetName(),
+                "material_type_id": mat.GetType(),
+                "projection": projection_type,
+                "auto_uv_attempted": auto_uv,
             }
 
         except Exception as e:
-            self.log("[RENDER ] Exception during render_to_file")
-            self.log(traceback.format_exc())
-            return {"error": f"Exception during render: {str(e)}"}
+            doc.EndUndo()
+            err = f"Error applying material '{material_name}' to '{obj.GetName()}': {str(e)}"
+            self.log(f"[**ERROR**] {err}\n{traceback.format_exc()}")
+            return {"error": err, "traceback": traceback.format_exc()}
 
     def handle_snapshot_scene(self, command=None):
         """
-        Generates a snapshot of the current scene:
-        - Lists objects in the document
-        - Renders a preview image (returns file path + base64)
+        Generates a snapshot: object list + base64 preview render.
+        Uses the corrected core render logic via handle_render_preview_base64.
         """
-        import time
-
         doc = c4d.documents.GetActiveDocument()
-        frame = 0  # You can extend to accept from command if needed
+        if not doc:
+            return {"error": "No active document for snapshot."}
 
-        self.log(
-            "[C4D SNAPSHOT] Running snapshot_scene: listing objects and rendering preview"
-        )
+        frame = doc.GetTime().GetFrame(doc.GetFps())
+        width, height = 640, 360
 
-        # --- 1. Get object list ---
-        object_data = self.handle_list_objects()
+        self.log(f"[C4D SNAPSHOT] Generating snapshot for frame {frame}...")
+
+        # List objects
+        object_data = self.handle_list_objects()  # Runs via execute_on_main_thread
         objects = object_data.get("objects", [])
 
-        # --- 2. Render preview image ---
-        render_result = self.execute_on_main_thread(
-            self.handle_render_to_file,
-            args=(doc, frame, 640, 360, None),
-            _timeout=60,
-        )
+        # Render preview - uses handle_render_preview_base64 which now uses corrected core logic
+        render_command = {"width": width, "height": height, "frame": frame}
+        render_result = self.handle_render_preview_base64(
+            **render_command
+        )  # Runs via execute_on_main_thread
 
-        if not render_result or "error" in render_result:
-            self.log(
-                f"[C4D SNAPSHOT] Snapshot render failed: {render_result.get('error')}"
-            )
-            return {
-                "objects": objects,
-                "render": {
-                    "error": render_result.get("error", "Unknown rendering error")
-                },
+        render_info = {}
+        if render_result and render_result.get("success"):
+            render_info = {
+                "frame": render_result.get("frame", frame),
+                "resolution": f"{render_result.get('width', width)}x{render_result.get('height', height)}",
+                "image_base64": render_result.get("image_base64"),
+                "render_time": render_result.get("render_time", 0.0),
+                "format": render_result.get("format", "png"),
+                "success": True,
             }
+            self.log(f"[C4D SNAPSHOT] Render successful.")
+        else:
+            error_msg = render_result.get("error", "Unknown rendering error")
+            render_info = {"error": error_msg, "success": False}
+            self.log(f"[C4D SNAPSHOT] Render failed: {error_msg}")
+            # Include traceback from render result if available
+            if isinstance(render_result, dict) and "traceback" in render_result:
+                render_info["traceback"] = render_result["traceback"]
 
-        # --- 3. Return combined context ---
-
+        # Return combined result
         return {
             "objects": objects,
-            "render": {
-                "frame": render_result.get("frame"),
-                "resolution": render_result.get("resolution"),
-                "output_path": render_result.get("output_path"),
-                "file_exists": render_result.get("file_exists", False),
-                "image_base64": render_result.get("image_base64"),
-                "render_time": render_result.get("render_time"),
-            },
+            "render": render_info,
         }
 
     def handle_set_keyframe(self, command):
-        """Handle set_keyframe command with enhanced property support."""
+        """Set a keyframe on an object, supporting both GUID and name lookup."""
         doc = c4d.documents.GetActiveDocument()
-        object_name = command.get("object_name", "")
-        frame = command.get("frame", doc.GetTime().GetFrame(doc.GetFps()))
-        property_type = command.get("property_type", "position")
-        value = command.get("value", [0, 0, 0])
+        if not doc:
+            return {"error": "No active document"}
 
-        # Find the object
-        obj = self.find_object_by_name(doc, object_name)
+        # --- Identifier Detection ---
+        identifier = None
+        use_guid = False
+        if command.get("guid"):
+            identifier = command.get("guid")
+            use_guid = True
+            self.log(f"[KEYFRAME] Using GUID identifier: '{identifier}'")
+        elif command.get("object_name"):
+            identifier = command.get("object_name")
+            if "-" in str(identifier) and len(str(identifier)) > 30:
+                use_guid = True
+                self.log(
+                    f"[KEYFRAME] Identifier '{identifier}' looks like GUID, treating as GUID."
+                )
+            else:
+                use_guid = False
+                self.log(f"[KEYFRAME] Using Name identifier: '{identifier}'")
+        else:
+            identifier = command.get("name")
+            if identifier:
+                use_guid = False
+                self.log(
+                    f"[KEYFRAME] Using 'name' key as Name identifier: '{identifier}'"
+                )
+            else:
+                return {
+                    "error": "No object identifier ('guid', 'object_name', or 'name') provided."
+                }
+
+        # Find object
+        obj = self.find_object_by_name(doc, identifier, use_guid=use_guid)
         if obj is None:
-            return {"error": f"Object not found: {object_name}"}
+            search_type = "GUID" if use_guid else "Name"
+            return {
+                "error": f"Object '{identifier}' (searched by {search_type}) not found for keyframing."
+            }
+
+        # --- Property, Frame, and Value ---
+        property_type = (
+            command.get("property_type") or command.get("property") or "position"
+        ).lower()
+        frame = command.get("frame", doc.GetTime().GetFrame(doc.GetFps()))
+        value = command.get("value")
+        if value is None:
+            return {"error": "No 'value' provided for keyframe."}
 
         try:
-            # Check if it's a component property (e.g., "position.x")
+            frame = int(frame)
+        except (ValueError, TypeError):
+            return {"error": f"Invalid frame: {frame}"}
+
+        try:
+            # --- Handle Different Property Types ---
             if "." in property_type:
-                # Parse the property and component
+                # Vector component property (e.g., position.x)
                 parts = property_type.split(".")
                 if len(parts) != 2:
                     return {
-                        "error": f"Invalid property format: {property_type}. Use format 'property.component' (e.g., 'position.x')"
+                        "error": f"Invalid property format: '{property_type}'. Use 'position.x' etc."
                     }
 
-                # Log the component parts for debugging
-                self.log(
-                    f"[C4D KEYFRAME] Parsing component property: {property_type} into parts: {parts}"
-                )
-
-                base_property = parts[0].lower()
-                component = parts[1].lower()
-
-                # Map to property IDs and component IDs
+                base_property, component = parts
                 property_map = {
                     "position": c4d.ID_BASEOBJECT_POSITION,
                     "rotation": c4d.ID_BASEOBJECT_ROTATION,
                     "scale": c4d.ID_BASEOBJECT_SCALE,
                     "color": c4d.LIGHT_COLOR if obj.GetType() == c4d.Olight else None,
                 }
-
                 component_map = {
                     "x": c4d.VECTOR_X,
                     "y": c4d.VECTOR_Y,
                     "z": c4d.VECTOR_Z,
+                    "r": c4d.VECTOR_X,
+                    "g": c4d.VECTOR_Y,
+                    "b": c4d.VECTOR_Z,
                 }
 
-                if base_property not in property_map:
+                if (
+                    base_property not in property_map
+                    or property_map[base_property] is None
+                ):
                     return {
-                        "error": f"Unsupported vector property: {base_property}. Supported properties: position, rotation, scale, color (for lights)"
+                        "error": f"Unsupported/invalid base property '{base_property}' for object type."
                     }
-
-                if property_map[base_property] is None:
-                    return {
-                        "error": f"Property {base_property} is not applicable to this object type"
-                    }
-
                 if component not in component_map:
                     return {
-                        "error": f"Unsupported component: {component}. Supported components: x, y, z"
+                        "error": f"Unsupported component '{component}'. Use x, y, z, r, g, or b."
                     }
 
-                # Ensure value is a scalar
                 if isinstance(value, list):
-                    if len(value) > 0:
-                        value = value[0]  # Use the first value if a list is provided
-                    else:
-                        return {"error": f"Empty value provided for {property_type}"}
+                    value = value[0] if value else 0.0
 
-                # Set the component keyframe
                 result = self._set_vector_component_keyframe(
                     obj,
                     frame,
                     property_map[base_property],
                     component_map[component],
-                    float(value),  # Convert to float to ensure compatibility
+                    float(value),
                     base_property,
                     component,
                 )
-
                 if not result:
                     return {"error": f"Failed to set {property_type} keyframe"}
 
-            # Handle standard vector properties
             elif property_type in ["position", "rotation", "scale"]:
-                # Map to property IDs
+                # Full vector properties
                 property_ids = {
                     "position": c4d.ID_BASEOBJECT_POSITION,
                     "rotation": c4d.ID_BASEOBJECT_ROTATION,
                     "scale": c4d.ID_BASEOBJECT_SCALE,
                 }
 
-                # Check for valid vector value and make adaptations as needed
                 if isinstance(value, (int, float)):
-                    self.log(
-                        f"[C4D KEYFRAME] Converting single value {value} to a vector with all components equal"
-                    )
-                    # Use the single value for all components
-                    value = [value, value, value]
+                    value = [float(value)] * 3
                 elif isinstance(value, list):
-                    # Pad short lists with zeros or last element
                     if len(value) == 1:
-                        self.log(
-                            f"[C4D KEYFRAME] Padding single-value list to [x, x, x]"
-                        )
-                        value = [value[0], value[0], value[0]]
+                        value = [float(value[0])] * 3
                     elif len(value) == 2:
-                        self.log(
-                            f"[C4D KEYFRAME] Padding two-value list with 0 for z-component"
-                        )
-                        value = [value[0], value[1], 0]
-                    # Truncate long lists
+                        value = [float(value[0]), float(value[1]), 0.0]
                     elif len(value) > 3:
-                        self.log(
-                            f"[C4D KEYFRAME] Truncating list with {len(value)} values to first 3 components"
-                        )
-                        value = value[:3]
+                        value = [float(v) for v in value[:3]]
+                    else:
+                        value = [float(v) for v in value]
                 else:
-                    # Convert to string and try to parse as list
-                    try:
-                        str_value = str(value).strip()
-                        if str_value.startswith("[") and str_value.endswith("]"):
-                            # Parse as JSON list
-                            import json
-
-                            parsed_value = json.loads(str_value)
-                            if isinstance(parsed_value, list):
-                                value = parsed_value
-                                self.log(
-                                    f"[C4D KEYFRAME] Parsed string value into list: {value}"
-                                )
-                            else:
-                                return {
-                                    "error": f"{property_type.capitalize()} must be a list of [x, y, z] values, got: {value}"
-                                }
-                        else:
-                            # Try as single value
-                            try:
-                                single_value = float(value)
-                                value = [single_value, single_value, single_value]
-                                self.log(
-                                    f"[C4D KEYFRAME] Converted string to vector: {value}"
-                                )
-                            except ValueError:
-                                return {
-                                    "error": f"{property_type.capitalize()} must be a list of [x, y, z] values, got: {value}"
-                                }
-                    except:
-                        return {
-                            "error": f"{property_type.capitalize()} must be a list of [x, y, z] values, got: {value}"
-                        }
-
-                # Final check that we have a valid list of 3 elements
-                if not isinstance(value, list) or len(value) != 3:
                     return {
-                        "error": f"{property_type.capitalize()} must be a list of [x, y, z] values, got: {value}"
+                        "error": f"{property_type.capitalize()} value must be a number or a list [x,y,z]."
                     }
 
-                # Log the final vector value
-                self.log(
-                    f"[C4D KEYFRAME] Using final vector value for {property_type}: {value}"
-                )
+                if len(value) != 3:
+                    return {
+                        "error": f"{property_type.capitalize()} value must have 3 components."
+                    }
 
-                # Set the vector keyframe
                 result = self._set_vector_keyframe(
                     obj, frame, property_ids[property_type], value, property_type
                 )
-
                 if not result:
                     return {"error": f"Failed to set {property_type} keyframe"}
 
-            # Handle light-specific properties
             elif obj.GetType() == c4d.Olight and property_type in [
                 "intensity",
                 "color",
             ]:
                 if property_type == "intensity":
-                    # Ensure value is a scalar
                     if isinstance(value, list):
-                        if len(value) > 0:
-                            value = value[
-                                0
-                            ]  # Use the first value if a list is provided
-                        else:
-                            return {"error": "Empty value provided for intensity"}
-
-                    # Set the light intensity keyframe
+                        value = value[0] if value else 0.0
                     result = self._set_scalar_keyframe(
                         obj,
                         frame,
                         c4d.LIGHT_BRIGHTNESS,
                         c4d.DTYPE_REAL,
-                        float(value) / 100.0,  # Convert percentage to 0-1 range
+                        float(value) / 100.0,
                         "intensity",
                     )
-
                     if not result:
                         return {"error": "Failed to set intensity keyframe"}
+
                 elif property_type == "color":
-                    # Ensure value is a valid RGB list
                     if not isinstance(value, list) or len(value) < 3:
-                        return {"error": "Color must be a list of [r, g, b] values"}
-
-                    # Set the light color keyframe
+                        return {"error": "Color must be a list [r,g,b]."}
                     result = self._set_vector_keyframe(
-                        obj, frame, c4d.LIGHT_COLOR, value, "color"
+                        obj, frame, c4d.LIGHT_COLOR, value[:3], "color"
                     )
-
                     if not result:
                         return {"error": "Failed to set color keyframe"}
 
-            # Check for other common scalar properties
-            elif property_type in ["visibility", "parameter"]:
-                # For visibility
-                if property_type == "visibility":
-                    # Ensure value is a scalar
-                    if isinstance(value, list):
-                        if len(value) > 0:
-                            value = value[
-                                0
-                            ]  # Use the first value if a list is provided
-                        else:
-                            return {"error": "Empty value provided for visibility"}
-
-                    # Set the visibility keyframe
-                    result = self._set_scalar_keyframe(
-                        obj,
-                        frame,
-                        c4d.ID_BASEOBJECT_VISIBILITY_EDITOR,
-                        c4d.DTYPE_LONG,
-                        int(bool(value)),  # Convert to 0 or 1
-                        "visibility",
-                    )
-
-                    if not result:
-                        return {"error": "Failed to set visibility keyframe"}
-
-                # For custom parameter (requires parameter_id in command)
-                elif property_type == "parameter":
-                    parameter_id = command.get("parameter_id")
-                    data_type = command.get("data_type", c4d.DTYPE_REAL)
-
-                    if parameter_id is None:
-                        return {
-                            "error": "parameter_id is required for setting parameter keyframes"
-                        }
-
-                    # Ensure value is a scalar
-                    if isinstance(value, list):
-                        if len(value) > 0:
-                            value = value[
-                                0
-                            ]  # Use the first value if a list is provided
-                        else:
-                            return {"error": "Empty value provided for parameter"}
-
-                    # Set the parameter keyframe
-                    result = self._set_scalar_keyframe(
-                        obj,
-                        frame,
-                        parameter_id,
-                        data_type,
-                        float(value),  # Convert to float
-                        f"parameter (ID: {parameter_id})",
-                    )
-
-                    if not result:
-                        return {
-                            "error": f"Failed to set parameter (ID: {parameter_id}) keyframe"
-                        }
             else:
                 return {
-                    "error": f"Unsupported property type: {property_type}. Supported properties: position, rotation, scale, intensity (lights), color (lights), visibility, parameter"
+                    "error": f"Unsupported property type '{property_type}' for object '{obj.GetName()}'."
                 }
 
-            # Return success
+            # --- Success ---
             return {
-                "success": True,
-                "object": object_name,
-                "frame": frame,
-                "property": property_type,
-                "value": value,
+                "keyframe_set": {
+                    "object_name": obj.GetName(),
+                    "object_guid": str(obj.GetGUID()),
+                    "property": property_type,
+                    "value_set": value,
+                    "frame": frame,
+                    "success": True,
+                }
             }
+
         except Exception as e:
-            return {"error": f"Error setting keyframe: {str(e)}"}
+            self.log(
+                f"[**ERROR**] Error setting keyframe: {str(e)}\n{traceback.format_exc()}"
+            )
+            return {
+                "error": f"Error setting keyframe: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def _set_position_keyframe(self, obj, frame, position):
         """Set a position keyframe for an object at a specific frame.
@@ -2347,7 +2678,15 @@ class C4DSocketServer(threading.Thread):
                 return {"error": "No Python code provided"}
 
         # For security, limit available modules
-        allowed_imports = ["c4d", "math", "random", "time", "json", "os.path", "sys"]
+        allowed_imports = [
+            "c4d",
+            "math",
+            "random",
+            "time",
+            "json",
+            "os.path",
+            "sys",
+        ]
 
         # Check for potentially harmful imports or functions
         for banned_keyword in [
@@ -2467,192 +2806,306 @@ class C4DSocketServer(threading.Thread):
         return result
 
     def handle_create_mograph_cloner(self, command):
-        """
-        Handle create_mograph_cloner command.
-        Creates a MoGraph Cloner object with the specified properties.
-        Supports backward-compatible grid mode and other standard modes.
-        """
+        """Handle create_mograph_cloner command with context and fixed parameter names."""
         doc = c4d.documents.GetActiveDocument()
-        name = command.get("cloner_name", "MoGraph Cloner")
+        if not doc:
+            return {"error": "No active document"}
+
+        requested_name = command.get("cloner_name", "MoGraph Cloner")
         mode = command.get("mode", "grid").lower()
-        object_name = command.get("object_name", None)
+        object_identifier = command.get("object_name", None)
 
-        # Normalize count early
-        raw_count = command.get("count", [3, 1, 3] if mode == "grid" else 10)
+        use_child_guid = False
+        clone_child_provided = object_identifier is not None
+        if clone_child_provided:
+            identifier_str = str(object_identifier)
+            if "-" in identifier_str and len(identifier_str) > 30:
+                use_child_guid = True
+            elif identifier_str.isdigit() or (
+                identifier_str.startswith("-") and identifier_str[1:].isdigit()
+            ):
+                if len(identifier_str) > 10:
+                    use_child_guid = True
 
+        # Count Parsing (robust version from previous step)
+        default_count = [3, 1, 3] if mode == "grid" else 10
+        raw_count = command.get("count", default_count)
         count_vec = None
-        count = None
-
-        if mode == "grid":
-            if isinstance(raw_count, (list, tuple)) and len(raw_count) == 3:
-                count_vec = c4d.Vector(*raw_count)
+        count_scalar = None
+        reported_count = raw_count
+        try:
+            if mode == "grid":
+                if isinstance(raw_count, list) and len(raw_count) >= 3:
+                    count_vec = c4d.Vector(
+                        int(raw_count[0]), int(raw_count[1]), int(raw_count[2])
+                    )
+                    reported_count = [int(c) for c in count_vec]
+                elif isinstance(raw_count, (int, float)):
+                    count_vec = c4d.Vector(int(raw_count), 1, 1)
+                    reported_count = [int(raw_count), 1, 1]
+                else:
+                    self.log(
+                        f"[CLONER] ## Warning ## Invalid count '{raw_count}' for grid. Using defaults."
+                    )
+                    count_vec = c4d.Vector(3, 1, 3)
+                    reported_count = [3, 1, 3]
+            elif mode in ["linear", "radial", "object", "spline", "honeycomb"]:
+                if isinstance(raw_count, list) and len(raw_count) >= 1:
+                    count_scalar = int(raw_count[0])
+                    reported_count = count_scalar
+                elif isinstance(raw_count, (int, float)):
+                    count_scalar = int(raw_count)
+                    reported_count = count_scalar
+                else:
+                    self.log(
+                        f"[CLONER] ## Warning ## Invalid count '{raw_count}' for {mode}. Using default 10."
+                    )
+                    count_scalar = 10
+                    reported_count = 10
             else:
                 self.log(
-                    f"[C4D CLONER] Invalid count for grid mode, using default [3, 1, 3]"
+                    f"[CLONER] ## Warning ## Unsupported mode '{mode}'. Using default grid."
                 )
+                mode = "grid"
                 count_vec = c4d.Vector(3, 1, 3)
-        else:
-            try:
-                count = (
-                    int(raw_count)
-                    if not isinstance(raw_count, (list, tuple))
-                    else int(raw_count[0])
-                )
-            except Exception:
-                self.log(f"[C4D CLONER] Invalid count format, falling back to 10")
-                count = 10
+                reported_count = [3, 1, 3]
+        except (ValueError, TypeError) as e:
+            self.log(
+                f"[CLONER] ## Warning ## Error parsing count '{raw_count}': {e}. Using defaults."
+            )
+            if mode == "grid":
+                count_vec = c4d.Vector(3, 1, 3)
+                reported_count = [3, 1, 3]
+            else:
+                count_scalar = 10
+                reported_count = 10
 
         self.log(
-            f"[C4D CLONER] Creating MoGraph Cloner: {name}, Mode: {mode}, Count: {raw_count}"
+            f"[C4D CLONER] Creating: Name='{requested_name}', Mode='{mode}', Count='{reported_count}', Source='{object_identifier}' (GUID: {use_child_guid})"
         )
 
-        # Attempt to find object to clone
-        clone_obj = None
-        if object_name:
-            clone_obj = self.find_object_by_name(doc, object_name)
-            if not clone_obj:
-                self.log(f"[C4D CLONER] Clone object not found: {object_name}")
-                return {"error": f"Object '{object_name}' not found."}
-            self.log(f"[C4D CLONER] Found clone object: {object_name}")
+        clone_obj_target = None
+        child_obj_details = {"source": "Default Cube"}
+        child_guid = None
+        child_actual_name = "Default Cube"
+        if clone_child_provided:
+            clone_obj_target = self.find_object_by_name(
+                doc, object_identifier, use_guid=use_child_guid
+            )
+            if not clone_obj_target:
+                search_type = "GUID" if use_child_guid else "Name"
+                return {
+                    "error": f"Object '{object_identifier}' (searched by {search_type}) not found to clone."
+                }
+            else:
+                target_name = clone_obj_target.GetName()
+                target_guid = str(clone_obj_target.GetGUID())
+                child_obj_details["source"] = (
+                    f"Existing Object: '{target_name}' (GUID: {target_guid})"
+                )
+                self.log(
+                    f"[CLONER] Found clone object: '{target_name}' (GUID: {target_guid})"
+                )
 
-        # Main-thread-safe cloner creation logic
-        def create_mograph_cloner_safe(doc, name, mode, count, count_vec, clone_obj):
+        def create_mograph_cloner_safe(
+            doc, name, mode, count, count_vec, found_clone_object
+        ):
+            nonlocal child_guid, child_actual_name
             try:
-                self.log("[C4D CLONER] Creating MoGraph Cloner on main thread")
                 cloner = c4d.BaseObject(c4d.Omgcloner)
                 if not cloner:
-                    return {"error": "Failed to create Cloner object"}
-
+                    raise RuntimeError("Failed to create Cloner object")
                 cloner.SetName(name)
-                self.log(f"[C4D CLONER] Created cloner: {name}")
 
                 mode_ids = {
                     "linear": 0,
                     "radial": 2,
                     "grid": 1,
                     "object": 3,
+                    "spline": 4,
+                    "honeycomb": 5,
                 }
-                mode_id = mode_ids.get(mode, 0)
+                mode_id = mode_ids.get(mode, 1)
 
+                doc.StartUndo()
                 doc.InsertObject(cloner)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, cloner)
                 cloner[c4d.ID_MG_MOTIONGENERATOR_MODE] = mode_id
-                self.log(f"[C4D CLONER] Set mode: {mode} (ID: {mode_id})")
 
-                # Create child
-                if clone_obj:
-                    child_obj = clone_obj.GetClone()
-                    self.log(
-                        f"[C4D CLONER] Cloning source object: {clone_obj.GetName()}"
-                    )
+                if found_clone_object:
+                    child_obj = found_clone_object.GetClone()
                 else:
                     child_obj = c4d.BaseObject(c4d.Ocube)
                     child_obj.SetName("Default Cube")
                     child_obj.SetAbsScale(c4d.Vector(0.5, 0.5, 0.5))
-                    self.log("[C4D CLONER] Using default cube")
-
                 if not child_obj:
-                    return {"error": "Failed to create child object"}
+                    raise RuntimeError("Failed to create/clone child object")
 
                 doc.InsertObject(child_obj)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, child_obj)
+                child_actual_name = child_obj.GetName()
+                child_guid = str(child_obj.GetGUID())
                 child_obj.InsertUnderLast(cloner)
+                self.register_object_name(
+                    child_obj,
+                    (
+                        found_clone_object.GetName()
+                        if found_clone_object
+                        else "Default Cube"
+                    ),
+                )
 
-                # Mode-specific configuration
+                mg_bc = cloner.GetDataInstance()
+                if not mg_bc:
+                    raise RuntimeError("Failed to get MoGraph BaseContainer")
+
+                # ---Use getattr for potentially missing constants ---
                 if mode == "linear":
-                    cloner[c4d.MG_LINEAR_COUNT] = count
-                    cloner[c4d.MG_LINEAR_OFFSET] = 100
+                    mg_bc[c4d.MG_LINEAR_COUNT] = count
+                    # Use getattr for MG_LINEAR_PERSTEP, provide default vector if missing
+                    perstep_id = getattr(c4d, "MG_LINEAR_PERSTEP", None)
+                    mode_id_param = getattr(c4d, "MG_LINEAR_MODE", None)
+                    perstep_mode_val = getattr(
+                        c4d, "MG_LINEAR_MODE_PERSTEP", 0
+                    )  # Default to 0 if missing
+
+                    if perstep_id:
+                        mg_bc[perstep_id] = c4d.Vector(0, 50, 0)
+                    else:
+                        self.log("[CLONER] ## Warning ## MG_LINEAR_PERSTEP not found.")
+                    if mode_id_param:
+                        mg_bc[mode_id_param] = perstep_mode_val
+                    else:
+                        self.log("[CLONER] ## Warning ## MG_LINEAR_MODE not found.")
                     self.log(f"[C4D CLONER] Set linear count: {count}")
 
                 elif mode == "grid":
                     version = c4d.GetC4DVersion()
                     try:
-                        # Use updated constants if available
-                        if version >= 202500 and hasattr(c4d, "MGGRIDARRAY_MODE"):
-                            cloner[c4d.MGGRIDARRAY_MODE] = 1
-                            cloner[c4d.MGGRIDARRAY_RESOLUTION] = count_vec
-                            cloner[c4d.MGGRIDARRAY_SIZE] = c4d.Vector(200, 200, 200)
+                        if version >= 2025000 and hasattr(c4d, "MGGRIDARRAY_MODE"):
+                            mg_bc[c4d.MGGRIDARRAY_MODE] = c4d.MGGRIDARRAY_MODE_ENDPOINT
+                            mg_bc[c4d.MGGRIDARRAY_RESOLUTION] = count_vec
+                            mg_bc[c4d.MGGRIDARRAY_SIZE] = c4d.Vector(200, 200, 200)
                             self.log(
                                 f"[C4D CLONER] Using 2025+ MGGRIDARRAY_*; resolution: {count_vec}"
                             )
                         else:
-                            import c4d.modules.mograph as mo
-
-                            cloner[c4d.ID_MG_MOTIONGENERATOR_MODE] = 1
-
-                            # Legacy grid count per axis
-                            if hasattr(c4d, "MG_GRID_COUNT_X"):
-                                cloner[c4d.MG_GRID_COUNT_X] = int(count_vec.x)
-                                cloner[c4d.MG_GRID_COUNT_Y] = int(count_vec.y)
-                                cloner[c4d.MG_GRID_COUNT_Z] = int(count_vec.z)
+                            if (
+                                hasattr(c4d, "MG_GRID_COUNT")
+                                and hasattr(c4d, "MG_GRID_MODE")
+                                and hasattr(c4d, "MG_GRID_SIZE")
+                            ):
+                                mg_bc[c4d.MG_GRID_COUNT] = count_vec
+                                mg_bc[c4d.MG_GRID_MODE] = c4d.MG_GRID_MODE_PERSTEP
+                                mg_bc[c4d.MG_GRID_SIZE] = c4d.Vector(100, 100, 100)
                                 self.log(
-                                    f"[C4D CLONER] Legacy counts: X={int(count_vec.x)}, Y={int(count_vec.y)}, Z={int(count_vec.z)}"
+                                    f"[C4D CLONER] Using legacy MG_GRID_COUNT: {count_vec}, Mode: Per Step"
                                 )
                             else:
-                                self.log(
-                                    "[C4D CLONER WARNING] MG_GRID_COUNT_* not available"
-                                )
-
-                            # Legacy size
-                            if hasattr(c4d, "MG_CLONER_SIZE"):
-                                cloner[c4d.MG_CLONER_SIZE] = c4d.Vector(200, 200, 200)
-                                self.log("[C4D CLONER] Set MG_CLONER_SIZE to 200")
-                            else:
-                                self.log(
-                                    "[C4D CLONER WARNING] MG_CLONER_SIZE not available"
-                                )
-                    except Exception as e:
+                                if all(
+                                    hasattr(c4d, attr)
+                                    for attr in [
+                                        "MG_GRID_COUNT_X",
+                                        "MG_GRID_COUNT_Y",
+                                        "MG_GRID_COUNT_Z",
+                                        "MG_CLONER_SIZE",
+                                    ]
+                                ):
+                                    mg_bc[c4d.MG_GRID_COUNT_X] = int(count_vec.x)
+                                    mg_bc[c4d.MG_GRID_COUNT_Y] = int(count_vec.y)
+                                    mg_bc[c4d.MG_GRID_COUNT_Z] = int(count_vec.z)
+                                    mg_bc[c4d.MG_CLONER_SIZE] = c4d.Vector(
+                                        200, 200, 200
+                                    )
+                                    self.log(
+                                        f"[C4D CLONER] Using legacy MG_GRID_COUNT_X/Y/Z: {count_vec}, Size: 200"
+                                    )
+                                else:
+                                    self.log(
+                                        "[C4D CLONER] ## Warning ##: Could not find suitable grid parameters."
+                                    )
+                    except Exception as e_grid:
                         self.log(
-                            f"[C4D CLONER ERROR] Grid mode config failed: {str(e)}"
+                            f"[C4D CLONER] ## Warning ## Grid mode config failed: {e_grid}"
+                        )
+                elif mode == "radial":
+                    if hasattr(c4d, "MG_POLY_COUNT") and hasattr(c4d, "MG_POLY_RADIUS"):
+                        mg_bc[c4d.MG_POLY_COUNT] = count
+                        mg_bc[c4d.MG_POLY_RADIUS] = 200
+                        self.log(f"[C4D CLONER] Set radial count: {count}, Radius: 200")
+                    else:
+                        self.log(
+                            "[C4D CLONER] ## Warning ##: Radial parameters not found."
+                        )
+                elif mode == "object":
+                    self.log("[C4D CLONER] Object mode selected, requires linking.")
+                    if not hasattr(c4d, "MG_OBJECT_LINK"):
+                        self.log(
+                            "[C4D CLONER] ## Warning ##: Object link parameter not found."
                         )
 
-                elif mode == "radial":
-                    cloner[c4d.MG_POLY_COUNT] = count
-                    cloner[c4d.MG_POLY_RADIUS] = 200
-                    self.log(f"[C4D CLONER] Set radial count: {count}")
+                if hasattr(c4d, "MGCLONER_MODE"):
+                    cloner[c4d.MGCLONER_MODE] = c4d.MGCLONER_MODE_ITERATE
 
-                elif mode == "object":
-                    self.log("[C4D CLONER] Object mode not implemented")
-
-                cloner[c4d.MGCLONER_MODE] = c4d.MGCLONER_MODE_ITERATE
+                doc.EndUndo()
                 c4d.EventAdd()
 
+                actual_cloner_name = cloner.GetName()
+                cloner_guid = str(cloner.GetGUID())
+                pos_vec = cloner.GetAbsPos()
+                self.register_object_name(cloner, name)  # Use 'name' (requested name)
+
                 return {
-                    "name": cloner.GetName(),
-                    "id": str(cloner.GetGUID()),
-                    "type": mode,
-                    "count": (
-                        count
-                        if count is not None
-                        else [int(count_vec.x), int(count_vec.y), int(count_vec.z)]
-                    ),
-                    "type_id": cloner.GetType(),
+                    "cloner": {
+                        "requested_name": name,
+                        "actual_name": actual_cloner_name,
+                        "guid": cloner_guid,
+                        "type": mode,
+                        "count_set": reported_count,
+                        "position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                        "child_object": {
+                            "source": child_obj_details["source"],
+                            "actual_name": child_actual_name,
+                            "guid": child_guid,
+                        },
+                    }
                 }
-
             except Exception as e:
-                import traceback
-
-                traceback.print_exc()
-                return {"error": f"Exception during cloner creation: {str(e)}"}
+                doc.EndUndo()
+                self.log(
+                    f"[**ERROR**] Exception during cloner creation safe wrapper: {str(e)}\n{traceback.format_exc()}"
+                )
+                return {
+                    "error": f"Exception during cloner creation: {str(e)}",
+                    "traceback": traceback.format_exc(),
+                }
 
         try:
             self.log("[C4D CLONER] Dispatching cloner creation to main thread")
-            cloner_info = self.execute_on_main_thread(
+            result = self.execute_on_main_thread(
                 create_mograph_cloner_safe,
-                args=(doc, name, mode, count, count_vec, clone_obj),
+                args=(
+                    doc,
+                    requested_name,
+                    mode,
+                    count_scalar,
+                    count_vec,
+                    clone_obj_target,
+                ),
                 _timeout=30,
             )
-
-            if isinstance(cloner_info, dict) and "error" in cloner_info:
-                self.log(f"[C4D CLONER] Main thread error: {cloner_info['error']}")
-                return cloner_info
-
-            self.log(f"[C4D CLONER] Cloner created successfully: {cloner_info}")
-            return {"success": True, "cloner": cloner_info}
-
+            if isinstance(result, dict) and "error" in result:
+                self.log(f"[C4D CLONER] Error: {result['error']}")
+                return result
+            return result
         except Exception as e:
-            self.log(f"[C4D CLONER] Exception in handler: {str(e)}")
-            return {"error": f"Exception in cloner handler: {str(e)}"}
+            self.log(
+                f"[**ERROR**] Exception in cloner handler dispatch: {str(e)}\n{traceback.format_exc()}"
+            )
+            return {
+                "error": f"Exception dispatching cloner handler: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def handle_list_objects(self):
         """Handle list_objects command with comprehensive object detection including MoGraph objects."""
@@ -2691,7 +3144,12 @@ class C4DSocketServer(threading.Thread):
                         try:
                             # Get the cloner mode
                             mode_id = current_obj[c4d.ID_MG_MOTIONGENERATOR_MODE]
-                            modes = {0: "Linear", 1: "Grid", 2: "Radial", 3: "Object"}
+                            modes = {
+                                0: "Linear",
+                                1: "Grid",
+                                2: "Radial",
+                                3: "Object",
+                            }
                             mode_name = modes.get(mode_id, f"Mode {mode_id}")
                             additional_props["cloner_mode"] = mode_name
 
@@ -2864,31 +3322,50 @@ class C4DSocketServer(threading.Thread):
         return {"objects": objects}
 
     def handle_add_effector(self, command):
-        """Adds a MoGraph effector (e.g. random, plain) and optionally links it to a cloner."""
+        """Adds a MoGraph effector and optionally links it to a cloner, returns context."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
+
         type_name = command.get("effector_type", "random").lower()
-        cloner_name = command.get("cloner_name", "")
+        # --- Use 'target' preferentially, fallback to 'cloner_name' ---
+        cloner_identifier = command.get("target") or command.get("cloner_name") or ""
         properties = command.get("properties", {})
+        requested_name = (
+            command.get("name")
+            or command.get("effector_name")
+            or f"{type_name.capitalize()} Effector"
+        )
 
-        name = command.get("name", f"{type_name.capitalize()} Effector")
+        # --- Detect if the cloner_identifier looks like a GUID ---
+        use_cloner_guid = False
+        if cloner_identifier:  # Check only if identifier exists
+            identifier_str = str(cloner_identifier)
+            if "-" in identifier_str and len(identifier_str) > 30:
+                use_cloner_guid = True
+            elif identifier_str.isdigit() or (
+                identifier_str.startswith("-") and identifier_str[1:].isdigit()
+            ):
+                if len(identifier_str) > 10:
+                    use_cloner_guid = True
 
+        effector = None
         try:
-            # Debug log
-            self.log(f"[C4D EFFECTOR] Creating {type_name} effector named '{name}'")
-            if cloner_name:
+            self.log(
+                f"[C4D EFFECTOR] Creating {type_name} effector named '{requested_name}'"
+            )
+            if cloner_identifier:
                 self.log(
-                    f"[C4D EFFECTOR] Will attempt to apply to cloner '{cloner_name}'"
+                    f"[C4D EFFECTOR] Will attempt to apply to cloner '{cloner_identifier}' (Treat as GUID: {use_cloner_guid})"
                 )
 
-            # Map effector types to C4D constants.
+            # (Effector type mapping and creation remains the same)
             effector_types = {
                 "random": c4d.Omgrandom,
                 "formula": c4d.Omgformula,
                 "step": c4d.Omgstep,
-                "target": (
-                    c4d.Omgtarget
-                    if hasattr(c4d, "Omgtarget")
-                    else c4d.Omgeffectortarget
+                "target": getattr(
+                    c4d, "Omgtarget", getattr(c4d, "Omgeffectortarget", None)
                 ),
                 "time": c4d.Omgtime,
                 "sound": c4d.Omgsound,
@@ -2896,162 +3373,193 @@ class C4DSocketServer(threading.Thread):
                 "delay": c4d.Omgdelay,
                 "spline": c4d.Omgspline,
                 "python": c4d.Omgpython,
+                "shader": c4d.Omgshader,
+                "volume": c4d.Omgvolume,
             }
-
             if hasattr(c4d, "Omgfalloff"):
                 effector_types["falloff"] = c4d.Omgfalloff
+            effector_id = effector_types.get(type_name)
+            if effector_id is None:
+                return {"error": f"Unsupported effector type: {type_name}"}
 
-            effector_id = effector_types.get(type_name, c4d.Omgrandom)
+            doc.StartUndo()
             effector = c4d.BaseObject(effector_id)
             if effector is None:
-                return {"error": f"Failed to create {type_name} effector"}
-            effector.SetName(name)
+                raise RuntimeError(f"Failed to create {type_name} effector BaseObject")
+            effector.SetName(requested_name)
 
-            # Set common properties.
-            if "strength" in properties and isinstance(
-                properties["strength"], (int, float)
-            ):
-                effector[c4d.ID_MG_BASEEFFECTOR_STRENGTH] = float(
-                    properties["strength"]
+            # (Property setting remains the same)
+            bc = effector.GetDataInstance()
+            if bc:
+                if "strength" in properties and isinstance(
+                    properties["strength"], (int, float)
+                ):
+                    try:
+                        bc[c4d.ID_MG_BASEEFFECTOR_STRENGTH] = (
+                            float(properties["strength"]) / 100.0
+                        )
+                    except Exception as e_prop:
+                        self.log(f"Warning: Could not set strength: {e_prop}")
+                if "position_mode" in properties and isinstance(
+                    properties["position_mode"], bool
+                ):
+                    try:
+                        bc[c4d.ID_MG_BASEEFFECTOR_POSITION_ACTIVE] = properties[
+                            "position_mode"
+                        ]
+                    except Exception as e_prop:
+                        self.log(f"Warning: Could not set position_mode: {e_prop}")
+                if "rotation_mode" in properties and isinstance(
+                    properties["rotation_mode"], bool
+                ):
+                    try:
+                        bc[c4d.ID_MG_BASEEFFECTOR_ROTATION_ACTIVE] = properties[
+                            "rotation_mode"
+                        ]
+                    except Exception as e_prop:
+                        self.log(f"Warning: Could not set rotation_mode: {e_prop}")
+                if "scale_mode" in properties and isinstance(
+                    properties["scale_mode"], bool
+                ):
+                    try:
+                        bc[c4d.ID_MG_BASEEFFECTOR_SCALE_ACTIVE] = properties[
+                            "scale_mode"
+                        ]
+                    except Exception as e_prop:
+                        self.log(f"Warning: Could not set scale_mode: {e_prop}")
+            else:
+                self.log(
+                    f"Warning: Could not get BaseContainer for effector '{requested_name}'"
                 )
-            if "position_mode" in properties and isinstance(
-                properties["position_mode"], bool
-            ):
-                effector[c4d.ID_MG_BASEEFFECTOR_POSITION_ACTIVE] = properties[
-                    "position_mode"
-                ]
-            if "rotation_mode" in properties and isinstance(
-                properties["rotation_mode"], bool
-            ):
-                effector[c4d.ID_MG_BASEEFFECTOR_ROTATION_ACTIVE] = properties[
-                    "rotation_mode"
-                ]
-            if "scale_mode" in properties and isinstance(
-                properties["scale_mode"], bool
-            ):
-                effector[c4d.ID_MG_BASEEFFECTOR_SCALE_ACTIVE] = properties["scale_mode"]
 
             doc.InsertObject(effector)
             doc.AddUndo(c4d.UNDOTYPE_NEW, effector)
 
-            # If a cloner is specified, add the effector to its effector list.
-            cloner_applied = False
-            if cloner_name:
-                # Try to find cloner by name - both exact and fuzzy matching
-                cloner = None
+            # --- Linking logic (remains the same, but find_object_by_name call uses correct flag now) ---
+            cloner_applied_to_name = "None"
+            cloner_applied_to_guid = None
+            cloner_found = None
 
-                # Try standard find first
-                cloner = self.find_object_by_name(doc, cloner_name)
+            if cloner_identifier:
+                # Pass the use_cloner_guid flag correctly
+                cloner_found = self.find_object_by_name(
+                    doc, cloner_identifier, use_guid=use_cloner_guid
+                )
 
-                # If not found, and name is generic like "Cloner", try to find by type
-                if cloner is None and cloner_name.lower() in [
-                    "cloner",
-                    "mograph cloner",
-                ]:
-                    self.log(f"[C4D EFFECTOR] Trying to find any MoGraph Cloner object")
-                    obj = doc.GetFirstObject()
-                    while obj:
-                        if obj.GetType() == c4d.Omgcloner:
-                            cloner = obj
-                            self.log(
-                                f"[C4D EFFECTOR] Found cloner by type: {cloner.GetName()}"
-                            )
-                            break
-                        obj = obj.GetNext()
-
-                if cloner is None:
+                if cloner_found is None:
+                    search_type = "GUID" if use_cloner_guid else "Name"
                     self.log(
-                        f"[C4D EFFECTOR] ## Warning ##: Cloner '{cloner_name}' not found, effector created but not applied"
+                        f"[C4D EFFECTOR] ## Warning ##: Cloner '{cloner_identifier}' (searched by {search_type}) not found, effector created but not linked."
                     )
-                    # Instead of returning error, just continue without applying
                 else:
-                    if cloner.GetType() != c4d.Omgcloner:
+                    if cloner_found.GetType() != c4d.Omgcloner:
                         self.log(
-                            f"[C4D EFFECTOR] ## Warning ##: Object '{cloner_name}' is not a MoGraph Cloner"
+                            f"[C4D EFFECTOR] ## Warning ##: Target '{cloner_found.GetName()}' is not a MoGraph Cloner (Type: {cloner_found.GetType()})"
                         )
-                        # Instead of returning error, just continue without applying
                     else:
                         try:
-                            # Get the effector list or create a new one
                             effector_list = None
-
-                            # Try to get existing list
                             try:
-                                effector_list = cloner[
+                                effector_list = cloner_found[
                                     c4d.ID_MG_MOTIONGENERATOR_EFFECTORLIST
                                 ]
                             except:
                                 self.log(
-                                    f"[C4D EFFECTOR] Creating new effector list for cloner"
+                                    f"[C4D EFFECTOR] Creating new effector list for cloner '{cloner_found.GetName()}'"
                                 )
-                                pass
-
-                            # Create new list if needed
                             if not isinstance(effector_list, c4d.InExcludeData):
                                 effector_list = c4d.InExcludeData()
 
-                            # Insert effector with enabled flag (1)
                             effector_list.InsertObject(effector, 1)
-                            cloner[c4d.ID_MG_MOTIONGENERATOR_EFFECTORLIST] = (
+                            cloner_found[c4d.ID_MG_MOTIONGENERATOR_EFFECTORLIST] = (
                                 effector_list
                             )
-                            doc.AddUndo(c4d.UNDOTYPE_CHANGE, cloner)
-                            cloner_applied = True
+                            doc.AddUndo(c4d.UNDOTYPE_CHANGE, cloner_found)
+                            cloner_applied_to_name = cloner_found.GetName()
+                            cloner_applied_to_guid = str(cloner_found.GetGUID())
                             self.log(
-                                f"[C4D EFFECTOR] Successfully applied effector to cloner '{cloner.GetName()}'"
+                                f"[C4D EFFECTOR] Successfully applied effector to cloner '{cloner_applied_to_name}'"
                             )
-                        except Exception as e:
+                        except Exception as e_apply:
                             self.log(
-                                f"[C4D EFFECTOR] Error applying effector to cloner: {str(e)}"
+                                f"[**ERROR**] Error applying effector to cloner '{cloner_found.GetName()}': {str(e_apply)}"
                             )
-                            # Continue without returning error - at least create the effector
 
+            doc.EndUndo()
             c4d.EventAdd()
 
+            # --- Contextual Return (remains the same) ---
+            actual_effector_name = effector.GetName()
+            effector_guid = str(effector.GetGUID())
+            pos_vec = effector.GetAbsPos()
+
+            self.register_object_name(effector, requested_name)
+
             return {
-                "object": {
-                    "name": effector.GetName(),
-                    "id": str(effector.GetGUID()),
+                "effector": {
+                    "requested_name": requested_name,
+                    "actual_name": actual_effector_name,
+                    "guid": effector_guid,
                     "type": type_name,
-                    "applied_to_cloner": cloner_applied,
+                    "position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                    "applied_to_cloner_name": cloner_applied_to_name,
+                    "applied_to_cloner_guid": cloner_applied_to_guid,
                 }
             }
+
         except Exception as e:
-            self.log(f"[C4D EFFECTOR] Error creating effector: {str(e)}")
-            return {"error": f"Failed to create effector: {str(e)}"}
+            doc.EndUndo()
+            self.log(
+                f"[**ERROR**] Error creating effector: {str(e)}\n{traceback.format_exc()}"
+            )
+            if effector and not effector.GetDocument():
+                try:
+                    effector.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Failed to create effector: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def handle_apply_mograph_fields(self, command):
-        """Applies a MoGraph field (as a child) to a MoGraph effector in C4D 2025.0.0."""
+        """Applies a MoGraph field (as a child) to a MoGraph effector, returns context."""
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return {"error": "No active document"}
 
-        # Step 1: Extract command parameters
         field_type = command.get("field_type", "spherical").lower()
-        field_name = command.get("field_name", f"{field_type.capitalize()} Field")
-        target_name = command.get("target_name", "")
+        requested_name = command.get("field_name", f"{field_type.capitalize()} Field")
+        target_identifier = command.get("target_name", "")
         parameters = command.get("parameters", {})
 
-        # Step 2: Map field type to object ID
-        field_type_map = {
-            "spherical": getattr(c4d, "Fspherical", 440000243),
-            "box": getattr(c4d, "Fbox", 440000244),
-            "radial": getattr(c4d, "Fradial", 440000245),
-            "linear": getattr(c4d, "Flinear", 440000246),
-            "noise": 440000248,  # No constant exists in c4d module
-        }
+        # Detect if target_identifier is likely a GUID
+        use_target_guid = False
+        if target_identifier:
+            identifier_str = str(target_identifier)
+            if "-" in identifier_str and len(identifier_str) > 30:
+                use_target_guid = True
+            elif identifier_str.isdigit() or (
+                identifier_str.startswith("-") and identifier_str[1:].isdigit()
+            ):
+                if len(identifier_str) > 10:
+                    use_target_guid = True
 
-        field_type_id = field_type_map.get(field_type)
-        if not field_type_id:
-            return {"error": f"Unsupported field type: '{field_type}'"}
-
+        field = None
         try:
-            # Step 3: Locate effector
-            target = self.find_object_by_name(doc, target_name)
-            if not target:
-                return {"error": f"Effector '{target_name}' not found"}
+            self.log(
+                f"[C4D FIELDS] Request: Field='{requested_name}' Type='{field_type}' Target='{target_identifier}' (Treat as GUID: {use_target_guid})"
+            )
 
-            # Validate effector by its type ID
+            target = self.find_object_by_name(
+                doc, target_identifier, use_guid=use_target_guid
+            )
+            if not target:
+                search_type = "GUID" if use_target_guid else "Name"
+                return {
+                    "error": f"Target effector '{target_identifier}' (searched by {search_type}) not found"
+                }
+
             valid_effector_types = {
                 c4d.Omgplain,
                 c4d.Omgrandom,
@@ -3061,89 +3569,186 @@ class C4DSocketServer(threading.Thread):
                 c4d.Omgtime,
                 c4d.Omgsound,
                 c4d.Omgpython,
+                c4d.Omgshader,
+                c4d.Omgvolume,
+                getattr(c4d, "Omgtarget", getattr(c4d, "Omgeffectortarget", None)),
             }
-            if hasattr(c4d, "Omgtarget"):
-                valid_effector_types.add(c4d.Omgtarget)
-            else:
-                valid_effector_types.add(c4d.Omgeffectortarget)
-
             if target.GetType() not in valid_effector_types:
                 return {
-                    "error": f"Target '{target_name}' is not a supported effector type"
+                    "error": f"Target '{target.GetName()}' is not a supported effector type (Type: {target.GetType()})"
                 }
 
-            # Step 4: Create field object
+            target_name = target.GetName()
+            target_guid = str(target.GetGUID())
+
+            field_type_map = {
+                "spherical": getattr(c4d, "Fspherical", 440000243),
+                "box": getattr(c4d, "Fbox", 440000244),
+                "radial": getattr(c4d, "Fradial", 440000245),
+                "linear": getattr(c4d, "Flinear", 440000246),
+                "noise": 440000248,
+                "cylinder": getattr(c4d, "Fcylinder", 1039386),
+                "cone": getattr(c4d, "Fcone", 1039388),
+                "torus": getattr(c4d, "Ftorus", 1039387),
+                "formula": getattr(c4d, "Fformula", 1040830),
+                "random": getattr(c4d, "Frandom", 1040831),
+                "step": getattr(c4d, "Fstep", 1040832),
+            }
+            field_type_id = field_type_map.get(field_type)
+            if not field_type_id:
+                return {"error": f"Unsupported field type: '{field_type}'"}
+
+            doc.StartUndo()
             field = c4d.BaseObject(field_type_id)
             if not field:
-                return {"error": "Failed to create field object"}
+                raise RuntimeError("Failed to create field BaseObject")
+            field.SetName(requested_name)
 
-            field.SetName(field_name)
+            bc = field.GetDataInstance()
+            if bc:
+                if (
+                    "position" in parameters
+                    and isinstance(parameters["position"], list)
+                    and len(parameters["position"]) >= 3
+                ):
+                    try:
+                        field.SetAbsPos(
+                            c4d.Vector(*[float(p) for p in parameters["position"][:3]])
+                        )
+                    except (ValueError, TypeError):
+                        self.log(
+                            f"Warning: Invalid field position {parameters['position']}"
+                        )
+                if (
+                    "scale" in parameters
+                    and isinstance(parameters["scale"], list)
+                    and len(parameters["scale"]) >= 3
+                ):
+                    try:
+                        field.SetAbsScale(
+                            c4d.Vector(*[float(p) for p in parameters["scale"][:3]])
+                        )
+                    except (ValueError, TypeError):
+                        self.log(f"Warning: Invalid field scale {parameters['scale']}")
+                if (
+                    "rotation" in parameters
+                    and isinstance(parameters["rotation"], list)
+                    and len(parameters["rotation"]) >= 3
+                ):
+                    try:
+                        hpb_rad = [
+                            c4d.utils.DegToRad(float(angle))
+                            for angle in parameters["rotation"][:3]
+                        ]
+                        field.SetAbsRot(c4d.Vector(*hpb_rad))
+                    except (ValueError, TypeError):
+                        self.log(
+                            f"Warning: Invalid field rotation {parameters['rotation']}"
+                        )
+                if field_type == "spherical" and "radius" in parameters:
+                    radius_id = getattr(
+                        c4d, "FIELD_SIZE", getattr(c4d, "FIELDSPHERICAL_RADIUS", None)
+                    )
+                    if radius_id:
+                        try:
+                            bc[radius_id] = float(parameters["radius"])
+                        except (ValueError, TypeError):
+                            self.log(
+                                f"Warning: Invalid radius value {parameters['radius']}"
+                            )
+                    else:
+                        self.log(
+                            "Warning: Could not find radius parameter ID for spherical field."
+                        )
+            else:
+                self.log(
+                    f"Warning: Could not get BaseContainer for field '{requested_name}'"
+                )
 
-            # Step 5: Apply basic user-defined parameters
-            if "position" in parameters and isinstance(parameters["position"], list):
-                field.SetAbsPos(c4d.Vector(*parameters["position"]))
-
-            if "scale" in parameters and isinstance(parameters["scale"], list):
-                field.SetAbsScale(c4d.Vector(*parameters["scale"]))
-
-            if "rotation" in parameters and isinstance(parameters["rotation"], list):
-                hpb = [c4d.utils.DegToRad(angle) for angle in parameters["rotation"]]
-                field.SetAbsRot(c4d.Vector(*hpb))
-
-            # Step 6: Insert and parent field under effector
             doc.InsertObject(field)
-            field.InsertUnder(target)
             doc.AddUndo(c4d.UNDOTYPE_NEW, field)
+            field.InsertUnder(target)
             doc.AddUndo(c4d.UNDOTYPE_CHANGE, target)
-
+            doc.EndUndo()
             c4d.EventAdd()
             self.log(
-                f"[C4D FIELDS] Linked field '{field_name}' to effector '{target_name}'"
+                f"[C4D FIELDS] Linked field '{field.GetName()}' to effector '{target_name}'"
             )
+
+            actual_field_name = field.GetName()
+            field_guid = str(field.GetGUID())
+            pos_vec = field.GetAbsPos()
+            self.register_object_name(field, requested_name)
 
             return {
                 "field": {
-                    "name": field.GetName(),
-                    "id": str(field.GetGUID()),
+                    "requested_name": requested_name,
+                    "actual_name": actual_field_name,
+                    "guid": field_guid,
                     "type": field_type,
-                    "target": target.GetName(),
-                    "position": [
-                        field.GetAbsPos().x,
-                        field.GetAbsPos().y,
-                        field.GetAbsPos().z,
-                    ],
-                    "linked": True,
+                    "target_name": target_name,
+                    "target_guid": target_guid,
+                    "position": [pos_vec.x, pos_vec.y, pos_vec.z],
                 }
             }
 
         except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            return {"error": f"Exception occurred: {str(e)}"}
+            doc.EndUndo()
+            self.log(f"[**ERROR**] Error applying field: {e}\n{traceback.format_exc()}")
+            if field and not field.GetDocument():
+                try:
+                    field.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Exception occurred applying field: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def handle_create_soft_body(self, command):
-        """Handle create_soft_body command."""
+        """Handle create_soft_body command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
-        object_name = command.get("object_name", "")
-        name = command.get("name", "Soft Body")
+        if not doc:
+            return {"error": "No active document"}
+
+        # --- MODIFIED: Identify target object ---
+        identifier = None
+        use_guid = False
+        if command.get("guid"):
+            identifier = command.get("guid")
+            use_guid = True
+            self.log(f"[SOFT BODY] Using GUID identifier: '{identifier}'")
+        elif command.get("object_name"):
+            identifier = command.get("object_name")
+            use_guid = False
+            self.log(f"[SOFT BODY] Using Name identifier: '{identifier}'")
+        else:
+            return {"error": "No object identifier ('guid' or 'object_name') provided."}
+
+        # Find target object using the determined method
+        obj = self.find_object_by_name(doc, identifier, use_guid=use_guid)
+        if obj is None:
+            search_type = "GUID" if use_guid else "Name"
+            return {
+                "error": f"Object '{identifier}' (searched by {search_type}) not found for soft body."
+            }
+
+        # Get parameters (using original logic)
+        name = command.get(
+            "name", f"{obj.GetName()} Soft Body"
+        )  # Default name based on object
         stiffness = command.get("stiffness", 50)
         mass = command.get("mass", 1.0)
 
-        # Find target object
-        obj = self.find_object_by_name(doc, object_name)
-        if obj is None:
-            return {"error": f"Object not found: {object_name}"}
-
-        def create_soft_body_safe(obj, name, stiffness, mass, object_name):
+        # Define safe wrapper (using original logic, but noting potential RIGID_BODY_SOFTBODY issue)
+        def create_soft_body_safe(
+            target_obj, tag_name, stiff_val, mass_val, obj_actual_name
+        ):
             self.log(
-                f"[C4D SBODY] Creating soft body dynamics tag '{name}' for object '{object_name}'"
+                f"[C4D SBODY] Creating soft body dynamics tag '{tag_name}' for object '{obj_actual_name}'"
             )
+            dynamics_tag_id = 180000102  # Standard Dynamics Body Tag ID
 
-            # Get dynamics tag ID - same for all C4D versions
-            dynamics_tag_id = 180000102  # This is the standard tag ID for dynamics
-
-            # Create Dynamics tag
             tag = c4d.BaseTag(dynamics_tag_id)
             if tag is None:
                 self.log(
@@ -3151,116 +3756,281 @@ class C4DSocketServer(threading.Thread):
                 )
                 raise RuntimeError("Failed to create Dynamics Body tag")
 
-            tag.SetName(name)
-            self.log(f"[C4D SBODY] Successfully created dynamics tag: {name}")
+            tag.SetName(tag_name)
+            self.log(f"[C4D SBODY] Successfully created dynamics tag: {tag_name}")
 
-            tag[c4d.RIGID_BODY_DYNAMIC] = 1  # Enable dynamics
-            tag[c4d.RIGID_BODY_MASS] = mass
-            tag[c4d.RIGID_BODY_SOFTBODY] = True  # Enable soft body
+            # --- Potential Issue Area ---
+            # RIGID_BODY_SOFTBODY might be deprecated in newer C4D versions.
+            # This might need adjustment based on testing with the target C4D version.
+            # A more modern approach uses RIGID_BODY_TYPE = 2
+            try:
+                # Try modern approach first
+                if hasattr(c4d, "RIGID_BODY_TYPE"):
+                    tag[c4d.RIGID_BODY_TYPE] = getattr(
+                        c4d, "RIGID_BODY_TYPE_SOFTBODY", 2
+                    )  # Use constant or fallback value 2
+                    self.log(
+                        f"[C4D SBODY] Set RIGID_BODY_TYPE to Soft Body ({tag[c4d.RIGID_BODY_TYPE]})"
+                    )
+                elif hasattr(c4d, "RIGID_BODY_SOFTBODY"):
+                    # Fallback to older attribute if modern one doesn't exist
+                    tag[c4d.RIGID_BODY_SOFTBODY] = True
+                    self.log("[C4D SBODY] Set RIGID_BODY_SOFTBODY to True (legacy)")
+                else:
+                    self.log(
+                        "[C4D SBODY] ## Warning ##: Cannot find suitable parameter to enable Soft Body mode."
+                    )
 
-            obj.InsertTag(tag)
+                # Common properties (assuming these IDs are stable)
+                tag[c4d.RIGID_BODY_DYNAMIC] = 1  # Enable dynamics
+                tag[c4d.RIGID_BODY_MASS] = float(mass_val)
+
+                # Stiffness might also have changed ID, add check
+                softbody_stiffness_id = getattr(
+                    c4d, "RIGID_BODY_SOFTBODY_STIFFNESS", 1110
+                )  # Example ID 1110
+                if tag.HasParameter(softbody_stiffness_id):
+                    tag[softbody_stiffness_id] = (
+                        float(stiff_val) / 100.0
+                    )  # Assume 0-100 input
+                    self.log(
+                        f"[C4D SBODY] Set stiffness parameter ID {softbody_stiffness_id}"
+                    )
+                else:
+                    self.log(
+                        f"[C4D SBODY] ## Warning ##: Stiffness parameter ID {softbody_stiffness_id} not found."
+                    )
+
+            except AttributeError as ae:
+                self.log(
+                    f"[**ERROR**] Missing Dynamics attribute: {ae}. Dynamics setup might be incomplete."
+                )
+                # Don't raise, just log, tag might still be useful partially
+            except Exception as e_tag:
+                self.log(f"[**ERROR**] Error setting dynamics parameters: {e_tag}")
+                # Don't raise, try inserting tag anyway
+
+            target_obj.InsertTag(tag)
             doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
             c4d.EventAdd()
 
+            # Return context
             return {
-                "object": object_name,
+                "object_name": obj_actual_name,
+                "object_guid": str(target_obj.GetGUID()),  # Added GUID
                 "tag_name": tag.GetName(),
-                "stiffness": stiffness,
-                "mass": mass,
+                "stiffness_set": float(stiff_val),  # Report value requested
+                "mass_set": float(mass_val),  # Report value requested
             }
 
+        # Execute on main thread
         try:
-            soft_body_info = self.execute_on_main_thread(
-                create_soft_body_safe, args=(obj, name, stiffness, mass, object_name)
+            result = self.execute_on_main_thread(
+                create_soft_body_safe,
+                args=(obj, name, stiffness, mass, obj.GetName()),
             )
-            return {"soft_body": soft_body_info}
+            # Check result structure from execute_on_main_thread
+            if isinstance(result, dict) and "error" in result:
+                return result  # Propagate error
+            elif isinstance(result, dict) and result.get("status") == "completed_none":
+                return {
+                    "error": "Soft body creation function returned None unexpectedly."
+                }
+            else:
+                return {"soft_body": result}  # Wrap successful result
+
         except Exception as e:
-            return {"error": f"Failed to create Soft Body: {str(e)}"}
+            # Catch errors related to execute_on_main_thread itself
+            self.log(
+                f"[**ERROR**] Failed to execute soft body creation via main thread: {e}\n{traceback.format_exc()}"
+            )
+            return {"error": f"Failed to queue/execute Soft Body creation: {str(e)}"}
 
     def handle_apply_dynamics(self, command):
-        """Handle apply_dynamics command."""
+        """Handle apply_dynamics command with GUID support."""
         doc = c4d.documents.GetActiveDocument()
-        object_name = command.get("object_name", "")
+        if not doc:
+            return {"error": "No active document"}
+
+        # --- MODIFIED: Identify target object ---
+        identifier = None
+        use_guid = False
+        if command.get("guid"):
+            identifier = command.get("guid")
+            use_guid = True
+            self.log(f"[DYNAMICS] Using GUID identifier: '{identifier}'")
+        elif command.get("object_name"):
+            identifier = command.get("object_name")
+            use_guid = False
+            self.log(f"[DYNAMICS] Using Name identifier: '{identifier}'")
+        else:
+            return {"error": "No object identifier ('guid' or 'object_name') provided."}
+
+        # Find target object using the determined method
+        obj = self.find_object_by_name(doc, identifier, use_guid=use_guid)
+        if obj is None:
+            search_type = "GUID" if use_guid else "Name"
+            return {
+                "error": f"Object '{identifier}' (searched by {search_type}) not found for dynamics."
+            }
+
         tag_type = command.get("tag_type", "rigid_body").lower()
         params = command.get("parameters", {})
+        tag_name = command.get(
+            "tag_name", f"{obj.GetName()} {tag_type.replace('_',' ').title()}"
+        )  # Default name
 
         try:
-            obj = self.find_object_by_name(doc, object_name)
-            if obj is None:
-                return {"error": f"Object not found: {object_name}"}
+            # Use Tdynamicsbody if available, fallback to old ID
+            dynamics_tag_id = getattr(c4d, "Tdynamicsbody", 180000102)
+            self.log(
+                f"[DYNAMICS] Using Dynamics Tag ID: {dynamics_tag_id} for type '{tag_type}'"
+            )
 
-            tag_types = {
-                "rigid_body": 180000102,  # Rigid Body tag
-                "collider": 180000102,  # Different mode in same tag
-                "connector": 180000103,  # Connector tag
-                "ghost": 180000102,  # Special mode in dynamics tag
-            }
-            tag_type_id = tag_types.get(tag_type, 180000102)
-
-            tag = c4d.BaseTag(tag_type_id)
+            doc.StartUndo()  # Start undo block
+            tag = obj.MakeTag(dynamics_tag_id)  # Use MakeTag for safer insertion
             if tag is None:
-                return {"error": f"Failed to create {tag_type} tag"}
+                raise RuntimeError(
+                    f"Failed to create Dynamics tag (ID: {dynamics_tag_id}) on '{obj.GetName()}'"
+                )
 
-            if tag_type == "rigid_body":
-                tag[c4d.RIGID_BODY_DYNAMIC] = 2  # Dynamic mode
-            elif tag_type == "collider":
-                tag[c4d.RIGID_BODY_DYNAMIC] = 0  # Static mode
-            elif tag_type == "ghost":
-                tag[c4d.RIGID_BODY_DYNAMIC] = 3  # Ghost mode
+            tag.SetName(tag_name)
+            bc = tag.GetDataInstance()
+            if not bc:
+                raise RuntimeError("Failed to get BaseContainer for dynamics tag")
 
-            # Set common parameters.
-            if "mass" in params and isinstance(params["mass"], (int, float)):
-                tag[c4d.RIGID_BODY_MASS] = float(params["mass"])
-            if "friction" in params and isinstance(params["friction"], (int, float)):
-                tag[c4d.RIGID_BODY_FRICTION] = float(params["friction"])
-            if "elasticity" in params and isinstance(
-                params["elasticity"], (int, float)
-            ):
-                tag[c4d.RIGID_BODY_ELASTICITY] = float(params["elasticity"])
-            if "collision_margin" in params and isinstance(
-                params["collision_margin"], (int, float)
-            ):
-                tag[c4d.RIGID_BODY_MARGIN] = float(params["collision_margin"])
+            # Map tag_type string to RIGID_BODY_TYPE enum value
+            type_map = {
+                "rigid_body": getattr(c4d, "RIGID_BODY_TYPE_RIGIDBODY", 1),  # Usually 1
+                "collider": getattr(c4d, "RIGID_BODY_TYPE_COLLIDER", 0),  # Usually 0
+                "ghost": getattr(c4d, "RIGID_BODY_TYPE_GHOST", 3),  # Usually 3
+                "soft_body": getattr(c4d, "RIGID_BODY_TYPE_SOFTBODY", 2),  # Usually 2
+            }
+            dynamics_type = type_map.get(tag_type)
+            if dynamics_type is None:
+                self.log(
+                    f"Warning: Unknown dynamics tag_type '{tag_type}'. Defaulting to Collider."
+                )
+                dynamics_type = type_map["collider"]
 
-            obj.InsertTag(tag)
-            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+            # Set dynamics type and enable
+            bc[c4d.RIGID_BODY_TYPE] = dynamics_type
+            bc[c4d.RIGID_BODY_ENABLED] = True
+
+            # Apply common parameters from the 'params' dictionary safely
+            if "mass" in params:
+                try:
+                    bc[c4d.RIGID_BODY_MASS_TYPE] = getattr(
+                        c4d, "RIGID_BODY_MASS_TYPE_CUSTOM", 1
+                    )
+                    bc[c4d.RIGID_BODY_MASS_CUSTOM] = float(params["mass"])
+                except (ValueError, TypeError, AttributeError) as e:
+                    self.log(
+                        f"Warning: Invalid/unsupported mass value '{params['mass']}': {e}"
+                    )
+            if "friction" in params:
+                try:
+                    bc[c4d.RIGID_BODY_FRICTION] = float(params["friction"])
+                except (ValueError, TypeError, AttributeError) as e:
+                    self.log(
+                        f"Warning: Invalid/unsupported friction value '{params['friction']}': {e}"
+                    )
+            # Use BOUNCE as it's the more common ID name than ELASTICITY
+            if "bounce" in params or "elasticity" in params:
+                bounce_val = params.get(
+                    "bounce", params.get("elasticity")
+                )  # Accept either key
+                try:
+                    bc[c4d.RIGID_BODY_BOUNCE] = float(bounce_val)
+                except (ValueError, TypeError, AttributeError) as e:
+                    self.log(
+                        f"Warning: Invalid/unsupported bounce/elasticity value '{bounce_val}': {e}"
+                    )
+            if "collision_shape" in params:
+                shape_map = {
+                    "auto": getattr(c4d, "RIGID_BODY_SHAPE_AUTO", 0),
+                    "box": getattr(c4d, "RIGID_BODY_SHAPE_BOX", 1),
+                    "sphere": getattr(c4d, "RIGID_BODY_SHAPE_SPHERE", 2),
+                    "capsule": getattr(c4d, "RIGID_BODY_SHAPE_CAPSULE", 3),
+                    "cylinder": getattr(c4d, "RIGID_BODY_SHAPE_CYLINDER", 4),
+                    "cone": getattr(c4d, "RIGID_BODY_SHAPE_CONE", 5),
+                    "static_mesh": getattr(c4d, "RIGID_BODY_SHAPE_STATICMESH", 7),
+                    "moving_mesh": getattr(c4d, "RIGID_BODY_SHAPE_MOVINGMESH", 8),
+                }
+                shape_val = shape_map.get(str(params["collision_shape"]).lower())
+                if shape_val is not None:
+                    try:
+                        bc[c4d.RIGID_BODY_SHAPE] = shape_val
+                    except AttributeError as e:
+                        self.log(f"Warning: Collision shape parameter not found: {e}")
+                else:
+                    self.log(
+                        f"Warning: Invalid collision_shape value '{params['collision_shape']}'"
+                    )
+            else:  # Default collision shape if not specified
+                try:
+                    bc[c4d.RIGID_BODY_SHAPE] = getattr(c4d, "RIGID_BODY_SHAPE_AUTO", 0)
+                except AttributeError as e:
+                    self.log(
+                        f"Warning: Default collision shape parameter not found: {e}"
+                    )
+
+            # No need for obj.InsertTag(tag) because MakeTag already inserts it
+            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)  # Add undo for the new tag
+            doc.EndUndo()  # End undo block
             c4d.EventAdd()
 
+            # Contextual Return
             return {
                 "dynamics": {
-                    "object": object_name,
-                    "tag_type": tag_type,
-                    "parameters": params,
+                    "object_name": obj.GetName(),
+                    "object_guid": str(obj.GetGUID()),
+                    "tag_name": tag.GetName(),
+                    "tag_type_applied": tag_type,
+                    "parameters_received": params,  # Echo back received params for verification
                 }
             }
+
         except Exception as e:
-            return {"error": f"Failed to apply Dynamics tag: {str(e)}"}
+            doc.EndUndo()  # Ensure undo is ended on error
+            self.log(
+                f"[**ERROR**] Error applying dynamics: {e}\n{traceback.format_exc()}"
+            )
+            return {
+                "error": f"Failed to apply Dynamics tag: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def handle_create_abstract_shape(self, command):
-        """Handle create_abstract_shape command with C4D 2025 compatibility."""
+        """Handle create_abstract_shape command with context and C4D 2025 compatibility."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
 
-        # Standardize parameter naming for consistency with other functions
         shape_type = command.get("shape_type", "metaball").lower()
+        # Accept both "name" and "object_name"
+        requested_name = command.get("name") or command.get(
+            "object_name", f"{shape_type.capitalize()}"
+        )
+        position_list = command.get("position", [0, 0, 0])
 
-        # Accept both "name" and "object_name" for backward compatibility
-        name = command.get("name")
-        if name is None:
-            name = command.get("object_name", f"{shape_type.capitalize()}")
+        # Safely parse position
+        position = [0.0, 0.0, 0.0]
+        if isinstance(position_list, list) and len(position_list) >= 3:
+            try:
+                position = [float(p) for p in position_list[:3]]
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid position data {position_list}")
 
-        position = command.get("position", [0, 0, 0])
-
-        # Log the requested name for debugging
         self.log(
-            f"[C4D ABSTRCTSHAPE] Creating abstract shape '{shape_type}' with requested name: '{name}'"
+            f"[C4D ABSTRCTSHAPE] Creating abstract shape '{shape_type}' with requested name: '{requested_name}'"
         )
 
+        shape = None  # Initialize shape variable
         try:
-            # Updated shape type mapping based on the testing report
-            # Use direct integer IDs for maximum compatibility
             shape_types = {
-                "metaball": 5125,  # Correct ID from testing report
-                "blob": 5119,  # Correct ID from testing report
+                "metaball": 5125,
+                "blob": 5119,
                 "loft": 5107,
                 "sweep": 5118,
                 "atom": 5168,
@@ -3269,141 +4039,130 @@ class C4DSocketServer(threading.Thread):
                 "landscape": 5119,
                 "extrude": 5116,
             }
-
-            # Get the ID for the requested shape type
-            shape_type_id = shape_types.get(shape_type, shape_types.get("metaball"))
+            shape_type_id = shape_types.get(shape_type, shape_types["metaball"])
             self.log(
                 f"[C4D ABSTRCTSHAPE] Creating abstract shape of type: {shape_type} (ID: {shape_type_id})"
             )
 
-            # Create the abstract shape object
+            doc.StartUndo()  # Start undo block
             shape = c4d.BaseObject(shape_type_id)
             if shape is None:
-                return {"error": f"Failed to create {shape_type} object"}
+                raise RuntimeError(f"Failed to create {shape_type} object")
 
-            # Set the name
-            original_name = name
-            shape.SetName(original_name)
+            shape.SetName(requested_name)
+            shape.SetAbsPos(c4d.Vector(*position))
 
-            # Set position if provided
-            if len(position) >= 3:
-                shape.SetAbsPos(
-                    c4d.Vector(
-                        float(position[0]), float(position[1]), float(position[2])
-                    )
-                )
+            child_objects_context = {}  # Store context for children
 
-            # Dictionary to track all created child objects
-            child_objects = {}
-
-            # For metaball and blob shapes, add a child sphere
+            # Add children based on type (using original logic)
             if shape_type in ["metaball", "blob"]:
-                # Log the child object creation
-                self.log(
-                    f"[C4D ABSTRCTSHAPE] Creating child sphere for {shape_type} object"
-                )
-
-                # Create sphere for the abstract shape
+                self.log(f"[C4D ABSTRCTSHAPE] Creating child sphere for {shape_type}")
                 sphere = c4d.BaseObject(c4d.Osphere)
-                if sphere is None:
-                    self.log(
-                        f"[C4D ABSTRCTSHAPE] ## Warning ##: Failed to create child sphere for {shape_type}"
+                if sphere:
+                    child_req_name = (
+                        f"{requested_name}_Sphere"  # Use requested name of parent
                     )
-                else:
-                    # Use a standardized naming pattern
-                    sphere_name = f"{original_name}_Sphere"
-                    sphere.SetName(sphere_name)
-
-                    # Configure the sphere using GetDataInstance for C4D 2025 compatibility
-                    sphere.SetAbsScale(c4d.Vector(2.0, 2.0, 2.0))
-
-                    # Use proper BaseContainer access
+                    sphere.SetName(child_req_name)
+                    sphere.SetAbsScale(c4d.Vector(2.0, 2.0, 2.0))  # Use floats
                     bc = sphere.GetDataInstance()
                     if bc:
-                        bc.SetFloat(c4d.PRIM_SPHERE_RAD, 50.0)
-
-                    # Insert under the parent shape
+                        bc.SetFloat(c4d.PRIM_SPHERE_RAD, 50.0)  # Use floats
                     sphere.InsertUnder(shape)
                     doc.AddUndo(c4d.UNDOTYPE_NEW, sphere)
-
-                    # Track this child object
-                    child_objects["sphere"] = {
-                        "name": sphere.GetName(),
-                        "id": str(sphere.GetGUID()),
-                        "type": "sphere",
+                    # Add child context
+                    child_actual_name = sphere.GetName()
+                    child_guid = str(sphere.GetGUID())
+                    child_objects_context["sphere"] = {
+                        "requested_name": child_req_name,
+                        "actual_name": child_actual_name,
+                        "guid": child_guid,
                     }
+                    self.register_object_name(sphere, child_req_name)  # Register child
+                else:
+                    self.log(f"Warning: Failed to create child sphere for {shape_type}")
 
             elif shape_type in ("loft", "sweep"):
                 self.log(
                     f"[C4D ABSTRCTSHAPE] Creating profile and path splines for {shape_type}"
                 )
-
-                # Create profile spline
-                # Use direct constants for maximum compatibility
                 spline = c4d.BaseObject(c4d.Osplinecircle)
                 path = c4d.BaseObject(c4d.Osplinenside)
 
-                if spline is None or path is None:
-                    self.log(
-                        f"[C4D ABSTRCTSHAPE] ## Warning ##: Failed to create profile or path splines for {shape_type}"
-                    )
-                else:
-                    # Use standardized naming patterns
-                    spline.SetName(f"{original_name}_Profile")
+                if spline:
+                    child_req_name = f"{requested_name}_Profile"
+                    spline.SetName(child_req_name)
                     spline.InsertUnder(shape)
                     doc.AddUndo(c4d.UNDOTYPE_NEW, spline)
+                    child_actual_name = spline.GetName()
+                    child_guid = str(spline.GetGUID())
+                    child_objects_context["profile"] = {
+                        "requested_name": child_req_name,
+                        "actual_name": child_actual_name,
+                        "guid": child_guid,
+                    }
+                    self.register_object_name(spline, child_req_name)
+                else:
+                    self.log("Warning: Failed to create profile spline")
 
-                    path.SetName(f"{original_name}_Path")
+                if path:
+                    child_req_name = f"{requested_name}_Path"
+                    path.SetName(child_req_name)
                     path.SetAbsPos(c4d.Vector(0, 50, 0))
                     path.InsertUnder(shape)
                     doc.AddUndo(c4d.UNDOTYPE_NEW, path)
-
-                # Track these child objects if they were created successfully
-                if spline is not None:
-                    child_objects["profile"] = {
-                        "name": spline.GetName(),
-                        "id": str(spline.GetGUID()),
-                        "type": "spline",
+                    child_actual_name = path.GetName()
+                    child_guid = str(path.GetGUID())
+                    child_objects_context["path"] = {
+                        "requested_name": child_req_name,
+                        "actual_name": child_actual_name,
+                        "guid": child_guid,
                     }
+                    self.register_object_name(path, child_req_name)
+                else:
+                    self.log("Warning: Failed to create path spline")
 
-                if path is not None:
-                    child_objects["path"] = {
-                        "name": path.GetName(),
-                        "id": str(path.GetGUID()),
-                        "type": "spline",
-                    }
-
+            # Insert the main shape object
             doc.InsertObject(shape)
             doc.AddUndo(c4d.UNDOTYPE_NEW, shape)
+            doc.EndUndo()  # End undo block
             c4d.EventAdd()
 
-            # Get actual name which may have been changed by Cinema 4D
+            # --- MODIFIED: Contextual Return ---
             actual_name = shape.GetName()
-            if actual_name != original_name:
-                self.log(
-                    f"[C4D ABSTRCTSHAPE] ## Warning ##: Cinema 4D renamed shape from '{original_name}' to '{actual_name}'"
-                )
+            guid = str(shape.GetGUID())
+            pos_vec = shape.GetAbsPos()
+            shape_type_name = self.get_object_type_name(shape)  # Get user friendly name
 
-            # Register the object for reliable lookup
-            self.register_object_name(shape, original_name)
+            # Register the main shape object
+            self.register_object_name(shape, requested_name)
 
-            # Return comprehensive information about created objects
             return {
                 "shape": {
-                    "name": actual_name,
-                    "requested_name": original_name,
-                    "id": str(shape.GetGUID()),
-                    "type": shape_type,
-                    "position": position,
-                    "child_objects": child_objects,  # Include information about all child objects
+                    "requested_name": requested_name,
+                    "actual_name": actual_name,
+                    "guid": guid,
+                    "type": shape_type_name,  # User friendly type
+                    "type_id": shape.GetType(),  # C4D ID
+                    "position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                    "child_objects": child_objects_context,  # Include context of children
                 }
             }
-        except Exception as e:
-            self.log(f"[C4D ABSTRCTSHAPE] Error creating abstract shape: {str(e)}")
-            import traceback
 
-            self.log(traceback.format_exc())
-            return {"error": f"Failed to create abstract shape: {str(e)}"}
+        except Exception as e:
+            doc.EndUndo()  # Ensure undo is ended on error
+            self.log(
+                f"[**ERROR**] Error creating abstract shape '{requested_name}': {str(e)}\n{traceback.format_exc()}"
+            )
+            # Clean up shape if created but not inserted
+            if shape and not shape.GetDocument():
+                try:
+                    shape.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Failed to create abstract shape: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def _find_by_guid_recursive(self, start_obj, guid):
         """Recursively search for an object with a specific GUID."""
@@ -3485,257 +4244,475 @@ class C4DSocketServer(threading.Thread):
         return all_objects
 
     def handle_create_light(self, command):
-        """Light creation with EXACT 2025.0 SDK parameters"""
+        """Light creation with context and EXACT 2025.0 SDK parameters"""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
+
         light_type = command.get("type", "spot").lower()
-        default_name = command.get("object_name")
+        # Use requested name or generate one
+        requested_name = (
+            command.get("name")
+            or command.get("object_name")
+            or f"MCP_{light_type.capitalize()}Light_{int(time.time()) % 1000}"
+        )
+        # Handle test harness name if provided
+        if not requested_name and command.get("from_test_harness"):
+            requested_name = "Test_Light"
 
-        # Verified from your script log and docs
-        LIGHT_TYPE_MAP = {
-            "point": 0,  # c4d.LIGHT_TYPE_OMNI
-            "spot": 1,  # c4d.LIGHT_TYPE_SPOT
-            "area": 8,  # c4d.LIGHT_TYPE_AREA
-            "infinite": 3,  # c4d.LIGHT_TYPE_DISTANT
-        }
+        position_list = command.get("position", [0, 100, 0])
+        color_list = command.get("color", [1, 1, 1])
+        intensity = command.get("intensity", 100)
+        temperature = command.get("temperature", 6500)
+        width = command.get("width", 200)
+        height = command.get("height", 200)
 
+        LIGHT_TYPE_MAP = {"point": 0, "spot": 1, "area": 8, "infinite": 3}
+        if light_type not in LIGHT_TYPE_MAP:
+            valid_types = ", ".join(LIGHT_TYPE_MAP.keys())
+            return {
+                "error": f"Invalid light type: '{light_type}'. Valid: {valid_types}"
+            }
+
+        light = None  # Initialize light variable
         try:
+            doc.StartUndo()  # Start undo block
             light = c4d.BaseObject(c4d.Olight)
             if not light:
-                return {"error": "Light creation failed"}
-
-            # Validate light type first
-            if light_type not in LIGHT_TYPE_MAP:
-                valid_types = ", ".join(LIGHT_TYPE_MAP.keys())
-                return {
-                    "error": f"Invalid light type: {light_type}. Valid: {valid_types}"
-                }
+                raise RuntimeError("Light creation failed")
 
             light_code = LIGHT_TYPE_MAP[light_type]
             light[c4d.LIGHT_TYPE] = light_code
+            light.SetName(requested_name)
+            self.log(
+                f"[C4D LIGHT] Set requested name '{requested_name}' before insertion."
+            )  # Log name set
 
-            # Core parameters (documented)
-            if not default_name:
-                # Use standardized test name if this is coming from test harness
-                if command.get("from_test_harness"):
-                    default_name = "Test_Light"
-                else:
-                    default_name = f"{light_type.capitalize()} Light"
+            # Safely set position, color, brightness
+            try:
+                light.SetAbsPos(c4d.Vector(*[float(x) for x in position_list[:3]]))
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid light position {position_list}")
+            try:
+                light[c4d.LIGHT_COLOR] = c4d.Vector(
+                    *[max(0.0, min(1.0, float(c))) for c in color_list[:3]]
+                )  # Clamp color 0-1
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid light color {color_list}")
+            try:
+                light[c4d.LIGHT_BRIGHTNESS] = max(
+                    0.0, float(intensity) / 100.0
+                )  # Clamp brightness >= 0
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid light intensity {intensity}")
 
-            light.SetName(default_name)
-            light.SetAbsPos(
-                c4d.Vector(
-                    *[float(x) for x in command.get("position", [0, 100, 0])[:3]]
-                )
-            )
-            light[c4d.LIGHT_COLOR] = c4d.Vector(
-                *[float(c) for c in command.get("color", [1, 1, 1])[:3]]
-            )
-            light[c4d.LIGHT_BRIGHTNESS] = (
-                float(command.get("intensity", 100)) / 100.0
-            )  # 0-1 range
-
-            # Temperature handling (only set if parameter exists)
+            # Temperature handling
             if hasattr(c4d, "LIGHT_TEMPERATURE"):
                 try:
-                    light[c4d.LIGHT_TEMPERATURE] = float(
-                        command.get("temperature", 6500)
-                    )
-                except:
-                    pass  # Silently fail if temperature is invalid
+                    light[c4d.LIGHT_TEMPERATURE] = int(float(temperature))
+                except (TypeError, ValueError):
+                    self.log(f"Warning: Invalid temperature '{temperature}'")
 
-            # Area light parameters (documented)
+            # Area light parameters
             if light_code == 8:  # Area light
-                light[c4d.LIGHT_AREADETAILS_SIZEX] = float(command.get("width", 200))
-                light[c4d.LIGHT_AREADETAILS_SIZEY] = float(command.get("height", 200))
-                light[c4d.LIGHT_AREADETAILS_SHAPE] = 0  # Rectangle
+                try:
+                    light[c4d.LIGHT_AREADETAILS_SIZEX] = max(
+                        0.0, float(width)
+                    )  # Ensure non-negative
+                except (ValueError, TypeError):
+                    self.log(f"Warning: Invalid area light width {width}")
+                try:
+                    light[c4d.LIGHT_AREADETAILS_SIZEY] = max(
+                        0.0, float(height)
+                    )  # Ensure non-negative
+                except (ValueError, TypeError):
+                    self.log(f"Warning: Invalid area light height {height}")
+                try:
+                    light[c4d.LIGHT_AREADETAILS_SHAPE] = 0  # Rectangle
+                except AttributeError:
+                    pass  # Ignore if param doesn't exist
 
-            # Shadow parameters (documented)
+            # Shadow parameters
             if hasattr(c4d, "LIGHT_SHADOWTYPE"):
-                light[c4d.LIGHT_SHADOWTYPE] = (
-                    1  # Soft shadows (c4d.LIGHT_SHADOWTYPE_SOFT)
-                )
+                try:
+                    light[c4d.LIGHT_SHADOWTYPE] = 1  # Soft shadows
+                except AttributeError:
+                    pass  # Ignore if param doesn't exist
 
             doc.InsertObject(light)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, light)  # Add undo for new light
+            doc.EndUndo()  # End undo block
             c4d.EventAdd()
 
+            # --- MODIFIED: Contextual Return ---
+            actual_name = light.GetName()
+            guid = str(light.GetGUID())
+            pos_vec = light.GetAbsPos()
+            light_type_name = self.get_object_type_name(light)  # Get user friendly name
+
+            # Register the light object
+            self.register_object_name(light, requested_name)
+
             return {
-                "success": True,
-                "type": light_type,
-                "temperature": (
-                    light[c4d.LIGHT_TEMPERATURE]
-                    if hasattr(c4d, "LIGHT_TEMPERATURE")
-                    else None
-                ),
-                "width": (
-                    light[c4d.LIGHT_AREADETAILS_SIZEX] if light_code == 8 else None
-                ),
-                "height": (
-                    light[c4d.LIGHT_AREADETAILS_SIZEY] if light_code == 8 else None
-                ),
+                "light": {  # Changed key from 'object' to 'light' for clarity
+                    "requested_name": requested_name,
+                    "actual_name": actual_name,
+                    "guid": guid,
+                    "type": light_type_name,  # User friendly type name
+                    "type_id": light.GetType(),  # C4D ID
+                    "position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                    # Optionally return other set properties for context
+                    "color_set": [
+                        light[c4d.LIGHT_COLOR].x,
+                        light[c4d.LIGHT_COLOR].y,
+                        light[c4d.LIGHT_COLOR].z,
+                    ],
+                    "intensity_set": light[c4d.LIGHT_BRIGHTNESS] * 100.0,
+                }
             }
 
         except Exception as e:
-            return {"error": f"Light creation failed: {str(e)}"}
+            doc.EndUndo()  # Ensure undo is ended on error
+            self.log(
+                f"[**ERROR**] Error creating light '{requested_name}': {str(e)}\n{traceback.format_exc()}"
+            )
+            # Clean up light if created but not inserted
+            if light and not light.GetDocument():
+                try:
+                    light.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Light creation failed: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def handle_create_camera(self, command):
-        """Create a new camera in the scene with optional properties."""
+        """Create a new camera in the scene with context and optional properties."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
 
-        # Get command values
-        name = command.get("name", "Camera")
-        position = command.get("position", [0, 0, 0])
-        properties = command.get("properties", {})  # Focal length, aperture, etc.
+        requested_name = command.get("name", "Camera")
+        position_list = command.get("position", [0, 0, 0])
+        properties = command.get("properties", {})
 
-        # Create the camera
-        camera = c4d.BaseObject(c4d.Ocamera)
-        camera.SetName(name)
+        # Safely parse position
+        position = [0.0, 0.0, 0.0]
+        if isinstance(position_list, list) and len(position_list) >= 3:
+            try:
+                position = [float(p) for p in position_list[:3]]
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid camera position data {position_list}")
 
-        # Set position
-        if isinstance(position, list) and len(position) >= 3:
+        camera = None  # Initialize camera variable
+        try:
+            doc.StartUndo()  # Start undo block
+            camera = c4d.BaseObject(c4d.Ocamera)
+            if not camera:
+                raise RuntimeError("Failed to create camera object")
+
+            camera.SetName(requested_name)
             camera.SetAbsPos(c4d.Vector(*position))
 
-        # Apply camera-specific properties if provided
-        if "focal_length" in properties:
-            camera[c4d.CAMERA_FOCUS] = float(properties["focal_length"])
-        if "aperture" in properties:
-            camera[c4d.CAMERA_APERTURE] = float(properties["aperture"])
-        if "film_offset_x" in properties:
-            camera[c4d.CAMERA_FILM_OFFSET_X] = float(properties["film_offset_x"])
-        if "film_offset_y" in properties:
-            camera[c4d.CAMERA_FILM_OFFSET_Y] = float(properties["film_offset_y"])
+            # Apply camera-specific properties safely
+            applied_properties = {}
+            bc = camera.GetDataInstance()
+            if bc:
+                if "focal_length" in properties:
+                    try:
+                        val = float(properties["focal_length"])
+                        # Use CAMERAOBJECT_FOCUS which is often the correct one, fallback to CAMERA_FOCUS
+                        focus_id = getattr(c4d, "CAMERAOBJECT_FOCUS", c4d.CAMERA_FOCUS)
+                        bc[focus_id] = val
+                        applied_properties["focal_length"] = val
+                    except (ValueError, TypeError, AttributeError) as e:
+                        self.log(
+                            f"Warning: Failed to set focal_length '{properties['focal_length']}': {e}"
+                        )
+                if "aperture" in properties:
+                    try:
+                        val = float(properties["aperture"])
+                        bc[c4d.CAMERAOBJECT_APERTURE] = val  # Use CAMERAOBJECT_APERTURE
+                        applied_properties["aperture"] = val
+                    except (ValueError, TypeError, AttributeError) as e:
+                        self.log(
+                            f"Warning: Failed to set aperture '{properties['aperture']}': {e}"
+                        )
+                if "film_offset_x" in properties:
+                    try:
+                        val = float(properties["film_offset_x"])
+                        bc[c4d.CAMERAOBJECT_FILM_OFFSET_X] = (
+                            val  # Use CAMERAOBJECT_FILM_OFFSET_X
+                        )
+                        applied_properties["film_offset_x"] = val
+                    except (ValueError, TypeError, AttributeError) as e:
+                        self.log(
+                            f"Warning: Failed to set film_offset_x '{properties['film_offset_x']}': {e}"
+                        )
+                if "film_offset_y" in properties:
+                    try:
+                        val = float(properties["film_offset_y"])
+                        bc[c4d.CAMERAOBJECT_FILM_OFFSET_Y] = (
+                            val  # Use CAMERAOBJECT_FILM_OFFSET_Y
+                        )
+                        applied_properties["film_offset_y"] = val
+                    except (ValueError, TypeError, AttributeError) as e:
+                        self.log(
+                            f"Warning: Failed to set film_offset_y '{properties['film_offset_y']}': {e}"
+                        )
+            else:
+                self.log(
+                    f"Warning: Could not get BaseContainer for camera '{requested_name}'"
+                )
 
-        # Insert into the scene
-        doc.InsertObject(camera)
-        doc.AddUndo(c4d.UNDOTYPE_NEW, camera)
-        doc.SetActiveObject(camera)
-        c4d.EventAdd()
+            # Insert into the scene
+            doc.InsertObject(camera)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, camera)
+            doc.SetActiveObject(camera)  # Make active by default
+            doc.EndUndo()  # End undo block
+            c4d.EventAdd()
 
-        self.log(f"[C4D] Created camera '{name}' at {position}")
+            self.log(f"[C4D] Created camera '{camera.GetName()}' at {position}")
 
-        return {
-            "camera": {
-                "name": name,
-                "position": position,
-                "focal_length": properties.get("focal_length"),
-                "aperture": properties.get("aperture"),
+            # --- MODIFIED: Contextual Return ---
+            actual_name = camera.GetName()
+            guid = str(camera.GetGUID())
+            pos_vec = camera.GetAbsPos()
+            camera_type_name = self.get_object_type_name(camera)
+
+            # Register the camera object
+            self.register_object_name(camera, requested_name)
+
+            return {
+                "camera": {
+                    "requested_name": requested_name,
+                    "actual_name": actual_name,
+                    "guid": guid,
+                    "type": camera_type_name,
+                    "type_id": camera.GetType(),
+                    "position": [pos_vec.x, pos_vec.y, pos_vec.z],
+                    "properties_applied": applied_properties,  # Show which optional props were set
+                }
             }
-        }
+
+        except Exception as e:
+            doc.EndUndo()  # Ensure undo ended
+            self.log(
+                f"[**ERROR**] Error creating camera '{requested_name}': {str(e)}\n{traceback.format_exc()}"
+            )
+            # Clean up camera if created but not inserted
+            if camera and not camera.GetDocument():
+                try:
+                    camera.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Failed to create camera: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def handle_animate_camera(self, command):
-        """Handle animate_camera command."""
+        """Handle animate_camera command with context."""
         doc = c4d.documents.GetActiveDocument()
-        camera_name = command.get("camera_name", "")
+        if not doc:
+            return {"error": "No active document"}
+
+        # Identify target camera ---
+        identifier = None
+        use_guid = False
+        if command.get("guid"):  # Check for GUID first
+            identifier = command.get("guid")
+            use_guid = True
+            self.log(f"[ANIM CAM] Using GUID identifier: '{identifier}'")
+        elif command.get("camera_name"):
+            identifier = command.get("camera_name")
+            use_guid = False
+            self.log(f"[ANIM CAM] Using Name identifier: '{identifier}'")
+
         path_type = command.get("path_type", "linear").lower()
         positions = command.get("positions", [])
         frames = command.get("frames", [])
         create_camera = command.get("create_camera", False)
-        camera_properties = command.get("camera_properties", {})
+        camera_properties = command.get("camera_properties", {})  # e.g., focal_length
 
+        camera = None
+        camera_created = False
+        requested_name = (
+            identifier if identifier else "Animated Camera"
+        )  # Use identifier as requested name if provided
+
+        # Find existing camera if identifier provided and not creating new
+        if identifier and not create_camera:
+            camera = self.find_object_by_name(doc, identifier, use_guid=use_guid)
+            if camera and camera.GetType() != c4d.Ocamera:
+                self.log(
+                    f"Warning: Object '{identifier}' found but is not a camera. Will create new."
+                )
+                camera = None  # Force creation
+            elif camera is None:
+                search_type = "GUID" if use_guid else "Name"
+                self.log(
+                    f"Info: Camera '{identifier}' (searched by {search_type}) not found, will create a new one."
+                )
+
+        # Create camera if needed
+        if camera is None:
+            doc.StartUndo()  # Start undo if creating
+            camera = c4d.BaseObject(c4d.Ocamera)
+            if not camera:
+                return {"error": "Failed to create camera object"}
+
+            camera.SetName(requested_name)  # Use requested name
+            self.log(f"[ANIM CAM] Created new camera: {camera.GetName()}")
+            camera_created = True
+
+            # Apply properties if provided (using original logic, ensure safety)
+            applied_properties = {}
+            bc = camera.GetDataInstance()
+            if bc:
+                if "focal_length" in camera_properties:
+                    try:
+                        val = float(camera_properties["focal_length"])
+                        focus_id = getattr(c4d, "CAMERAOBJECT_FOCUS", c4d.CAMERA_FOCUS)
+                        bc[focus_id] = val
+                        applied_properties["focal_length"] = val
+                    except (ValueError, TypeError, AttributeError) as e:
+                        self.log(f"Warning: Failed to set focal_length: {e}")
+                if "aperture" in camera_properties:
+                    try:
+                        val = float(camera_properties["aperture"])
+                        bc[c4d.CAMERAOBJECT_APERTURE] = val
+                        applied_properties["aperture"] = val
+                    except (ValueError, TypeError, AttributeError) as e:
+                        self.log(f"Warning: Failed to set aperture: {e}")
+                # Add other properties as needed...
+
+            doc.InsertObject(camera)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, camera)
+            doc.SetActiveObject(camera)  # Make active
+            # Register the newly created camera
+            self.register_object_name(camera, requested_name)
+            doc.EndUndo()  # End undo block for creation
+        else:
+            self.log(f"[ANIM CAM] Using existing camera: '{camera.GetName()}'")
+
+        # --- Animation Logic ---
         try:
-            # Log the command for debugging purposes
-            self.log(
-                f"[C4D LIGHT] Animate camera command: path_type={path_type}, camera={camera_name}, positions={len(positions)}, frames={len(frames)}"
-            )
-
-            camera = None
-            if camera_name:
-                camera = self.find_object_by_name(doc, camera_name)
-                if camera is None:
-                    self.log(
-                        f"[C4D LIGHT] Camera '{camera_name}' not found, will create a new one"
-                    )
-
-                    # List existing cameras to help with debugging
-                    existing_cameras = []
-                    obj = doc.GetFirstObject()
-                    while obj:
-                        if obj.GetType() == c4d.Ocamera:
-                            existing_cameras.append(obj.GetName())
-                        obj = obj.GetNext()
-
-                    if existing_cameras:
-                        self.log(
-                            f"[C4D LIGHT] Available cameras: {', '.join(existing_cameras)}"
-                        )
-                    else:
-                        self.log("[C4D LIGHT] No cameras found in the scene")
-
-            if camera is None or create_camera:
-                camera = c4d.BaseObject(c4d.Ocamera)
-                camera.SetName(camera_name or "Animated Camera")
-                self.log(f"[C4D LIGHT] Created new camera: {camera.GetName()}")
-
-                if "focal_length" in camera_properties and isinstance(
-                    camera_properties["focal_length"], (int, float)
-                ):
-                    camera[c4d.CAMERA_FOCUS] = float(camera_properties["focal_length"])
-                if "aperture" in camera_properties and isinstance(
-                    camera_properties["aperture"], (int, float)
-                ):
-                    camera[c4d.CAMERA_APERTURE] = float(camera_properties["aperture"])
-                if "film_offset_x" in camera_properties and isinstance(
-                    camera_properties["film_offset_x"], (int, float)
-                ):
-                    camera[c4d.CAMERA_FILM_OFFSET_X] = float(
-                        camera_properties["film_offset_x"]
-                    )
-                if "film_offset_y" in camera_properties and isinstance(
-                    camera_properties["film_offset_y"], (int, float)
-                ):
-                    camera[c4d.CAMERA_FILM_OFFSET_Y] = float(
-                        camera_properties["film_offset_y"]
-                    )
-
-                doc.InsertObject(camera)
-                doc.AddUndo(c4d.UNDOTYPE_NEW, camera)
-                doc.SetActiveObject(camera)
+            doc.StartUndo()  # Start undo for animation changes
 
             # Add default frames if only positions are provided
             if positions and not frames:
-                frames = list(range(len(positions)))
+                frames = list(range(len(positions)))  # Simple frame sequence
 
             if not positions or not frames or len(positions) != len(frames):
-                return {
-                    "error": "Invalid positions or frames data. They must be arrays of equal length."
-                }
+                # Allow animation types without positions/frames? e.g. wiggle?
+                if path_type not in ["wiggle"]:  # Add other position-less types here
+                    doc.EndUndo()  # End undo as nothing happened yet
+                    return {
+                        "error": f"Invalid positions/frames data for animation type '{path_type}'. They must be arrays of equal length."
+                    }
+                else:
+                    self.log(
+                        f"Info: No position/frame data provided for '{path_type}', proceeding if type supports it."
+                    )
 
-            # Set keyframes for camera positions.
-            for pos, frame in zip(positions, frames):
-                if len(pos) >= 3:
-                    self._set_position_keyframe(camera, frame, pos)
+            keyframe_count = 0
+            frame_range_set = []
 
-            # If a spline path is requested.
-            if path_type == "spline" and len(positions) > 1:
+            # Set keyframes for camera positions if provided
+            if positions and frames:
+                for pos, frame in zip(positions, frames):
+                    if isinstance(pos, list) and len(pos) >= 3:
+                        # Use internal helper which already includes AddUndo
+                        if self._set_position_keyframe(camera, frame, pos):
+                            keyframe_count += 1
+                    else:
+                        self.log(
+                            f"Warning: Skipping invalid position data {pos} for frame {frame}"
+                        )
+                if frames:
+                    frame_range_set = [min(frames), max(frames)]
+
+            # Handle spline path if requested and positions available
+            path_guid = None  # Store GUID of created path
+            if path_type in ["spline", "spline_oriented"] and len(positions) > 1:
+                self.log("[ANIM CAM] Creating spline path and alignment tag.")
                 path = c4d.BaseObject(c4d.Ospline)
                 path.SetName(f"{camera.GetName()} Path")
                 points = [
-                    c4d.Vector(p[0], p[1], p[2]) for p in positions if len(p) >= 3
+                    c4d.Vector(p[0], p[1], p[2])
+                    for p in positions
+                    if isinstance(p, list) and len(p) >= 3
                 ]
-                path.ResizeObject(len(points))
-                for i, pt in enumerate(points):
-                    path.SetPoint(i, pt)
-                doc.InsertObject(path)
-                doc.AddUndo(c4d.UNDOTYPE_NEW, path)
+                if not points:
+                    self.log("Warning: No valid points for spline path creation.")
+                else:
+                    path.ResizeObject(len(points))
+                    for i, pt in enumerate(points):
+                        path.SetPoint(i, pt)
 
-                align_to_path = path_type == "spline_oriented"
-                path_tag = c4d.BaseTag(c4d.Talignment)
-                path_tag[c4d.ALIGNMENTOBJECT_LINK] = path
-                path_tag[c4d.ALIGNMENTOBJECT_ALIGN] = align_to_path
-                camera.InsertTag(path_tag)
-                doc.AddUndo(c4d.UNDOTYPE_NEW, path_tag)
+                    doc.InsertObject(path)  # Insert path into scene
+                    doc.AddUndo(c4d.UNDOTYPE_NEW, path)
+                    path_guid = str(path.GetGUID())  # Get GUID after insertion
+                    self.register_object_name(
+                        path, path.GetName()
+                    )  # Register the path spline
 
+                    # Create and apply Align to Spline tag
+                    align_tag = camera.MakeTag(c4d.Talignspline)  # Use Talignspline
+                    if align_tag:
+                        align_tag[c4d.ALIGNTOSPLINETAG_LINK] = (
+                            path  # Link the path object
+                        )
+                        # Set Tangential if spline_oriented? Check specific tag params if needed.
+                        # align_tag[c4d.ALIGNTOSPLINETAG_TANGENTIAL] = (path_type == "spline_oriented")
+                        doc.AddUndo(c4d.UNDOTYPE_NEW, align_tag)  # Add undo for new tag
+                        self.log("Applied Align to Spline tag.")
+                    else:
+                        self.log("Warning: Failed to create Align to Spline tag.")
+
+            # Handle other animation types (like wiggle) if needed here...
+            # elif path_type == "wiggle":
+            #    # Apply wiggle expression or tag... (Requires specific implementation)
+            #    self.log("Info: Wiggle animation type not fully implemented in this version.")
+
+            doc.EndUndo()  # End undo block for animation changes
             c4d.EventAdd()
 
-            return {
-                "camera_animation": {
-                    "camera": camera.GetName(),
-                    "path_type": path_type,
-                    "keyframe_count": len(positions),
-                    "frame_range": [min(frames), max(frames)],
-                }
+            # --- MODIFIED: Contextual Return ---
+            actual_camera_name = camera.GetName()
+            camera_guid = str(camera.GetGUID())
+
+            response_data = {
+                "requested_name": requested_name,  # Name used to find/create
+                "actual_name": actual_camera_name,  # Final name
+                "guid": camera_guid,
+                "camera_created": camera_created,  # Was it created by this call?
+                "path_type": path_type,
+                "keyframe_count": keyframe_count,
+                "frame_range_set": frame_range_set,  # Frames actually keyframed
+                "spline_path_guid": path_guid,  # GUID of path spline if created
+                # "properties_applied": applied_properties if camera_created else {}, # Properties set during creation
             }
+
+            return {"camera_animation": response_data}  # Keep original top-level key
+
         except Exception as e:
-            return {"error": f"Failed to animate camera: {str(e)}"}
+            doc.EndUndo()  # Ensure undo ended
+            self.log(
+                f"[**ERROR**] Error animating camera '{requested_name}': {str(e)}\n{traceback.format_exc()}"
+            )
+            # Clean up camera if created but not inserted
+            if camera and not camera.GetDocument():
+                try:
+                    camera.Remove()
+                except:
+                    pass
+            return {
+                "error": f"Failed to animate camera: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
     def _get_redshift_material_id(self):
         """Detect Redshift material ID by examining existing materials.
@@ -3898,7 +4875,11 @@ class C4DSocketServer(threading.Thread):
                 )
 
                 # Check for common Redshift module attributes
-                for attr in ["Mmaterial", "MATERIAL_TYPE", "GetRSMaterialNodeSpace"]:
+                for attr in [
+                    "Mmaterial",
+                    "MATERIAL_TYPE",
+                    "GetRSMaterialNodeSpace",
+                ]:
                     has_attr = hasattr(redshift, attr)
                     self.log(
                         f"[C4D] DIAGNOSTIC: Redshift module has '{attr}': {has_attr}"
@@ -4265,559 +5246,636 @@ class C4DSocketServer(threading.Thread):
             }
 
     def handle_create_material(self, command):
-        """Handle create_material command with proper NodeMaterial support for Redshift."""
+        """Handle create_material command with context and proper NodeMaterial support for Redshift."""
         doc = c4d.documents.GetActiveDocument()
-        name = command.get("name") or command.get("material_name") or "New Material"
-        color = command.get("color", [1, 1, 1])
+        if not doc:
+            return {"error": "No active document"}
+
+        requested_name = (
+            command.get("name") or command.get("material_name") or "New Material"
+        )
+        color_list = command.get("color", [1.0, 1.0, 1.0])  # Default to white
         properties = command.get("properties", {})
-        material_type = command.get("material_type", "standard")  # standard, redshift
-        procedural = command.get("procedural", False)
-        shader_type = command.get("shader_type", "noise")
+        material_type = command.get(
+            "material_type", "standard"
+        ).lower()  # standard, redshift
+        procedural = command.get(
+            "procedural", False
+        )  # Currently only affects Redshift in this example
+        shader_type = command.get(
+            "shader_type", "noise"
+        )  # Used if procedural=True for Redshift
 
-        self.log(f"[C4D] Starting material creation: {name}, type: {material_type}")
+        # Safely parse color
+        color = [1.0, 1.0, 1.0]
+        if isinstance(color_list, list) and len(color_list) >= 3:
+            try:
+                color = [
+                    max(0.0, min(1.0, float(c))) for c in color_list[:3]
+                ]  # Clamp 0-1
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid color data {color_list}")
 
-        # Set default result
+        self.log(
+            f"[C4D] Starting material creation: Name='{requested_name}', Type='{material_type}'"
+        )
+
         mat = None
-        material_id = f"mat_{name}_{int(time.time())}"
-        success = False
         has_redshift = False
         redshift_plugin_id = None
+        rs_mat_id_used = None  # Store the ID actually used for RS material
 
         try:
-            # DIAGNOSTIC STEP 1: Check for Redshift plugin
-            self.log("[C4D] Checking for Redshift plugin availability...")
+            # Check for Redshift plugin
             plugins = c4d.plugins.FilterPluginList(c4d.PLUGINTYPE_MATERIAL, True)
-            self.log(f"[C4D] Found {len(plugins)} material plugins")
-
             for plugin in plugins:
-                plugin_name = plugin.GetName()
-                plugin_id = plugin.GetID()
-                self.log(f"[C4D] Material plugin: {plugin_name} (ID: {plugin_id})")
-
-                if "redshift" in plugin_name.lower():
+                if "redshift" in plugin.GetName().lower():
                     has_redshift = True
-                    redshift_plugin_id = plugin_id
+                    redshift_plugin_id = plugin.GetID()
                     self.log(
-                        f"[C4D] Found Redshift plugin: {plugin_name} (ID: {plugin_id})"
+                        f"[C4D] Found Redshift plugin: {plugin.GetName()} (ID: {plugin_id})"
                     )
+                    break  # Found it
 
             if material_type == "redshift" and not has_redshift:
                 self.log(
-                    "[C4D] ## Warning ##: Redshift requested but not found in plugins. Using standard material."
+                    "[C4D] ## Warning ##: Redshift requested but not found. Using standard material."
                 )
                 material_type = "standard"
 
-            # STEP 2: Create the material based on type
-            if material_type == "redshift" and has_redshift:
-                self.log(
-                    "[C4D] Creating Redshift material using NodeMaterial approach..."
-                )
-                # Try multiple methods for creating Redshift material, preferring NodeMaterial
-                redshift_material_created = False
+            doc.StartUndo()  # Start undo block
 
-                # Using R2025.1 SDK approach for creating Redshift NodeMaterial
+            # Create material based on type
+            if material_type == "redshift":
+                self.log("[C4D] Attempting Redshift material creation...")
                 try:
-                    self.log(
-                        "[C4D] Creating Redshift material using R2025.1 SDK approach"
-                    )
-
                     # Determine the Redshift material ID to use
-                    rs_id = 1036224  # Default known Redshift material ID
+                    rs_id = getattr(
+                        c4d, "ID_REDSHIFT_MATERIAL", redshift_plugin_id or 1036224
+                    )  # Prefer constant, then plugin, then default
+                    rs_mat_id_used = rs_id  # Store the ID we are trying
+                    self.log(f"[C4D] Using Redshift Material ID: {rs_id}")
 
-                    if hasattr(c4d, "ID_REDSHIFT_MATERIAL"):
-                        rs_id = c4d.ID_REDSHIFT_MATERIAL
-                        self.log(f"[C4D] Using c4d.ID_REDSHIFT_MATERIAL: {rs_id}")
-                    elif redshift_plugin_id is not None:
-                        rs_id = redshift_plugin_id
-                        self.log(f"[C4D] Using detected plugin ID: {rs_id}")
-                    else:
-                        self.log(f"[C4D] Using default Redshift ID: {rs_id}")
-
-                    # Step 1: Create a material with the Redshift Material ID
                     mat = c4d.BaseMaterial(rs_id)
+                    if not mat or mat.GetType() != rs_id:
+                        raise RuntimeError(f"Failed to create material with ID {rs_id}")
 
-                    if not mat:
-                        raise RuntimeError("Failed to create base Redshift material")
+                    mat.SetName(requested_name)
+                    self.log(f"[C4D] Base Redshift material created: '{mat.GetName()}'")
 
-                    # Set the name immediately
-                    mat.SetName(name)
-
-                    # Verify we got a valid Redshift material
-                    if mat and mat.GetType() == rs_id:
-                        self.log(
-                            f"[C4D] Successfully created Redshift material, type: {mat.GetType()}"
-                        )
-                        redshift_material_created = True
-                        material_type = "redshift"
-                        success = True
-                    else:
-                        self.log("[C4D] Failed to create valid Redshift material")
-                        material_type = "standard"
-
-                except Exception as e:
-                    self.log(f"[C4D] Redshift material creation error: {str(e)}")
-                    import traceback
-
-                    traceback.print_exc()
-                    material_type = "standard"
-
-                # If we have a Redshift material at this point, set up its node graph
-                if redshift_material_created and mat:
+                    # Setup node graph using maxon API (R20+)
                     try:
-                        self.log("[C4D] Setting up Redshift node graph...")
-                        mat.SetName(name)
-                        material_type = "redshift"
-                        success = True
-
-                        # Import maxon module for node material handling
                         import maxon
 
-                        # Get the Redshift node space ID
                         redshift_ns = maxon.Id(
                             "com.redshift3d.redshift4c4d.class.nodespace"
                         )
+                        node_mat = c4d.NodeMaterial(mat)  # Wrap in NodeMaterial
+                        if not node_mat:
+                            raise RuntimeError("Failed to create NodeMaterial wrapper")
 
-                        # Create default graph (includes Standard material node)
-                        self.log(
-                            "[C4D] Creating default node graph for Redshift material"
-                        )
-                        try:
-                            # Step 2: Properly initialize as a NodeMaterial (R2025.1 approach)
-                            # This is critical as per the R2025.1 SDK documentation
-                            node_mat = c4d.NodeMaterial(mat)
-                            if not node_mat:
-                                raise RuntimeError(
-                                    "Failed to create NodeMaterial wrapper"
-                                )
+                        # Create default graph if it doesn't exist
+                        if not node_mat.HasSpace(redshift_ns):
+                            graph = node_mat.CreateDefaultGraph(redshift_ns)
+                            self.log("[C4D] Created default Redshift node graph")
+                        else:
+                            graph = node_mat.GetGraph(redshift_ns)
+                            self.log("[C4D] Using existing Redshift node graph")
 
-                            # Step 3: Create the default graph using the NodeMaterial
-                            if not node_mat.HasSpace(redshift_ns):
-                                graph = node_mat.CreateDefaultGraph(redshift_ns)
-                                self.log("[C4D] Created default Redshift node graph")
-                            else:
-                                graph = node_mat.GetGraph(redshift_ns)
-                                self.log("[C4D] Using existing Redshift node graph")
-
-                            # Important: Update our reference to use the NodeMaterial
-                            mat = node_mat
-
-                            # Find the Standard Surface material node to set color
-                            if len(color) >= 3 and graph:
-                                root = graph.GetViewRoot()
-                                if root:
-                                    # Try to find Standard Surface node
-                                    for node in graph.GetNodes():
-                                        node_id = node.GetId()
-                                        if "StandardMaterial" in node_id:
-                                            self.log(
-                                                f"[C4D] Found StandardMaterial node: {node_id}"
-                                            )
-                                            try:
-                                                # Set base color parameter
-                                                node.SetParameter(
-                                                    maxon.nodes.ParameterID(
-                                                        "base_color"
-                                                    ),
-                                                    maxon.Color(
-                                                        color[0], color[1], color[2]
-                                                    ),
-                                                    maxon.PROPERTYFLAGS_NONE,
-                                                )
-                                                self.log(
-                                                    f"[C4D] Set color: [{color[0]}, {color[1]}, {color[2]}]"
-                                                )
-                                            except Exception as e:
-                                                self.log(
-                                                    f"[**ERROR**] Error setting node color: {str(e)}"
-                                                )
-                                            break
-                        except Exception as e:
-                            self.log(
-                                f"[**ERROR**] Error setting up Redshift node graph: {str(e)}"
+                        if not graph:
+                            raise RuntimeError(
+                                "Failed to get or create Redshift node graph"
                             )
-                    except ImportError as e:
-                        self.log(f"[**ERROR**] Error importing maxon module: {str(e)}")
-                        # Continue with basic material without node graph
-                else:
-                    self.log(
-                        "[C4D] All Redshift material creation methods failed, switching to standard"
-                    )
-                    material_type = "standard"
 
-            # Create a standard material if needed
-            if material_type == "standard" or not mat:
+                        # Find StandardMaterial node and set base color
+                        standard_mat_node = None
+                        for node in graph.GetNodes():
+                            if "StandardMaterial" in node.GetId():
+                                standard_mat_node = node
+                                break
+
+                        if standard_mat_node:
+                            try:
+                                standard_mat_node.SetParameter(
+                                    maxon.nodes.ParameterID("base_color"),
+                                    maxon.Color(*color),
+                                    maxon.PROPERTYFLAGS_NONE,
+                                )
+                                self.log(f"[C4D] Set Redshift base_color to {color}")
+                            except Exception as e_node:
+                                self.log(
+                                    f"Warning: Failed to set Redshift base_color: {e_node}"
+                                )
+                        else:
+                            self.log(
+                                "Warning: Could not find StandardMaterial node in Redshift graph to set color."
+                            )
+
+                    except ImportError:
+                        self.log(
+                            "Warning: 'maxon' module not found, cannot configure Redshift nodes."
+                        )
+                    except Exception as e_node_setup:
+                        self.log(
+                            f"Warning: Error setting up Redshift node graph: {e_node_setup}"
+                        )
+
+                except Exception as e_rs:
+                    self.log(
+                        f"[**ERROR**] Redshift material creation failed: {e_rs}\n{traceback.format_exc()}. Falling back to standard."
+                    )
+                    material_type = "standard"  # Fallback flag
+                    mat = None  # Reset mat so standard creation runs
+
+            # Create a standard material if needed (or if RS failed)
+            if material_type == "standard":
                 self.log("[C4D] Creating standard material")
                 mat = c4d.BaseMaterial(c4d.Mmaterial)
-                mat.SetName(name)
-                material_type = "standard"
-                success = True
+                if not mat:
+                    raise RuntimeError("Failed to create standard material")
+                mat.SetName(requested_name)
 
-            # Set base properties for the material (if standard)
-            if material_type == "standard":
-                # Standard material properties
-                if len(color) >= 3:
-                    color_vector = c4d.Vector(color[0], color[1], color[2])
-                    mat[c4d.MATERIAL_COLOR_COLOR] = color_vector
+                # Set standard material properties
+                mat[c4d.MATERIAL_COLOR_COLOR] = c4d.Vector(*color)  # Set color
 
-                # Apply additional properties
+                # Apply additional standard properties if provided
                 if (
                     "specular" in properties
                     and isinstance(properties["specular"], list)
                     and len(properties["specular"]) >= 3
                 ):
-                    spec = properties["specular"]
-                    mat[c4d.MATERIAL_SPECULAR_COLOR] = c4d.Vector(
-                        spec[0], spec[1], spec[2]
-                    )
+                    try:
+                        mat[c4d.MATERIAL_SPECULAR_COLOR] = c4d.Vector(
+                            *[float(s) for s in properties["specular"][:3]]
+                        )
+                    except (ValueError, TypeError):
+                        self.log(
+                            f"Warning: Invalid specular color value {properties['specular']}"
+                        )
+                if "reflection" in properties:
+                    try:
+                        mat[c4d.MATERIAL_REFLECTION_BRIGHTNESS] = max(
+                            0.0, float(properties["reflection"])
+                        )  # Clamp >= 0
+                    except (ValueError, TypeError):
+                        self.log(
+                            f"Warning: Invalid reflection value {properties['reflection']}"
+                        )
 
-                if "reflection" in properties and isinstance(
-                    properties["reflection"], (int, float)
-                ):
-                    mat[c4d.MATERIAL_REFLECTION_BRIGHTNESS] = float(
-                        properties["reflection"]
-                    )
+            if not mat:  # Final check if creation failed completely
+                raise RuntimeError("Material creation failed for unknown reason.")
 
             # Insert material into document
             doc.InsertMaterial(mat)
-            doc.AddUndo(c4d.UNDOTYPE_NEW, mat)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, mat)  # Add undo step
+            doc.EndUndo()  # End undo block
             c4d.EventAdd()
 
-            # Determine material color for response
-            if material_type == "redshift":
-                material_color = color  # Use requested color
-            else:
-                material_color = [
-                    mat[c4d.MATERIAL_COLOR_COLOR].x,
-                    mat[c4d.MATERIAL_COLOR_COLOR].y,
-                    mat[c4d.MATERIAL_COLOR_COLOR].z,
-                ]
+            # --- MODIFIED: Contextual Return ---
+            actual_name = mat.GetName()
+            mat_type_id = mat.GetType()
+            final_material_type = (
+                "redshift" if mat_type_id == rs_mat_id_used else "standard"
+            )  # Determine final type based on actual ID
+
+            # Get final color (might differ if RS nodes failed)
+            final_color = color  # Default to requested
+            if final_material_type == "standard":
+                try:
+                    final_color = [
+                        mat[c4d.MATERIAL_COLOR_COLOR].x,
+                        mat[c4d.MATERIAL_COLOR_COLOR].y,
+                        mat[c4d.MATERIAL_COLOR_COLOR].z,
+                    ]
+                except:
+                    pass  # Keep requested color if read fails
 
             self.log(
-                f"[C4D] Material created successfully: {name}, type: {material_type}, ID: {mat.GetType()}"
+                f"[C4D] Material created successfully: Name='{actual_name}', Type='{final_material_type}', ID={mat_type_id}"
             )
 
+            # Note: Materials don't have GUIDs in the same way as objects, so we don't register them.
+            # We return info based on the final state.
             return {
                 "material": {
-                    "name": mat.GetName(),  # Exact Cinema 4D material name
-                    "id": material_id,  # Internal ID
-                    "color": material_color,  # Material color (RGB)
-                    "type": material_type,  # "standard" or "redshift"
-                    "material_type_id": mat.GetType(),  # Actual material type ID
-                    "procedural": procedural if material_type == "redshift" else False,
-                    "redshift_available": has_redshift,  # Helps client know if Redshift is available
+                    "requested_name": requested_name,
+                    "actual_name": actual_name,
+                    "type": final_material_type,  # Report actual type created
+                    "color_set": final_color,  # Report the final color state if possible
+                    "type_id": mat_type_id,
+                    "redshift_available": has_redshift,
+                    # Add any other relevant context about properties set
                 }
             }
 
         except Exception as e:
-            error_msg = f"Failed to create material: {str(e)}"
-            self.log(f"[C4D] {error_msg}")
-            return {"error": error_msg}
+            doc.EndUndo()  # Ensure undo ended
+            error_msg = f"Failed to create material '{requested_name}': {str(e)}"
+            self.log(f"[**ERROR**] {error_msg}\n{traceback.format_exc()}")
+            # Clean up material if created but not inserted
+            if mat and not mat.GetDocument():
+                try:
+                    mat.Remove()
+                except:
+                    pass
+            return {"error": error_msg, "traceback": traceback.format_exc()}
+
+    def handle_render_frame(
+        self, command
+    ):  # Renamed from handle_render_to_file to match command key
+        """Render the current frame to a file, using adapted core logic."""
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
+
+        output_path = command.get("output_path")
+        width = int(command.get("width", 640))
+        height = int(command.get("height", 360))
+        # Frame handling - default to current frame if not specified
+        frame = command.get("frame")
+        if frame is None:
+            frame = doc.GetTime().GetFrame(doc.GetFps())
+        else:
+            try:
+                frame = int(frame)
+            except (ValueError, TypeError):
+                self.log(f"Warning: Invalid frame value '{frame}', using current.")
+                frame = doc.GetTime().GetFrame(doc.GetFps())
+
+        self.log(
+            f"[RENDER FRAME] Request: frame={frame}, size={width}x{height}, path={output_path}"
+        )
+
+        # Ensure output path is valid and directory exists
+        if not output_path:
+            doc_name = os.path.splitext(doc.GetDocumentName() or "Untitled")[0]
+            fallback_dir = doc.GetDocumentPath() or os.path.join(
+                os.path.expanduser("~"), "Desktop"
+            )  # Fallback to desktop
+            output_path = os.path.join(
+                fallback_dir, f"{doc_name}_render_{frame:04d}.png"
+            )
+            self.log(
+                f"[RENDER FRAME] No output path provided, using fallback: {output_path}"
+            )
+        else:
+            output_path = os.path.normpath(os.path.expanduser(output_path))
+
+        output_dir = os.path.dirname(output_path)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            return {"error": f"Cannot create output directory '{output_dir}': {e}"}
+
+        # Determine format from extension (Default to PNG)
+        ext = os.path.splitext(output_path)[1].lower()
+        format_map = {
+            ".png": c4d.FILTER_PNG,
+            ".jpg": c4d.FILTER_JPG,
+            ".jpeg": c4d.FILTER_JPG,
+            ".tif": c4d.FILTER_TIF,
+            ".tiff": c4d.FILTER_TIF,
+        }
+        format_id = format_map.get(ext, c4d.FILTER_PNG)
+        if format_id == c4d.FILTER_PNG and ext not in format_map:
+            output_path = os.path.splitext(output_path)[0] + ".png"
+            format_id = c4d.FILTER_PNG
+            self.log(
+                f"Warning: Unsupported output extension '{ext}', defaulting to PNG: {output_path}"
+            )
+
+        # --- Execute render task on main thread ---
+        def render_task():
+            bmp = None
+            render_duration = 0.0
+            original_rd = None  # Keep track of original RD
+            rd_clone = None  # Keep track of clone RD
+            temp_rd_inserted = False
+            try:
+                # --- Start Core Logic Adaptation ---
+                if not doc:
+                    return {"error": "No active document (in render_task)"}
+                active_draw = doc.GetActiveBaseDraw()
+                if not active_draw:
+                    return {"error": "No active BaseDraw (in render_task)"}
+                active_camera = (
+                    active_draw.GetSceneCamera(doc) or active_draw.GetEditorCamera()
+                )
+                if not active_camera:
+                    return {"error": "No active camera (in render_task)"}
+
+                original_rd = doc.GetActiveRenderData()
+                if not original_rd:
+                    return {"error": "No active RenderData (in render_task)"}
+                rd_clone = original_rd.GetClone(c4d.COPYFLAGS_NONE)
+                if not rd_clone:
+                    return {"error": "RenderData clone failed (in render_task)"}
+
+                settings = rd_clone.GetDataInstance()
+                if not settings:
+                    raise RuntimeError("Failed to get settings instance")
+
+                settings[c4d.RDATA_XRES] = float(width)
+                settings[c4d.RDATA_YRES] = float(height)
+                settings[c4d.RDATA_FRAMESEQUENCE] = c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
+                settings[c4d.RDATA_SAVEIMAGE] = False  # Render to bitmap, not auto-save
+
+                doc.InsertRenderData(rd_clone)
+                temp_rd_inserted = True
+                doc.SetActiveRenderData(rd_clone)
+
+                target_time = c4d.BaseTime(frame, doc.GetFps())
+                doc.SetTime(target_time)
+                # --- ExecutePasses Call ---
+                doc.ExecutePasses(
+                    None, True, True, True, c4d.BUILDFLAGS_NONE
+                )  # Use None instead of active_draw
+
+                bmp = c4d.bitmaps.BaseBitmap()  # Use BaseBitmap
+                if (
+                    not bmp
+                    or bmp.Init(int(width), int(height), 24) != c4d.IMAGERESULT_OK
+                ):  # Use int() for dimensions
+                    raise MemoryError(f"Bitmap Init failed ({width}x{height})")
+
+                render_flags = (
+                    c4d.RENDERFLAGS_EXTERNAL
+                    | c4d.RENDERFLAGS_SHOWERRORS
+                    | c4d.RENDERFLAGS_NODOCUMENTCLONE
+                    | 0x00040000
+                )
+                start_time = time.time()
+                result_code = c4d.documents.RenderDocument(
+                    doc, settings, bmp, render_flags, None
+                )
+                render_duration = time.time() - start_time
+
+                if result_code != c4d.RENDERRESULT_OK:
+                    err_str = self._render_code_to_str(result_code)
+                    last_c4d_err = c4d.GetLastError()
+                    if last_c4d_err:
+                        err_str += f" (GetLastError: {last_c4d_err})"
+                    raise RuntimeError(f"RenderDocument failed: {err_str}")
+
+                # Save the resulting bitmap to file
+                self.log(
+                    f"[RENDER FRAME] Saving bitmap to: {output_path} (Format ID: {format_id})"
+                )
+                save_result = bmp.Save(output_path, format_id)
+                if save_result == c4d.IMAGERESULT_OK:
+                    self.log(f"[RENDER FRAME] Bitmap saved successfully.")
+                    return {
+                        "success": True,
+                        "output_path": output_path,
+                        "width": width,
+                        "height": height,
+                        "frame": frame,
+                        "render_time": render_duration,
+                        "file_exists": os.path.exists(output_path),
+                    }
+                else:
+                    return {
+                        "error": f"Failed to save bitmap (Error code: {save_result})"
+                    }
+
+            except Exception as e_render:
+                tb = traceback.format_exc()
+                self.log(
+                    f"[**ERROR**][RENDER FRAME] Error during render task: {e_render}\n{tb}"
+                )
+                return {
+                    "error": f"Exception during render/save: {str(e_render)}",
+                    "traceback": tb,
+                }
+            finally:
+                # Cleanup render data clone
+                if temp_rd_inserted and original_rd:
+                    try:
+                        doc.SetActiveRenderData(original_rd)
+                        if rd_clone:
+                            rd_clone.Remove()
+                    except Exception as e_cleanup:
+                        self.log(f"Warning: Error during RD cleanup: {e_cleanup}")
+                # Cleanup bitmap
+                if bmp:
+                    try:
+                        bmp.FlushAll()
+                    except:
+                        pass
+                c4d.EventAdd()
+
+        # Execute the task on the main thread
+        response = self.execute_on_main_thread(render_task, _timeout=180)
+
+        # Structure the final response for the tool
+        if response and response.get("success"):
+            return {
+                "render_info": response
+            }  # Return nested structure expected by server tool
+        else:
+            # Ensure error structure is consistent if render_task itself returns an error dict
+            if isinstance(response, dict) and "error" in response:
+                return response
+            # Handle cases where execute_on_main_thread returned an error (like timeout)
+            elif isinstance(response, dict) and "error" in response:
+                return response
+            else:  # Fallback for unexpected scenarios
+                return {"error": "Unknown error during render frame execution."}
 
     def handle_apply_shader(self, command):
-        """Handle apply_shader command with improved Redshift/Fresnel support."""
+        """Handle apply_shader command with improved Redshift/Fresnel support and context."""
         doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return {"error": "No active document"}
+
         material_name = command.get("material_name", "")
-        object_name = command.get("object_name", "")
+        # --- MODIFIED: Identify target object ---
+        identifier = None
+        use_guid = False
+        object_specified = False
+        if command.get("guid"):  # Check for GUID first
+            identifier = command.get("guid")
+            use_guid = True
+            object_specified = True
+            self.log(f"[APPLY SHADER] Using GUID identifier for object: '{identifier}'")
+        elif command.get("object_name"):
+            identifier = command.get("object_name")
+            use_guid = False
+            object_specified = True
+            self.log(f"[APPLY SHADER] Using Name identifier for object: '{identifier}'")
+
         shader_type = command.get("shader_type", "noise").lower()
         channel = command.get("channel", "color").lower()
         parameters = command.get("parameters", {})
 
-        # Debug logging
-        self.log(f"[C4D] Applying {shader_type} shader to channel {channel}")
-        if material_name:
-            self.log(f"[C4D] Using material: '{material_name}'")
-        else:
-            self.log("[C4D] No material specified, will create a new one")
+        self.log(
+            f"[APPLY SHADER] Request: Shader='{shader_type}', Channel='{channel}', Material='{material_name}', Object='{identifier}'"
+        )
+
+        mat = None
+        created_new_material = False
+        obj_to_apply = None
 
         try:
-            # If no material name specified or material not found, create a new one
-            mat = None
-            created_new = False
+            doc.StartUndo()  # Start undo block
 
+            # Find or create material
             if material_name:
                 mat = self._find_material_by_name(doc, material_name)
-
-            # If material not found or no name specified, create a new one
             if mat is None:
-                mat = c4d.BaseMaterial(c4d.Mmaterial)
-                if material_name:
-                    mat.SetName(material_name)
-                else:
-                    # Name the material after the shader type
-                    mat.SetName(f"{shader_type.capitalize()} Material")
-
-                # Insert the new material
+                default_mat_name = (
+                    material_name
+                    if material_name
+                    else f"{shader_type.capitalize()} Material"
+                )
+                mat = c4d.BaseMaterial(c4d.Mmaterial)  # Create standard by default
+                if not mat:
+                    raise RuntimeError("Failed to create new material")
+                mat.SetName(default_mat_name)
                 doc.InsertMaterial(mat)
                 doc.AddUndo(c4d.UNDOTYPE_NEW, mat)
-                created_new = True
-                material_name = mat.GetName()
-                self.log(f"[C4D] Created new material: '{material_name}'")
+                created_new_material = True
+                material_name = mat.GetName()  # Use actual name
+                self.log(f"[APPLY SHADER] Created new material: '{material_name}'")
 
-            # Check if this is a Redshift material
-            is_redshift_material = mat.GetType() >= 1000000
+            # Find object if specified
+            if object_specified:
+                obj_to_apply = self.find_object_by_name(
+                    doc, identifier, use_guid=use_guid
+                )
+                if obj_to_apply is None:
+                    search_type = "GUID" if use_guid else "Name"
+                    self.log(
+                        f"Warning: Object '{identifier}' (searched by {search_type}) not found for shader application."
+                    )
+                    # Don't error out, just won't apply tag later
+
+            # Determine if material is Redshift
+            is_redshift_material = False
+            rs_mat_id = getattr(
+                c4d, "ID_REDSHIFT_MATERIAL", 1036224
+            )  # Get RS ID safely
+            if mat.GetType() == rs_mat_id:
+                is_redshift_material = True
+            elif mat.GetType() >= 1000000:  # General check for other RS types
+                is_redshift_material = True
+                self.log(
+                    f"Info: Material '{material_name}' has high ID ({mat.GetType()}), treating as Redshift."
+                )
+
             if is_redshift_material:
-                self.log(f"[C4D] Detected Redshift material (ID: {mat.GetType()})")
-
-                # Handle shader application for Redshift material using node graph
+                self.log(
+                    f"[APPLY SHADER] Applying shader to Redshift material '{material_name}'..."
+                )
+                # --- Redshift Node Graph Logic ---
                 try:
                     import maxon
 
                     redshift_ns = maxon.Id(
                         "com.redshift3d.redshift4c4d.class.nodespace"
                     )
-
-                    # Check if the material has a node graph
-                    # Ensure we're dealing with a NodeMaterial
                     node_mat = c4d.NodeMaterial(mat)
                     if node_mat and node_mat.HasSpace(redshift_ns):
-                        self.log("[C4D] Accessing Redshift node graph...")
                         graph = node_mat.GetGraph(redshift_ns)
-
                         if graph:
-                            # Begin transaction to modify the graph
                             with graph.BeginTransaction() as transaction:
-                                try:
-                                    # Find the material output node (usually StandardMaterial)
-                                    material_output = None
-                                    root_node = graph.GetViewRoot()
-                                    surface_input = root_node.GetInputs()[
-                                        0
-                                    ]  # First input is usually surface
+                                # Find output node... (Simplified for brevity - assumes StandardMaterial exists)
+                                material_output = None
+                                for node in graph.GetNodes():
+                                    if "StandardMaterial" in node.GetId():
+                                        material_output = node
+                                        break
 
-                                    if surface_input.GetDestination():
-                                        material_output = (
-                                            surface_input.GetDestination().GetNode()
+                                if material_output:
+                                    # Create shader node...
+                                    shader_node = None
+                                    shader_node_id_str = ""
+                                    if shader_type == "noise":
+                                        shader_node_id_str = "com.redshift3d.redshift4c4d.nodes.core.texturesampler"
+                                    elif shader_type == "fresnel":
+                                        shader_node_id_str = "com.redshift3d.redshift4c4d.nodes.core.fresnel"
+                                    # Add more shader types here...
+
+                                    if shader_node_id_str:
+                                        shader_node = graph.AddChild(
+                                            maxon.Id(), maxon.Id(shader_node_id_str)
+                                        )
+                                        if (
+                                            shader_node and shader_type == "noise"
+                                        ):  # Configure noise specific
+                                            shader_node.SetParameter(
+                                                maxon.nodes.ParameterID("tex0_tex"),
+                                                4,
+                                                maxon.PROPERTYFLAGS_NONE,
+                                            )  # 4=Noise
+                                            if "scale" in parameters:
+                                                shader_node.SetParameter(
+                                                    maxon.nodes.ParameterID(
+                                                        "noise_scale"
+                                                    ),
+                                                    float(parameters["scale"]),
+                                                    maxon.PROPERTYFLAGS_NONE,
+                                                )
+
+                                    # Connect shader node...
+                                    if shader_node:
+                                        # Find target port... (Simplified)
+                                        target_port_id_str = (
+                                            "base_color"
+                                            if channel == "color"
+                                            else "refl_color"
+                                        )  # Example mapping
+                                        target_port = material_output.GetInputs().Find(
+                                            maxon.Id(target_port_id_str)
                                         )
 
-                                    if not material_output:
-                                        # Try to find a standard material node
-                                        for node in graph.GetNodes():
-                                            if "StandardMaterial" in node.GetId():
-                                                material_output = node
-                                                break
-
-                                    if material_output:
-                                        self.log(
-                                            f"[C4D] Found material output node: {material_output.GetId()}"
+                                        # Find source port... (Simplified)
+                                        source_port_id_str = (
+                                            "outcolor"
+                                            if shader_type != "fresnel"
+                                            else "out"
+                                        )
+                                        source_port = shader_node.GetOutputs().Find(
+                                            maxon.Id(source_port_id_str)
                                         )
 
-                                        # Create shader node based on type
-                                        shader_node = None
-
-                                        if shader_type == "noise":
-                                            # Create a Redshift Noise texture
-                                            shader_node = graph.AddChild(
-                                                maxon.Id(),  # Auto-generate ID
-                                                maxon.Id(
-                                                    "com.redshift3d.redshift4c4d.nodes.core.texturesampler"
-                                                ),
+                                        if target_port and source_port:
+                                            graph.CreateConnection(
+                                                source_port, target_port
                                             )
-
-                                            if shader_node:
-                                                # Set texture type to noise
-                                                shader_node.SetParameter(
-                                                    maxon.nodes.ParameterID("tex0_tex"),
-                                                    4,  # 4 = Noise in Redshift
-                                                    maxon.PROPERTYFLAGS_NONE,
-                                                )
-
-                                                # Set noise parameters
-                                                if "scale" in parameters:
-                                                    try:
-                                                        scale = float(
-                                                            parameters["scale"]
-                                                        )
-                                                        shader_node.SetParameter(
-                                                            maxon.nodes.ParameterID(
-                                                                "noise_scale"
-                                                            ),
-                                                            scale,
-                                                            maxon.PROPERTYFLAGS_NONE,
-                                                        )
-                                                    except Exception as e:
-                                                        self.log(
-                                                            f"[**ERROR**] Error setting noise scale: {str(e)}"
-                                                        )
-
-                                        elif shader_type == "fresnel":
-                                            # Create a Redshift Fresnel node
-                                            shader_node = graph.AddChild(
-                                                maxon.Id(),  # Auto-generate ID
-                                                maxon.Id(
-                                                    "com.redshift3d.redshift4c4d.nodes.core.fresnel"
-                                                ),
-                                            )
-
-                                            if shader_node:
-                                                # Set IOR parameter if specified
-                                                if "ior" in parameters:
-                                                    try:
-                                                        ior = float(parameters["ior"])
-                                                        shader_node.SetParameter(
-                                                            maxon.nodes.ParameterID(
-                                                                "ior"
-                                                            ),
-                                                            ior,
-                                                            maxon.PROPERTYFLAGS_NONE,
-                                                        )
-                                                    except Exception as e:
-                                                        self.log(
-                                                            f"[**ERROR**] Error setting fresnel IOR: {str(e)}"
-                                                        )
-
-                                        elif shader_type == "gradient":
-                                            # Create a Redshift Gradient texture
-                                            shader_node = graph.AddChild(
-                                                maxon.Id(),  # Auto-generate ID
-                                                maxon.Id(
-                                                    "com.redshift3d.redshift4c4d.nodes.core.texturesampler"
-                                                ),
-                                            )
-
-                                            if shader_node:
-                                                # Set texture type to gradient
-                                                shader_node.SetParameter(
-                                                    maxon.nodes.ParameterID("tex0_tex"),
-                                                    2,  # 2 = Gradient in Redshift
-                                                    maxon.PROPERTYFLAGS_NONE,
-                                                )
-
-                                        elif shader_type == "checkerboard":
-                                            # Create a Redshift Checker texture
-                                            shader_node = graph.AddChild(
-                                                maxon.Id(),  # Auto-generate ID
-                                                maxon.Id(
-                                                    "com.redshift3d.redshift4c4d.nodes.core.texturesampler"
-                                                ),
-                                            )
-
-                                            if shader_node:
-                                                # Set texture type to checker
-                                                shader_node.SetParameter(
-                                                    maxon.nodes.ParameterID("tex0_tex"),
-                                                    1,  # 1 = Checker in Redshift
-                                                    maxon.PROPERTYFLAGS_NONE,
-                                                )
-
-                                        # Connect the shader to the appropriate channel
-                                        if shader_node:
                                             self.log(
-                                                f"[C4D] Created {shader_type} node: {shader_node.GetId()}"
+                                                f"Connected RS {shader_type} node to {channel}"
                                             )
-
-                                            # Find the right input port based on channel
-                                            target_port = None
-                                            for (
-                                                input_port
-                                            ) in material_output.GetInputs():
-                                                port_id = input_port.GetId()
-
-                                                if channel == "color" and (
-                                                    "base_color" in port_id
-                                                    or "diffuse_color" in port_id
-                                                ):
-                                                    target_port = input_port
-                                                    break
-                                                elif channel == "reflection" and (
-                                                    "refl_color" in port_id
-                                                    or "reflection" in port_id
-                                                ):
-                                                    target_port = input_port
-                                                    break
-                                                elif channel == "bump" and (
-                                                    "bump" in port_id
-                                                ):
-                                                    target_port = input_port
-                                                    break
-                                                elif channel == "opacity" and (
-                                                    "opacity" in port_id
-                                                    or "transparency" in port_id
-                                                ):
-                                                    target_port = input_port
-                                                    break
-
-                                            if target_port:
-                                                self.log(
-                                                    f"[C4D] Found target port: {target_port.GetId()}"
-                                                )
-
-                                                # Find the appropriate output port of the shader
-                                                source_port = None
-                                                for (
-                                                    output_port
-                                                ) in shader_node.GetOutputs():
-                                                    port_id = output_port.GetId()
-                                                    if (
-                                                        "out" in port_id
-                                                        and shader_type == "fresnel"
-                                                    ):
-                                                        source_port = output_port
-                                                        break
-                                                    elif "outcolor" in port_id:
-                                                        source_port = output_port
-                                                        break
-
-                                                if source_port:
-                                                    # Create the connection
-                                                    graph.CreateConnection(
-                                                        source_port, target_port
-                                                    )
-                                                    self.log(
-                                                        f"[C4D] Connected {shader_type} to {channel} channel"
-                                                    )
-                                                else:
-                                                    self.log(
-                                                        f"[C4D] Could not find source output port for {shader_type}"
-                                                    )
-                                            else:
-                                                self.log(
-                                                    f"[C4D] Could not find {channel} input port on material"
-                                                )
                                         else:
                                             self.log(
-                                                f"[C4D] Failed to create {shader_type} node"
+                                                "Warning: Could not find source/target ports for RS shader connection."
                                             )
                                     else:
                                         self.log(
-                                            "[C4D] Could not find a valid material output node"
+                                            f"Warning: Failed to create RS {shader_type} node."
                                         )
-                                except Exception as e:
+                                else:
                                     self.log(
-                                        f"[**ERROR**] Error in node graph transaction: {str(e)}"
+                                        "Warning: Could not find RS StandardMaterial output node."
                                     )
-                                    transaction.Rollback()
-                                    return {
-                                        "error": f"Failed to apply shader to Redshift material: {str(e)}"
-                                    }
-
-                                # Commit the transaction if no errors
                                 transaction.Commit()
                         else:
-                            self.log("[C4D] Could not access Redshift node graph")
-
-                            # Try to create the graph
-                            try:
-                                node_mat.CreateDefaultGraph(redshift_ns)
-                                self.log(
-                                    "[C4D] Created default Redshift node graph, try applying shader again"
-                                )
-                                return self.handle_apply_shader(
-                                    command
-                                )  # Retry with new graph
-                            except Exception as e:
-                                self.log(
-                                    f"[C4D] Failed to create Redshift node graph: {str(e)}"
-                                )
+                            self.log("Warning: Could not get RS node graph.")
                     else:
-                        self.log("[C4D] Material does not have a Redshift node space")
-                        is_redshift_material = False  # Treat as standard material
-                except Exception as e:
-                    self.log(f"[**ERROR**] Error handling Redshift material: {str(e)}")
-                    is_redshift_material = False  # Fall back to standard approach
+                        self.log(
+                            "Warning: Material is not a Redshift Node Material or lacks RS space."
+                        )
+                except ImportError:
+                    self.log("Warning: 'maxon' module not found, cannot edit RS nodes.")
+                except Exception as e_rs:
+                    self.log(f"Error applying shader to RS material: {e_rs}")
+                # Fallthrough to standard shader application is NOT intended here. If it's RS, we try nodes.
 
-            # For standard materials or if Redshift handling failed
-            if not is_redshift_material:
-                # Map shader types to C4D constants
+            else:
+                # --- Standard Shader Logic (from original) ---
+                self.log(
+                    f"[APPLY SHADER] Applying shader to Standard material '{material_name}'..."
+                )
                 shader_types = {
                     "noise": 5832,
                     "gradient": 5825,
@@ -4825,98 +5883,128 @@ class C4DSocketServer(threading.Thread):
                     "layer": 5685,
                     "checkerboard": 5831,
                 }
-
-                # Map channel names to C4D constants
                 channel_map = {
                     "color": c4d.MATERIAL_COLOR_SHADER,
                     "luminance": c4d.MATERIAL_LUMINANCE_SHADER,
                     "transparency": c4d.MATERIAL_TRANSPARENCY_SHADER,
                     "reflection": c4d.MATERIAL_REFLECTION_SHADER,
-                }
+                    "bump": c4d.MATERIAL_BUMP_SHADER,
+                }  # Added bump
+                shader_type_id = shader_types.get(shader_type, 5832)
+                channel_id = channel_map.get(channel)
 
-                # Get shader type ID and channel ID
-                shader_type_id = shader_types.get(shader_type, 5832)  # Default to noise
-                channel_id = channel_map.get(channel, c4d.MATERIAL_COLOR_SHADER)
+                if channel_id is None:
+                    raise ValueError(f"Unsupported standard channel: {channel}")
 
-                # Handle fresnel shader carefully
-                if shader_type == "fresnel":
-                    self.log(
-                        "[C4D] Attempting to create fresnel shader (may not be available)"
+                shader = c4d.BaseShader(shader_type_id)
+                if shader is None:
+                    raise RuntimeError(
+                        f"Failed to create standard {shader_type} shader"
                     )
 
-                # Create shader with proper error handling
-                try:
-                    shader = c4d.BaseShader(shader_type_id)
-                    if shader is None:
-                        return {"error": f"Failed to create {shader_type} shader"}
+                # Apply parameters (example for noise)
+                if shader_type == "noise" and hasattr(c4d, "SLA_NOISE_SCALE"):
+                    if "scale" in parameters:
+                        shader[c4d.SLA_NOISE_SCALE] = float(
+                            parameters.get("scale", 1.0)
+                        )
+                    if "octaves" in parameters:
+                        shader[c4d.SLA_NOISE_OCTAVES] = int(
+                            parameters.get("octaves", 3)
+                        )
+                # Add more parameter settings for other standard shader types here...
 
-                    # Set shader parameters
-                    if shader_type == "noise":
-                        if "scale" in parameters:
-                            shader[c4d.SLA_NOISE_SCALE] = float(
-                                parameters.get("scale", 1.0)
-                            )
-                        if "octaves" in parameters:
-                            shader[c4d.SLA_NOISE_OCTAVES] = int(
-                                parameters.get("octaves", 3)
-                            )
+                mat[channel_id] = shader
 
-                    # Assign shader to material channel
-                    mat[channel_id] = shader
-
-                    # Enable channel
-                    enable_map = {
-                        "color": c4d.MATERIAL_USE_COLOR,
-                        "luminance": c4d.MATERIAL_USE_LUMINANCE,
-                        "transparency": c4d.MATERIAL_USE_TRANSPARENCY,
-                        "reflection": c4d.MATERIAL_USE_REFLECTION,
-                    }
-                    if channel in enable_map:
-                        mat[enable_map[channel]] = True
-                except Exception as e:
-                    return {"error": f"Error creating shader: {str(e)}"}
-
-            # Update the material
-            mat.Update(True, True)
-            doc.AddUndo(c4d.UNDOTYPE_CHANGE, mat)
-
-            # Apply to object if specified
-            applied_to = "None"
-            if object_name:
-                obj = self.find_object_by_name(doc, object_name)
-                if obj is None:
-                    self.log(f"[C4D] ## Warning ##: Object '{object_name}' not found")
-                else:
-                    # Create and add texture tag
+                # Enable the channel
+                enable_map = {
+                    "color": c4d.MATERIAL_USE_COLOR,
+                    "luminance": c4d.MATERIAL_USE_LUMINANCE,
+                    "transparency": c4d.MATERIAL_USE_TRANSPARENCY,
+                    "reflection": c4d.MATERIAL_USE_REFLECTION,
+                    "bump": c4d.MATERIAL_USE_BUMP,
+                }
+                if channel in enable_map:
                     try:
-                        tag = c4d.TextureTag()
-                        tag.SetMaterial(mat)
-                        obj.InsertTag(tag)
-                        doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
-                        applied_to = obj.GetName()
-                        self.log(f"[C4D] Applied material to object '{applied_to}'")
-                    except Exception as e:
+                        mat[enable_map[channel]] = True
+                    except AttributeError:
                         self.log(
-                            f"[**ERROR**] Error applying material to object: {str(e)}"
+                            f"Warning: Could not find enable parameter for channel '{channel}'"
                         )
 
-            # Update Cinema 4D
+            mat.Update(True, True)
+            doc.AddUndo(c4d.UNDOTYPE_CHANGE, mat)  # Add undo for material change
+
+            # Apply material to object if found
+            applied_to_name = "None"
+            applied_to_guid = None
+            if obj_to_apply:
+                try:
+                    # Check if object already has a texture tag for this material
+                    existing_tag = None
+                    for tag in obj_to_apply.GetTags():
+                        if tag.GetType() == c4d.Ttexture and tag.GetMaterial() == mat:
+                            existing_tag = tag
+                            self.log(
+                                f"Found existing texture tag for material '{material_name}' on '{obj_to_apply.GetName()}'"
+                            )
+                            break
+
+                    if not existing_tag:
+                        tag = obj_to_apply.MakeTag(
+                            c4d.Ttexture
+                        )  # Use MakeTag for safer insertion
+                        if tag:
+                            tag.SetMaterial(mat)
+                            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+                            applied_to_name = obj_to_apply.GetName()
+                            applied_to_guid = str(obj_to_apply.GetGUID())
+                            self.log(
+                                f"[APPLY SHADER] Applied material '{material_name}' to object '{applied_to_name}'"
+                            )
+                        else:
+                            self.log(
+                                f"Warning: Failed to create texture tag on '{obj_to_apply.GetName()}'"
+                            )
+                    else:
+                        # Material already applied via existing tag
+                        applied_to_name = obj_to_apply.GetName()
+                        applied_to_guid = str(obj_to_apply.GetGUID())
+                        self.log(
+                            f"Material '{material_name}' was already applied to object '{applied_to_name}'"
+                        )
+
+                except Exception as e_tag:
+                    self.log(
+                        f"[**ERROR**] Error applying material tag to '{obj_to_apply.GetName()}': {str(e_tag)}"
+                    )
+
+            doc.EndUndo()  # End undo block
             c4d.EventAdd()
 
-            # Return shader info
+            # --- MODIFIED: Contextual Return ---
             return {
-                "shader": {
-                    "material": material_name,
-                    "type": shader_type,
+                "shader_application": {  # Changed key for clarity
+                    "material_name": material_name,
+                    "material_type_id": mat.GetType(),
+                    "shader_type": shader_type,
                     "channel": channel,
-                    "applied_to": applied_to,
-                    "created_new": created_new,
-                    "is_redshift": is_redshift_material,
+                    "applied_to_object_name": applied_to_name,  # Name or "None"
+                    "applied_to_object_guid": applied_to_guid,  # GUID or None
+                    "created_new_material": created_new_material,
+                    "is_redshift_material": is_redshift_material,
                 }
             }
+
         except Exception as e:
-            self.log(f"[**ERROR**] Error applying shader: {str(e)}")
-            return {"error": f"Failed to apply shader: {str(e)}"}
+            doc.EndUndo()  # Ensure undo ended
+            self.log(
+                f"[**ERROR**] Error applying shader: {str(e)}\n{traceback.format_exc()}"
+            )
+            return {
+                "error": f"Failed to apply shader: {str(e)}",
+                "traceback": traceback.format_exc(),
+            }
 
 
 class SocketServerDialog(gui.GeDialog):

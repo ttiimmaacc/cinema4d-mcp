@@ -34,19 +34,4 @@ ENV/
 # OS specific
 .DS_Store
 Thumbs.db
-**/CLAUDE.local.md
 
-# Aider
-.aider*
-.aider.chat.history.md
-.aider.history
-.aider.tags.cache.v3/
-.aider.tags.cache.v4/
-tests/.aider.history
-
-# Other
-context_awarenes.md
-context.md
-c4d_plugin/*.py
-c4d_plugin/mcp_server_plugin.py
-src/cinema4d_mcp/claude_context.py
