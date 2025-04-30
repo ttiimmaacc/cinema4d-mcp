@@ -227,12 +227,7 @@ async def add_primitive(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return f"""
-✅ Added {primitive_type} to scene
-- **Name**: {object_info.get('name', primitive_type)}
-- **ID**: {object_info.get('id', 'Unknown')}
-- **Position**: {object_info.get('position', [0, 0, 0])}
-"""
+        return response
 
 
 @mcp.tool()
@@ -268,10 +263,7 @@ async def modify_object(
         for prop, value in properties.items():
             modified_props.append(f"- **{prop}**: {value}")
 
-        return f"""
-✅ Modified object: {object_name}
-{chr(10).join(modified_props)}
-"""
+        return response
 
 
 @mcp.tool()
@@ -297,10 +289,7 @@ async def list_objects(ctx: Context) -> str:
             indent = "  " * obj.get("depth", 0)
             object_list.append(f"{indent}- **{obj['name']}** ({obj['type']})")
 
-        return f"""
-# Objects in Scene ({len(objects)})
-{chr(10).join(object_list)}
-"""
+        return response
 
 
 @mcp.tool()
@@ -337,11 +326,7 @@ async def create_material(
             return f"❌ Error: {response['error']}"
 
         material_info = response.get("material", {})
-        return f"""
-✅ Created material: {name}
-- **ID**: {material_info.get('id', 'Unknown')}
-- **Color**: {material_info.get('color', [1, 1, 1])}
-"""
+        return response
 
 
 @mcp.tool()
@@ -370,7 +355,7 @@ async def apply_material(material_name: str, object_name: str, ctx: Context) -> 
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return f"✅ Applied material '{material_name}' to object '{object_name}'"
+        return response
 
 
 @mcp.tool()
@@ -409,12 +394,7 @@ async def render_frame(
             return f"❌ Error: {response['error']}"
 
         render_info = response.get("render_info", {})
-        return f"""
-✅ Rendered frame
-- **Path**: {render_info.get('path', 'Unknown')}
-- **Resolution**: {render_info.get('width', 0)} x {render_info.get('height', 0)}
-- **Render Time**: {render_info.get('render_time', 0):.2f} seconds
-"""
+        return response
 
 
 @mcp.tool()
@@ -449,7 +429,7 @@ async def set_keyframe(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return f"✅ Set keyframe for '{object_name}.{property_name}' = {value} at frame {frame}"
+        return response
 
 
 @mcp.tool()
@@ -476,16 +456,7 @@ async def save_scene(file_path: Optional[str] = None, ctx: Context = None) -> st
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        # C4D plugin returns "file_path" directly in the response, not in a "save_info" dictionary
-        if "file_path" in response:
-            return f"✅ Scene saved to: {response['file_path']}"
-        elif "success" in response and "message" in response:
-            return f"✅ {response['message']}"
-        elif "save_info" in response:
-            save_info = response.get("save_info", {})
-            return f"✅ Scene saved to: {save_info.get('path', 'Default location')}"
-        else:
-            return f"✅ Scene saved successfully"
+        return response
 
 
 @mcp.tool()
@@ -508,7 +479,7 @@ async def load_scene(file_path: str, ctx: Context) -> str:
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return f"✅ Loaded scene from: {file_path}"
+        return response
 
 
 @mcp.tool()
@@ -537,11 +508,7 @@ async def create_mograph_cloner(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return f"""
-✅ Created {cloner_type} cloner
-- **Name**: {object_info.get('name', 'Cloner')}
-- **Type**: {object_info.get('type', cloner_type)}
-"""
+        return response
 
 
 @mcp.tool()
@@ -577,11 +544,7 @@ async def add_effector(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return f"""
-✅ Added {effector_type} effector
-- **Name**: {object_info.get('name', 'Effector')}
-- **Target**: {target if target else 'None'}
-"""
+        return response
 
 
 @mcp.tool()
@@ -644,11 +607,7 @@ async def apply_mograph_fields(
         if "falloff" in field_info:
             params_info += f"\n- **Falloff**: {field_info.get('falloff')}"
 
-        return f"""
-✅ Created {field_type} field
-- **Name**: {field_name}
-- **Applied to**: {applied_to}{params_info}
-"""
+        return response
 
 
 @mcp.tool()
@@ -670,7 +629,7 @@ async def create_soft_body(object_name: str, ctx: Context = None) -> str:
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return f"✅ Added soft body dynamics to object '{object_name}'"
+        return response
 
 
 @mcp.tool()
@@ -700,7 +659,7 @@ async def apply_dynamics(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return f"✅ Added {dynamics_type} body dynamics to object '{object_name}'"
+        return response
 
 
 @mcp.tool()
@@ -729,10 +688,45 @@ async def create_abstract_shape(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return f"""
-✅ Created {shape_type} shape
-- **Name**: {object_info.get('name', 'Shape')}
-"""
+        return response
+
+
+@mcp.tool()
+async def create_camera(
+    name: Optional[str] = None,
+    position: Optional[List[float]] = None,
+    properties: Optional[Dict[str, Any]] = None,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """
+    Create a new camera in the scene.
+
+    Args:
+        name: Optional name for the new camera.
+        position: Optional [x, y, z] position.
+        properties: Optional dictionary of camera properties (e.g., {"focal_length": 50}).
+    """
+    # Generate a default name if none provided - use the name from the plugin side if needed
+    requested_name = name
+
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            # Return error as dictionary for consistency
+            return {"error": "❌ Not connected to Cinema 4D"}
+
+        command = {"command": "create_camera"}
+        if requested_name:
+            command["name"] = (
+                requested_name  # Use the 'name' key expected by the handler
+            )
+        if position:
+            command["position"] = position
+        if properties:
+            command["properties"] = properties
+
+        response = send_to_c4d(connection, command)
+
+        return response
 
 
 @mcp.tool()
@@ -761,10 +755,7 @@ async def create_light(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return f"""
-✅ Created {light_type} light
-- **Name**: {object_info.get('name', 'Light')}
-"""
+        return response
 
 
 @mcp.tool()
@@ -804,7 +795,7 @@ async def apply_shader(
         applied_to = shader_info.get("applied_to", "None")
         applied_msg = f" and applied to '{applied_to}'" if applied_to != "None" else ""
 
-        return f"✅ Created {shader_type} shader for material '{material_name}'{applied_msg}"
+        return response
 
 
 @mcp.tool()
@@ -889,10 +880,7 @@ async def animate_camera(
         if "keyframe_count" in camera_info:
             keyframe_info = f"\n- **Keyframes**: {camera_info.get('keyframe_count', 0)}"
 
-        return f"""
-✅ Created {animation_type} camera animation
-- **Camera**: {camera_info.get('camera', 'Animated Camera')}{keyframe_info}{frames_info}
-"""
+        return response
 
 
 @mcp.tool()
@@ -916,11 +904,7 @@ async def execute_python_script(script: str, ctx: Context) -> str:
             return f"❌ Error: {response['error']}"
 
         result = response.get("result", "No output")
-        return f"""
-✅ Python script executed
-**Output**:
-{result}
-"""
+        return response
 
 
 @mcp.tool()
@@ -958,11 +942,7 @@ async def group_objects(
             # Truncate if too long
             objects_str = objects_str[:47] + "..."
 
-        return f"""
-✅ Created group: {group_info.get('name', group_name or 'Group')}
-- **Objects**: {objects_str}
-- **Object Count**: {len(object_names)}
-"""
+        return response
 
 
 @mcp.tool()
@@ -1015,13 +995,9 @@ async def render_preview(
         image_data = response["image_data"]
         image_format = response.get("format", "png")
 
-        return f"""
-✅ Preview rendered
-- **Resolution**: {preview_width} x {preview_height}
-- **Format**: {image_format}
-
-![Preview Image](data:image/{image_format};base64,{image_data})
-"""
+        # Note: The plugin handler handle_render_preview was already designed
+        # to return the structure needed for image display if successful.
+        return response  # Return the raw dictionary
 
 
 @mcp.tool()
@@ -1066,12 +1042,7 @@ async def snapshot_scene(
             assets_count = len(snapshot_info["assets"])
             assets_info = f"\n- **Assets Included**: {assets_count}"
 
-        return f"""
-✅ Scene snapshot created
-- **Path**: {path}
-- **Size**: {size}
-- **Timestamp**: {timestamp}{assets_info}
-"""
+        return response
 
 
 @mcp.resource("c4d://primitives")
@@ -1150,30 +1121,3 @@ def get_connection_status() -> str:
 
 
 mcp_app = mcp
-
-
-# mcp_app = mcp
-
-# def main():
-#     """Main entry point for the server module."""
-#     try:
-#         logger.info("Starting Cinema 4D MCP Server...")
-#         # Check if the socket server is running
-#         try:
-#             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#             test_socket.connect((C4D_HOST, C4D_PORT))
-#             test_socket.close()
-#             logger.info(f"Successfully connected to Cinema 4D socket on {C4D_HOST}:{C4D_PORT}")
-#         except Exception as e:
-#             logger.warning(f"Could not connect to Cinema 4D socket: {e}")
-#             logger.warning("Server will still start, but Cinema 4D integration will be unavailable")
-
-#         # Run the server
-#         mcp_app.run()
-#     except Exception as e:
-#         logger.error(f"Error starting server: {e}")
-#         logger.error(traceback.format_exc())
-#         sys.exit(1)
-
-# if __name__ == "__main__":
-#     main()

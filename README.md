@@ -21,10 +21,10 @@ Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D ma
 
 ## Prerequisites
 
-- Cinema 4D
-- Python 3.10 or higher
+- Cinema 4D (R2024+ recommended)
+- Python 3.10 or higher (for the MCP Server component)
 
-## Development Installation
+## Installation
 
 To install the project, follow these steps:
 
@@ -35,7 +35,7 @@ git clone https://github.com/ttiimmaacc/cinema4d-mcp.git
 cd cinema4d-mcp
 ```
 
-### Install the Package
+### Install the MCP Server Package
 
 ```bash
 pip install -e .
@@ -201,52 +201,52 @@ cinema4d-mcp/
 
 ### General Scene & Execution
 
-- `get_scene_info`: Get summary info about the active Cinema 4D scene.
-- `list_objects`: List all scene objects (with hierarchy).
-- `group_objects`: Group selected objects under a new null.
-- `execute_python`: Execute custom Python code inside Cinema 4D.
-- `save_scene`: Save the current Cinema 4D project to disk.
-- `load_scene`: Load a `.c4d` file into the scene.
-- `set_keyframe`: Set a keyframe on an objects property (position, rotation, etc.).
+- `get_scene_info`: Get summary info about the active Cinema 4D scene. ✅
+- `list_objects`: List all scene objects (with hierarchy). ✅
+- `group_objects`: Group selected objects under a new null. ✅
+- `execute_python`: Execute custom Python code inside Cinema 4D. ✅
+- `save_scene`: Save the current Cinema 4D project to disk. ✅
+- `load_scene`: Load a `.c4d` file into the scene. ✅
+- `set_keyframe`: Set a keyframe on an objects property (position, rotation, etc.). ✅
 
 ### Object Creation & Modification
 
-- `add_primitive`: Add a primitive (cube, sphere, cone, etc.) to the scene.
-- `modify_object`: Modify transform or attributes of an existing object.
-- `create_abstract_shape`: Create an organic, non-standard abstract form.
+- `add_primitive`: Add a primitive (cube, sphere, cone, etc.) to the scene. ✅
+- `modify_object`: Modify transform or attributes of an existing object. ✅
+- `create_abstract_shape`: Create an organic, non-standard abstract form. ✅
 
 ### Cameras & Animation
 
-- `create_camera`: Add a new camera to the scene.
-- `animate_camera`: Animate a camera along a path (linear or spline-based).
+- `create_camera`: Add a new camera to the scene. ✅
+- `animate_camera`: Animate a camera along a path (linear or spline-based). ✅
 
 ### Lighting & Materials
 
-- `create_light`: Add a light (omni, spot, etc.) to the scene.
-- `create_material`: Create a standard Cinema 4D material.
-- `apply_material`: Apply a material to a target object.
-- `apply_shader`: Generate and apply a stylized or procedural shader.
+- `create_light`: Add a light (omni, spot, etc.) to the scene. ✅
+- `create_material`: Create a standard Cinema 4D material. ✅
+- `apply_material`: Apply a material to a target object. ✅
+- `apply_shader`: Generate and apply a stylized or procedural shader. ✅
 
 ### Redshift Support
 
-- `validate_redshift_materials`: Check Redshift material setup and connections.
+- `validate_redshift_materials`: Check Redshift material setup and connections. ✅ ⚠️ (Redshift materials not fully implemented)
 
 ### MoGraph & Fields
 
-- `create_mograph_cloner`: Add a MoGraph Cloner (linear, radial, grid, etc.).
-- `add_effector`: Add a MoGraph Effector (Random, Plain, etc.).
-- `apply_mograph_fields`: Add and link a MoGraph Field to objects.
+- `create_mograph_cloner`: Add a MoGraph Cloner (linear, radial, grid, etc.). ✅
+- `add_effector`: Add a MoGraph Effector (Random, Plain, etc.). ✅
+- `apply_mograph_fields`: Add and link a MoGraph Field to objects. ✅
 
 ### Dynamics & Physics
 
-- `create_soft_body`: Add a Soft Body tag to an object.
-- `apply_dynamics`: Apply Rigid or Soft Body physics.
+- `create_soft_body`: Add a Soft Body tag to an object. ✅
+- `apply_dynamics`: Apply Rigid or Soft Body physics. ✅
 
 ### Rendering & Preview
 
-- `render_frame`: Render a frame and save it to disk (file-based output only).
-- `render_preview`: Render a quick preview and return base64 image (for AI).
-- `snapshot_scene`: Capture a snapshot of the scene (objects + preview image).
+- `render_frame`: Render a frame and save it to disk (file-based output only). ⚠️ (Works, but fails on large resolutions due to MemoryError: Bitmap Init failed. This is a resource limitation.)
+- `render_preview`: Render a quick preview and return base64 image (for AI). ✅
+- `snapshot_scene`: Capture a snapshot of the scene (objects + preview image). ✅
 
 ## Compatibility Plan & Roadmap
 
@@ -268,13 +268,9 @@ cinema4d-mcp/
 
 ## Recent Fixes
 
-- Fixed "Applied to: None" issue with MoGraph fields
-  - Fixed field hierarchy by inserting directly under target object
-  - Implemented proper Field Driver tag connection for Cinema 4D 2025.1
-  - Added multiple field linkage approaches for maximum compatibility
-  - Enabled 'Use Fields' checkbox using multiple parameter IDs
-  - Fixed field visibility and parent-child relationship issues
-- Fixed Grid Cloner creation issue by providing correct parameter IDs
-- Fixed MoGraph Fields application by defining proper field type constants
-- Improved hierarchical display in list_objects command
-- Enhanced cloner visibility and creation reliability
+- Context Awareness: Implemented robust object tracking using GUIDs. Commands creating objects return context (guid, actual_name, etc.). Subsequent commands correctly use GUIDs passed by the test harness/server to find objects reliably.
+- Object Finding: Reworked find_object_by_name to correctly handle GUIDs (numeric string format), fixed recursion errors, and improved reliability when doc.SearchObject fails.
+- GUID Detection: Command handlers (apply_material, create_mograph_cloner, add_effector, apply_mograph_fields, set_keyframe, group_objects) now correctly detect if identifiers passed in various parameters (object_name, target, target_name, list items) are GUIDs and search accordingly.
+- create_mograph_cloner: Fixed AttributeError for missing MoGraph parameters (like MG_LINEAR_PERSTEP) by using getattr fallbacks. Fixed logic bug where the found object wasn't correctly passed for cloning.
+- Rendering: Fixed TypeError in render_frame related to doc.ExecutePasses. snapshot_scene now correctly uses the working base64 render logic. Large render_frame still faces memory limits.
+- Registration: Fixed AttributeError for c4d.NilGuid.

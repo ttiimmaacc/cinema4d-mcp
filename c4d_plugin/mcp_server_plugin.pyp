@@ -1,7 +1,7 @@
 """
 Cinema 4D MCP Server Plugin
 Updated for Cinema 4D R2025 compatibility
-Version 0.1.8 - Added core logic for context-awareness
+Version 0.1.8 - Context awareness
 """
 
 import c4d
@@ -48,7 +48,7 @@ class C4DSocketServer(threading.Thread):
         # --- ADDED FOR CONTEXT AWARENESS ---
         self._object_name_registry = (
             {}
-        )  # Maps GUID -> requested_name AND requested_name -> GUID (less robust) Keep for compatibility
+        )  # OLDs? --Maps GUID -> requested_name AND requested_name -> GUID (less robust)
 
         self._name_to_guid_registry = (
             {}
@@ -358,6 +358,10 @@ class C4DSocketServer(threading.Thread):
             c4d.Osphere: "Sphere",
             c4d.Ocone: "Cone",
             c4d.Ocylinder: "Cylinder",
+            c4d.Odisc: "Disc",
+            c4d.Ocapsule: "Capsule",
+            c4d.Otorus: "Torus",
+            c4d.Otube: "Tube",
             c4d.Oplane: "Plane",
             c4d.Olight: "Light",
             c4d.Ocamera: "Camera",
@@ -428,7 +432,7 @@ class C4DSocketServer(threading.Thread):
         # --- GUID Search Logic ---
         if use_guid:
             guid_to_find = search_term
-            # --- GUID format check ---
+            # --- FIXED: GUID format check ---
             # C4D GUIDs converted with str() are typically long numbers (sometimes negative).
             # Check if it's likely numeric and long enough. Hyphen is NOT required.
             is_valid_guid_format = False
@@ -439,6 +443,7 @@ class C4DSocketServer(threading.Thread):
                         is_valid_guid_format = True
                 except ValueError:
                     is_valid_guid_format = False  # Not purely numeric
+            # --- END FIXED ---
 
             if not is_valid_guid_format:
                 self.log(
@@ -446,7 +451,7 @@ class C4DSocketServer(threading.Thread):
                 )
                 use_guid = False  # Fallback to name search
             else:
-                # Try direct C4D SearchObject
+                # 1. Try direct C4D SearchObject
                 obj_from_search = doc.SearchObject(guid_to_find)
                 if obj_from_search:
                     self.log(
@@ -466,7 +471,7 @@ class C4DSocketServer(threading.Thread):
                         self.register_object_name(obj_from_search, req_name)
                     return obj_from_search
 
-                # Manual iteration fallback
+                # 2. Manual iteration fallback
                 self.log(
                     f"[C4D FIND] Info: doc.SearchObject failed for GUID {guid_to_find}. Iterating manually..."
                 )
@@ -501,7 +506,7 @@ class C4DSocketServer(threading.Thread):
                         )
                     return found_obj_manual
 
-                # If both failed, cleanup registry
+                # 3. If both failed, cleanup registry
                 self.log(
                     f"[C4D FIND] Failed (GUID): Object with GUID '{guid_to_find}' not found by SearchObject or Manual Iteration."
                 )
@@ -522,7 +527,7 @@ class C4DSocketServer(threading.Thread):
         # --- Name Search Logic (Keep as is from previous correction) ---
         name_to_find_lower = search_term.lower()
 
-        # Check registry by name -> GUID -> Object
+        # 1. Check registry by name -> GUID -> Object
         guid_from_registry = self._name_to_guid_registry.get(name_to_find_lower)
         if guid_from_registry:
             obj_from_guid_lookup = self.find_object_by_name(
@@ -568,7 +573,7 @@ class C4DSocketServer(threading.Thread):
                     if other_name_val:
                         self._name_to_guid_registry.pop(other_name_val, None)
 
-        # Direct name search
+        # 2. Direct name search
         all_objects_name = self._get_all_objects(doc)
         for obj in all_objects_name:
             if obj.GetName().strip().lower() == name_to_find_lower:
@@ -578,7 +583,7 @@ class C4DSocketServer(threading.Thread):
                 self.register_object_name(obj, search_term)
                 return obj
 
-        # Comment Tag Search
+        # 3. Comment Tag Search
         self.log(f"[C4D FIND] Trying comment tag search for '{search_term}'")
         if hasattr(c4d, "Tcomment"):
             for obj in all_objects_name:
@@ -597,7 +602,7 @@ class C4DSocketServer(threading.Thread):
                         except Exception as e:
                             self.log(f"Error reading comment tag: {e}")
 
-        # User Data Search
+        # 4. User Data Search
         self.log(f"[C4D FIND] Trying user data search for '{search_term}'")
         for obj in all_objects_name:
             try:
@@ -620,7 +625,7 @@ class C4DSocketServer(threading.Thread):
             except Exception as e:
                 self.log(f"Error checking user data for '{obj.GetName()}': {e}")
 
-        # Fuzzy Name Search
+        # 5. Fuzzy Name Search
         self.log(f"[C4D FIND] Trying fuzzy name matching for '{search_term}'")
         similar_objects = []
         for obj in all_objects_name:
@@ -737,6 +742,8 @@ class C4DSocketServer(threading.Thread):
                             )
 
             # Check for other MoGraph objects if needed
+            # (Add specific searches here if certain objects are still missed)
+
         except Exception as e:
             self.log(f"[**ERROR**] Error in MoGraph direct search: {str(e)}")
 
@@ -777,6 +784,7 @@ class C4DSocketServer(threading.Thread):
                 ):
                     if len(identifier_str) > 10:
                         use_current_id_as_guid = True
+                # --- END REVISED ---
 
                 self.log(
                     f"[GROUP] Finding object by identifier: '{identifier_str}' (Treat as GUID: {use_current_id_as_guid})"
@@ -837,6 +845,7 @@ class C4DSocketServer(threading.Thread):
 
             # Calculate center
             group_center_pos = c4d.Vector(0)
+            # ... (keep centering logic as before) ...
             if center:
                 min_vec, max_vec = c4d.Vector(float("inf")), c4d.Vector(float("-inf"))
                 count = 0
@@ -998,6 +1007,7 @@ class C4DSocketServer(threading.Thread):
             size = [float(size_list)] * 3
         else:
             self.log(f"Warning: Size data not a list or number: {size_list}")
+        # --- End safe parse ---
 
         obj = None
         try:  # Wrap object creation/setting in try-except
@@ -1032,11 +1042,11 @@ class C4DSocketServer(threading.Thread):
                         obj[c4d.PRIM_PYRAMID_HEIGHT] = size[1]
                     if hasattr(c4d, "PRIM_PYRAMID_DEPTH"):
                         obj[c4d.PRIM_PYRAMID_DEPTH] = size[2]
-            elif primitive_type == "disk":
-                obj = c4d.BaseObject(c4d.Odisk)
-                # Use ORAD/IRAD for Disk
-                obj[c4d.PRIM_DISK_ORAD] = size[0] / 2.0
-                obj[c4d.PRIM_DISK_IRAD] = 0  # Default inner radius
+            elif primitive_type == "disc":
+                obj = c4d.BaseObject(c4d.Odisc)
+                # Use ORAD/IRAD for disc
+                obj[c4d.PRIM_DISC_ORAD] = size[0] / 2.0
+                obj[c4d.PRIM_DISC_IRAD] = 0  # Default inner radius
             elif primitive_type == "tube":
                 obj = c4d.BaseObject(c4d.Otube)
                 obj[c4d.PRIM_TUBE_RADIUS] = size[0] / 2.0
@@ -1093,6 +1103,7 @@ class C4DSocketServer(threading.Thread):
                     "position": [pos_vec.x, pos_vec.y, pos_vec.z],
                 }
             }
+            # --- END MODIFIED ---
 
         except Exception as e:
             # Catch errors during object creation or property setting
@@ -1202,16 +1213,18 @@ class C4DSocketServer(threading.Thread):
                 "actual_name": actual_name,
             }
 
-            # --- Keep Original Registry Logic (for backward compatibility) ---
-            # If old registry structure is needed for some reason
+            # --- Keep Original Registry Logic (Optional - for strict backward compatibility) ---
+            # If you need the old registry structure for some reason, keep these lines.
+            # Otherwise, they can be removed once find_object_by_name is fully updated.
             self._object_name_registry[obj_id] = requested_name
             self._object_name_registry[requested_name] = obj_id
+            # --- End Optional Original Registry ---
 
             self.log(
                 f"[C4D REG] Registered: Req='{requested_name}', Act='{actual_name}', GUID={obj_id}"
             )
 
-            # User Data
+            # User Data part from original (keep as is)
             try:
                 has_tag = False
                 userdata = obj.GetUserDataContainer()
@@ -1247,7 +1260,7 @@ class C4DSocketServer(threading.Thread):
                                     f"[C4D] Stored original name '{requested_name}' in object user data"
                                 )
                             else:
-                                # Handle case where AddUserData returns index directly (older C4D)
+                                # Handle case where AddUserData returns index directly (older C4D?)
                                 try:
                                     descid_from_index = obj.GetUserDataContainer()[
                                         element
@@ -1276,6 +1289,9 @@ class C4DSocketServer(threading.Thread):
 
     def handle_render_preview_base64(self, frame=0, width=640, height=360):
         """SDK 2025-compliant base64 renderer with error resolution"""
+        import c4d
+        import base64
+        import traceback
 
         def _execute_render():
             try:
@@ -1375,7 +1391,7 @@ class C4DSocketServer(threading.Thread):
         return codes.get(code, f"Unknown error ({code})")
 
     def handle_modify_object(self, command):
-        """Handle modify_object command with full property support and GUID option."""
+        """Handle modify_object command with full property support, GUID option, and Camera params."""
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return {"error": "No active document"}
@@ -1384,7 +1400,7 @@ class C4DSocketServer(threading.Thread):
         if not properties:
             return {"error": "No properties provided to modify."}
 
-        # --- MODIFIED: Identify target object ---
+        # --- Identifier Detection ---
         identifier = None
         use_guid = False
         if command.get("guid"):
@@ -1393,11 +1409,14 @@ class C4DSocketServer(threading.Thread):
             self.log(f"[MODIFY] Using GUID identifier: '{identifier}'")
         elif command.get("object_name"):
             identifier = command.get("object_name")
-            use_guid = False
-            self.log(f"[MODIFY] Using Name identifier: '{identifier}'")
-        elif command.get(
-            "name"
-        ):  # Fallback check in case 'name' is used for identification
+            identifier_str = str(identifier)
+            if "-" in identifier_str and len(identifier_str) > 30:
+                use_guid = True
+                self.log(f"[MODIFY] Identifier '{identifier}' looks like GUID.")
+            else:
+                use_guid = False
+                self.log(f"[MODIFY] Using Name identifier: '{identifier}'")
+        elif command.get("name"):
             identifier = command.get("name")
             use_guid = False
             self.log(f"[MODIFY] Using 'name' key as Name identifier: '{identifier}'")
@@ -1414,60 +1433,65 @@ class C4DSocketServer(threading.Thread):
                 "error": f"Object '{identifier}' (searched by {search_type}) not found."
             }
 
-        # Apply modifications (using original logic)
+        # Apply modifications
         modified = {}
-        name_before = obj.GetName()  # Store original name
+        name_before = obj.GetName()
         something_changed = False
+        obj_type = obj.GetType()  # Get type for specific param handling
 
-        try:  # Wrap property modifications in try-except
+        try:
+            doc.StartUndo()  # Start undo block
+
             # Position
-            pos = properties.get("position")
-            if isinstance(pos, list) and len(pos) >= 3:
+            pos_val = properties.get("position")
+            if isinstance(pos_val, list) and len(pos_val) >= 3:
                 try:
-                    new_pos = c4d.Vector(float(pos[0]), float(pos[1]), float(pos[2]))
+                    new_pos = c4d.Vector(
+                        float(pos_val[0]), float(pos_val[1]), float(pos_val[2])
+                    )
                     if obj.GetAbsPos() != new_pos:
                         obj.SetAbsPos(new_pos)
                         modified["position"] = [new_pos.x, new_pos.y, new_pos.z]
                         something_changed = True
                 except (ValueError, TypeError) as e:
-                    self.log(f"Warning: Invalid position value '{pos}': {e}")
+                    self.log(f"Warning: Invalid position value '{pos_val}': {e}")
 
-            # Rotation (in degrees)
-            rot = properties.get("rotation")
-            if isinstance(rot, list) and len(rot) >= 3:
+            # Rotation
+            rot_val = properties.get("rotation")
+            if isinstance(rot_val, list) and len(rot_val) >= 3:
                 try:
-                    new_rot_deg = [float(r) for r in rot[:3]]
+                    new_rot_deg = [float(r) for r in rot_val[:3]]
                     new_rot_rad = c4d.Vector(
                         *[c4d.utils.DegToRad(r) for r in new_rot_deg]
                     )
-                    obj.SetAbsRot(new_rot_rad)  # Use Absolute rotation
+                    obj.SetAbsRot(new_rot_rad)
                     modified["rotation"] = new_rot_deg
                     something_changed = True
                 except (ValueError, TypeError) as e:
-                    self.log(f"Warning: Invalid rotation value '{rot}': {e}")
+                    self.log(f"Warning: Invalid rotation value '{rot_val}': {e}")
 
             # Scale
-            scale = properties.get("scale")
-            if isinstance(scale, list) and len(scale) >= 3:
+            scale_val = properties.get("scale")
+            if isinstance(scale_val, list) and len(scale_val) >= 3:
                 try:
                     new_scale = c4d.Vector(
-                        float(scale[0]), float(scale[1]), float(scale[2])
+                        float(scale_val[0]), float(scale_val[1]), float(scale_val[2])
                     )
                     if obj.GetAbsScale() != new_scale:
                         obj.SetAbsScale(new_scale)
                         modified["scale"] = [new_scale.x, new_scale.y, new_scale.z]
                         something_changed = True
                 except (ValueError, TypeError) as e:
-                    self.log(f"Warning: Invalid scale value '{scale}': {e}")
+                    self.log(f"Warning: Invalid scale value '{scale_val}': {e}")
 
-            # Color (if object has a base color channel)
-            color = properties.get("color")
-            if isinstance(color, list) and len(color) >= 3:
+            # Color
+            color_val = properties.get("color")
+            if isinstance(color_val, list) and len(color_val) >= 3:
                 try:
                     new_color = c4d.Vector(
-                        max(0.0, min(1.0, float(color[0]))),
-                        max(0.0, min(1.0, float(color[1]))),
-                        max(0.0, min(1.0, float(color[2]))),
+                        max(0.0, min(1.0, float(color_val[0]))),
+                        max(0.0, min(1.0, float(color_val[1]))),
+                        max(0.0, min(1.0, float(color_val[2]))),
                     )
                     if (
                         obj.IsCorrectType(c4d.Opoint)
@@ -1475,7 +1499,10 @@ class C4DSocketServer(threading.Thread):
                         or obj.IsCorrectType(c4d.Ospline)
                         or obj.IsCorrectType(c4d.Onull)
                     ):
-                        if obj[c4d.ID_BASEOBJECT_COLOR] != new_color:
+                        if (
+                            obj.GetParameter(c4d.DescID(c4d.ID_BASEOBJECT_COLOR))[1]
+                            != new_color
+                        ):  # Safer comparison
                             obj[c4d.ID_BASEOBJECT_USECOLOR] = (
                                 c4d.ID_BASEOBJECT_USECOLOR_ON
                             )
@@ -1489,7 +1516,7 @@ class C4DSocketServer(threading.Thread):
                 except (ValueError, TypeError, AttributeError) as e:
                     self.log(f"Warning: Error setting color for '{name_before}': {e}")
 
-            # Size primitives
+            # Primitive Size
             size = properties.get("size")
             if isinstance(size, list) and len(size) > 0:
                 obj_type = obj.GetType()
@@ -1499,64 +1526,132 @@ class C4DSocketServer(threading.Thread):
                     safe_size = [float(s) for s in size if s is not None]
                     if not safe_size:
                         raise ValueError("No valid numeric sizes")
-                    sx = safe_size[0]
-                    sy = safe_size[1] if len(safe_size) > 1 else sx
-                    sz = safe_size[2] if len(safe_size) > 2 else sx
+                    sx, sy, sz = (
+                        safe_size[0],
+                        safe_size[1] if len(safe_size) > 1 else safe_size[0],
+                        safe_size[2] if len(safe_size) > 2 else safe_size[0],
+                    )
 
                     if obj_type == c4d.Ocube:
                         new_val = c4d.Vector(sx, sy, sz)
-                        if obj[c4d.PRIM_CUBE_LEN] != new_val:
-                            obj[c4d.PRIM_CUBE_LEN] = new_val
-                            size_applied = True
-                            new_size_applied = [sx, sy, sz]
+                        current = obj[c4d.PRIM_CUBE_LEN]
+                        setter = lambda v: obj.SetParameter(
+                            c4d.DescID(c4d.PRIM_CUBE_LEN), v, c4d.DESCFLAGS_SET_NONE
+                        )
+                        params = [sx, sy, sz]
+
                     elif obj_type == c4d.Osphere:
                         new_val = sx / 2.0
-                        if obj[c4d.PRIM_SPHERE_RAD] != new_val:
-                            obj[c4d.PRIM_SPHERE_RAD] = new_val
-                            size_applied = True
-                            new_size_applied = [sx]
+                        current = obj[c4d.PRIM_SPHERE_RAD]
+                        setter = lambda v: obj.SetParameter(
+                            c4d.DescID(c4d.PRIM_SPHERE_RAD), v, c4d.DESCFLAGS_SET_NONE
+                        )
+                        params = [sx]
+
                     elif obj_type == c4d.Ocone:
-                        new_brad, new_h = sx / 2.0, sy
-                        if (
-                            obj[c4d.PRIM_CONE_BRAD] != new_brad
-                            or obj[c4d.PRIM_CONE_HEIGHT] != new_h
-                        ):
-                            obj[c4d.PRIM_CONE_BRAD] = new_brad
-                            obj[c4d.PRIM_CONE_HEIGHT] = new_h
-                            size_applied = True
-                            new_size_applied = [sx, sy]
+                        new_val = (sx / 2.0, sy)
+                        current = (obj[c4d.PRIM_CONE_BRAD], obj[c4d.PRIM_CONE_HEIGHT])
+                        setter = lambda v: obj.SetParameters(
+                            {
+                                c4d.DescID(c4d.PRIM_CONE_BRAD): v[0],
+                                c4d.DescID(c4d.PRIM_CONE_HEIGHT): v[1],
+                            }
+                        )
+                        params = [sx, sy]
+
                     elif obj_type == c4d.Ocylinder:
-                        new_r, new_h = sx / 2.0, sy
-                        if (
-                            obj[c4d.PRIM_CYLINDER_RADIUS] != new_r
-                            or obj[c4d.PRIM_CYLINDER_HEIGHT] != new_h
-                        ):
-                            obj[c4d.PRIM_CYLINDER_RADIUS] = new_r
-                            obj[c4d.PRIM_CYLINDER_HEIGHT] = new_h
-                            size_applied = True
-                            new_size_applied = [sx, sy]
+                        new_val = (sx / 2.0, sy)
+                        current = (
+                            obj[c4d.PRIM_CYLINDER_RADIUS],
+                            obj[c4d.PRIM_CYLINDER_HEIGHT],
+                        )
+                        setter = lambda v: obj.SetParameters(
+                            {
+                                c4d.DescID(c4d.PRIM_CYLINDER_RADIUS): v[0],
+                                c4d.DescID(c4d.PRIM_CYLINDER_HEIGHT): v[1],
+                            }
+                        )
+                        params = [sx, sy]
+
                     elif obj_type == c4d.Oplane:
-                        new_w, new_h = sx, sy
-                        if (
-                            obj[c4d.PRIM_PLANE_WIDTH] != new_w
-                            or obj[c4d.PRIM_PLANE_HEIGHT] != new_h
-                        ):
-                            obj[c4d.PRIM_PLANE_WIDTH] = new_w
-                            obj[c4d.PRIM_PLANE_HEIGHT] = new_h
-                            size_applied = True
-                            new_size_applied = [sx, sy]
+                        new_val = (sx, sy)
+                        current = (
+                            obj[c4d.PRIM_PLANE_WIDTH],
+                            obj[c4d.PRIM_PLANE_HEIGHT],
+                        )
+                        setter = lambda v: obj.SetParameters(
+                            {
+                                c4d.DescID(c4d.PRIM_PLANE_WIDTH): v[0],
+                                c4d.DescID(c4d.PRIM_PLANE_HEIGHT): v[1],
+                            }
+                        )
+                        params = [sx, sy]
                     # Add other primitives here if needed...
+                    else:
+                        new_val = None
+                        current = None
+                        setter = None
+                        params = None  # Indicate not applicable
+
+                    if setter and new_val is not None and current != new_val:
+                        setter(new_val)
+                        size_applied = True
+                        new_size_applied = params
 
                     if size_applied:
                         modified["size"] = new_size_applied
                         something_changed = True
                     elif size:
                         self.log(
-                            f"Info: 'size' property not applicable to object type {self.get_object_type_name(obj)} ('{name_before}')"
+                            f"Info: 'size' prop not applicable to type {obj_type} ('{name_before}')"
                         )
-                except (TypeError, ValueError, IndexError, AttributeError) as e:
+                except Exception as e_size:
                     self.log(
-                        f"Warning: Error modifying size for {name_before} (Type: {obj_type}): {e}"
+                        f"Warning: Error modifying size for {name_before}: {e_size}"
+                    )
+
+            # --- NEW: Camera Specific Properties ---
+            elif obj_type == c4d.Ocamera:
+                bc = obj.GetDataInstance()
+                if bc:
+                    focal_length = properties.get("focal_length")
+                    if focal_length is not None:
+                        try:
+                            val = float(focal_length)
+                            focus_id = getattr(
+                                c4d, "CAMERAOBJECT_FOCUS", c4d.CAMERA_FOCUS
+                            )
+                            if bc[focus_id] != val:
+                                bc[focus_id] = val
+                                modified["focal_length"] = val
+                                something_changed = True
+                        except (ValueError, TypeError, AttributeError) as e:
+                            self.log(
+                                f"Warning: Failed to set focal_length '{focal_length}': {e}"
+                            )
+
+                    focus_distance = properties.get("focus_distance")
+                    if focus_distance is not None:
+                        try:
+                            val = float(focus_distance)
+                            dist_id = getattr(
+                                c4d, "CAMERAOBJECT_TARGETDISTANCE", None
+                            )  # ID for focus distance
+                            if dist_id and bc[dist_id] != val:
+                                bc[dist_id] = val
+                                modified["focus_distance"] = val
+                                something_changed = True
+                            elif not dist_id:
+                                self.log(
+                                    "Warning: CAMERAOBJECT_TARGETDISTANCE parameter not found."
+                                )
+                        except (ValueError, TypeError, AttributeError) as e:
+                            self.log(
+                                f"Warning: Failed to set focus_distance '{focus_distance}': {e}"
+                            )
+                else:
+                    self.log(
+                        f"Warning: Could not get BaseContainer for camera '{name_before}'"
                     )
 
             # Rename - process *after* other properties in case identifier was 'name'
@@ -1568,50 +1663,47 @@ class C4DSocketServer(threading.Thread):
                         f"[MODIFY] Renaming '{name_before}' to '{new_name_stripped}'"
                     )
                     obj.SetName(new_name_stripped)
-                    name_after_rename = (
-                        obj.GetName()
-                    )  # Get actual name after C4D potentially changed it
+                    name_after_rename = obj.GetName()
                     modified["name"] = {
                         "from": name_before,
                         "requested": new_name_stripped,
                         "to": name_after_rename,
                     }
                     something_changed = True
-                    # Re-register with the *requested* new name for future lookups
-                    self.register_object_name(obj, new_name_stripped)
+                    self.register_object_name(
+                        obj, new_name_stripped
+                    )  # Register with requested new name
 
-            # --- Finalize ---
+            # Finalize
             if something_changed:
-                doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)  # Add undo step for changes
+                doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
                 c4d.EventAdd()
             else:
                 self.log(f"No modifications applied to '{name_before}'")
 
-            # --- MODIFIED: Return Context ---
+            doc.EndUndo()  # End undo block
+
+            # Contextual Return
             final_name = obj.GetName()
             guid = str(obj.GetGUID())
             pos_vec = obj.GetAbsPos()
             rot_vec_rad = obj.GetAbsRot()
             scale_vec = obj.GetAbsScale()
 
-            # Ensure registration is up-to-date if C4D renamed unexpectedly without request
             if "name" not in modified and final_name != name_before:
                 self.log(
                     f"Warning: Object name changed unexpectedly from '{name_before}' to '{final_name}'. Updating registry."
                 )
-                self.register_object_name(
-                    obj, name_before
-                )  # Re-register with original intent
+                self.register_object_name(obj, name_before)
 
             return {
                 "object": {
-                    "requested_identifier": identifier,  # What was used to find the object
-                    "was_guid": use_guid,  # Was the identifier treated as a GUID?
-                    "actual_name": final_name,  # Current name after modifications
+                    "requested_identifier": identifier,
+                    "was_guid": use_guid,
+                    "actual_name": final_name,
                     "guid": guid,
-                    "name_before": name_before,  # Name before this operation started
-                    "modified_properties": modified,  # Dictionary of changes applied by this command
-                    # Include current state for confirmation
+                    "name_before": name_before,
+                    "modified_properties": modified,
                     "current_position": [pos_vec.x, pos_vec.y, pos_vec.z],
                     "current_rotation": [
                         c4d.utils.RadToDeg(r)
@@ -1622,7 +1714,8 @@ class C4DSocketServer(threading.Thread):
             }
 
         except Exception as e:
-            # Catch unexpected errors during property access/setting
+            if doc and doc.IsUndoEnabled():
+                doc.EndUndo()  # Ensure undo ended
             error_msg = f"Unexpected error modifying object '{name_before}': {str(e)}"
             self.log(f"[**ERROR**] {error_msg}\n{traceback.format_exc()}")
             return {"error": error_msg, "traceback": traceback.format_exc()}
@@ -1845,6 +1938,131 @@ class C4DSocketServer(threading.Thread):
             self.log(f"[**ERROR**] {err}\n{traceback.format_exc()}")
             return {"error": err, "traceback": traceback.format_exc()}
 
+    # def handle_render_to_file(self, doc, frame, width, height, output_path=None):
+    #     """Render a frame to file, with optional base64 and fallback output path."""
+    #     import os
+    #     import tempfile
+    #     import time
+    #     import base64
+    #     import c4d.storage
+    #     import traceback
+
+    #     try:
+    #         start_time = time.time()
+
+    #         # Clone active render settings
+    #         render_data = doc.GetActiveRenderData()
+    #         if not render_data:
+    #             return {"error": "No active RenderData found"}
+
+    #         rd_clone = render_data.GetClone()
+    #         if not rd_clone:
+    #             return {"error": "Failed to clone render settings"}
+
+    #         # Update render settings
+    #         settings = rd_clone.GetData()
+    #         settings[c4d.RDATA_XRES] = float(width)
+    #         settings[c4d.RDATA_YRES] = float(height)
+    #         settings[c4d.RDATA_PATH] = output_path or os.path.join(
+    #             tempfile.gettempdir(), "temp_render_output.png"
+    #         )
+
+    #         settings[c4d.RDATA_RENDERENGINE] = c4d.RDATA_RENDERENGINE_STANDARD
+    #         settings[c4d.RDATA_FRAMESEQUENCE] = c4d.RDATA_FRAMESEQUENCE_CURRENTFRAME
+    #         settings[c4d.RDATA_SAVEIMAGE] = False
+
+    #         # render_data.SetData(settings)
+    #         # Create temp RenderData container
+    #         # Insert actual RenderData object into the scene with settings
+    #         temp_rd = c4d.documents.RenderData()
+    #         temp_rd.SetData(settings)
+    #         doc.InsertRenderData(temp_rd)
+
+    #         # Update document time/frame
+    #         if isinstance(frame, dict):
+    #             frame = frame.get("frame", 0)
+    #         doc.SetTime(c4d.BaseTime(frame, doc.GetFps()))
+
+    #         doc.ExecutePasses(None, True, True, True, c4d.BUILDFLAGS_NONE)
+
+    #         # Create target bitmap
+    #         bmp = c4d.bitmaps.BaseBitmap()
+    #         if not bmp.Init(int(width), int(height)):
+    #             return {"error": "Failed to initialize bitmap"}
+
+    #         self.log(f"[RENDER] Rendering frame {frame} at {width}x{height}...")
+    #         self.log(f"[RENDER DEBUG] Using RenderData name: {temp_rd.GetName()}")
+
+    #         self.log(
+    #             f"[RENDER DEBUG] Width: {settings[c4d.RDATA_XRES]}, Height: {settings[c4d.RDATA_YRES]}"
+    #         )
+
+    #         # Render to bitmap
+    #         result = c4d.documents.RenderDocument(
+    #             doc,
+    #             temp_rd.GetData(),
+    #             bmp,
+    #             c4d.RENDERFLAGS_EXTERNAL | c4d.RENDERFLAGS_NODOCUMENTCLONE,
+    #             None,
+    #         )
+
+    #         if not result:
+    #             self.log("[RENDER] RenderDocument returned False")
+    #             return {"error": "RenderDocument failed"}
+
+    #         # Fallback path if needed
+    #         if not output_path:
+    #             doc_name = doc.GetDocumentName() or "untitled"
+    #             if doc_name.lower().endswith(".c4d"):
+    #                 doc_name = doc_name[:-4]
+    #             base_dir = doc.GetDocumentPath() or tempfile.gettempdir()
+    #             output_path = os.path.join(base_dir, f"{doc_name}_snapshot_{frame}.png")
+
+    #         # Choose format based on extension
+    #         ext = os.path.splitext(output_path)[1].lower()
+    #         format_map = {
+    #             ".png": c4d.FILTER_PNG,
+    #             ".jpg": c4d.FILTER_JPG,
+    #             ".jpeg": c4d.FILTER_JPG,
+    #             ".tif": c4d.FILTER_TIF,
+    #             ".tiff": c4d.FILTER_TIF,
+    #         }
+    #         format_id = format_map.get(ext, c4d.FILTER_PNG)
+
+    #         # Save image to file
+    #         if not bmp.Save(output_path, format_id):
+    #             self.log(f"[RENDER] Failed to save bitmap to file: {output_path}")
+    #             return {"error": f"Failed to save image to: {output_path}"}
+
+    #         # Optionally encode to base64 if PNG
+    #         image_base64 = None
+    #         if format_id == c4d.FILTER_PNG:
+    #             mem_file = c4d.storage.MemoryFileWrite()
+    #             if mem_file.Open(1024 * 1024):
+    #                 if bmp.Save(mem_file, c4d.FILTER_PNG):
+    #                     raw_bytes = mem_file.GetValue()
+    #                     image_base64 = base64.b64encode(raw_bytes).decode("utf-8")
+    #                     self.log("[RENDER] Base64 preview generated")
+    #                 mem_file.Close()
+
+    #         elapsed = round(time.time() - start_time, 3)
+
+    #         return {
+    #             "success": True,
+    #             "frame": frame,
+    #             "resolution": f"{width}x{height}",
+    #             "output_path": output_path,
+    #             "file_exists": os.path.exists(output_path),
+    #             "image_base64": image_base64,
+    #             "render_time": elapsed,
+    #         }
+
+    #     except Exception as e:
+    #         self.log("[RENDER ] Exception during render_to_file")
+    #         self.log(traceback.format_exc())
+
+    #         return {"error": f"Exception during render: {str(e)}"}
+
     def handle_snapshot_scene(self, command=None):
         """
         Generates a snapshot: object list + base64 preview render.
@@ -1859,11 +2077,11 @@ class C4DSocketServer(threading.Thread):
 
         self.log(f"[C4D SNAPSHOT] Generating snapshot for frame {frame}...")
 
-        # List objects
+        # 1. List objects
         object_data = self.handle_list_objects()  # Runs via execute_on_main_thread
         objects = object_data.get("objects", [])
 
-        # Render preview - uses handle_render_preview_base64 which now uses corrected core logic
+        # 2. Render preview - uses handle_render_preview_base64 which now uses corrected core logic
         render_command = {"width": width, "height": height, "frame": frame}
         render_result = self.handle_render_preview_base64(
             **render_command
@@ -1888,7 +2106,7 @@ class C4DSocketServer(threading.Thread):
             if isinstance(render_result, dict) and "traceback" in render_result:
                 render_info["traceback"] = render_result["traceback"]
 
-        # Return combined result
+        # 3. Return combined result
         return {
             "objects": objects,
             "render": render_info,
@@ -2959,7 +3177,7 @@ class C4DSocketServer(threading.Thread):
                 if not mg_bc:
                     raise RuntimeError("Failed to get MoGraph BaseContainer")
 
-                # ---Use getattr for potentially missing constants ---
+                # --- FIXED: Use getattr for potentially missing constants ---
                 if mode == "linear":
                     mg_bc[c4d.MG_LINEAR_COUNT] = count
                     # Use getattr for MG_LINEAR_PERSTEP, provide default vector if missing
@@ -2978,7 +3196,7 @@ class C4DSocketServer(threading.Thread):
                     else:
                         self.log("[CLONER] ## Warning ## MG_LINEAR_MODE not found.")
                     self.log(f"[C4D CLONER] Set linear count: {count}")
-
+                # --- END FIXED ---
                 elif mode == "grid":
                     version = c4d.GetC4DVersion()
                     try:
@@ -3348,6 +3566,7 @@ class C4DSocketServer(threading.Thread):
             ):
                 if len(identifier_str) > 10:
                     use_cloner_guid = True
+        # --- End GUID detection ---
 
         effector = None
         try:
@@ -3533,7 +3752,7 @@ class C4DSocketServer(threading.Thread):
         target_identifier = command.get("target_name", "")
         parameters = command.get("parameters", {})
 
-        # Detect if target_identifier is likely a GUID
+        # --- REVISED: Detect if target_identifier is likely a GUID ---
         use_target_guid = False
         if target_identifier:
             identifier_str = str(target_identifier)
@@ -3544,6 +3763,7 @@ class C4DSocketServer(threading.Thread):
             ):
                 if len(identifier_str) > 10:
                     use_target_guid = True
+        # --- END REVISED ---
 
         field = None
         try:
@@ -3732,6 +3952,7 @@ class C4DSocketServer(threading.Thread):
             return {
                 "error": f"Object '{identifier}' (searched by {search_type}) not found for soft body."
             }
+        # --- END MODIFIED ---
 
         # Get parameters (using original logic)
         name = command.get(
@@ -3873,6 +4094,7 @@ class C4DSocketServer(threading.Thread):
             return {
                 "error": f"Object '{identifier}' (searched by {search_type}) not found for dynamics."
             }
+        # --- END MODIFIED ---
 
         tag_type = command.get("tag_type", "rigid_body").lower()
         params = command.get("parameters", {})
@@ -3980,7 +4202,7 @@ class C4DSocketServer(threading.Thread):
             doc.EndUndo()  # End undo block
             c4d.EventAdd()
 
-            # Contextual Return
+            # --- MODIFIED: Contextual Return ---
             return {
                 "dynamics": {
                     "object_name": obj.GetName(),
@@ -3990,6 +4212,7 @@ class C4DSocketServer(threading.Thread):
                     "parameters_received": params,  # Echo back received params for verification
                 }
             }
+            # --- END MODIFIED ---
 
         except Exception as e:
             doc.EndUndo()  # Ensure undo is ended on error
@@ -4147,6 +4370,7 @@ class C4DSocketServer(threading.Thread):
                     "child_objects": child_objects_context,  # Include context of children
                 }
             }
+            # --- END MODIFIED ---
 
         except Exception as e:
             doc.EndUndo()  # Ensure undo is ended on error
@@ -4370,6 +4594,7 @@ class C4DSocketServer(threading.Thread):
                     "intensity_set": light[c4d.LIGHT_BRIGHTNESS] * 100.0,
                 }
             }
+            # --- END MODIFIED ---
 
         except Exception as e:
             doc.EndUndo()  # Ensure undo is ended on error
@@ -4388,14 +4613,16 @@ class C4DSocketServer(threading.Thread):
             }
 
     def handle_create_camera(self, command):
-        """Create a new camera in the scene with context and optional properties."""
+        """Create a new camera, optionally pointing it towards a target."""
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return {"error": "No active document"}
 
         requested_name = command.get("name", "Camera")
         position_list = command.get("position", [0, 0, 0])
-        properties = command.get("properties", {})
+        properties = command.get(
+            "properties", {}
+        )  # Includes focal_length, aperture, target_position etc.
 
         # Safely parse position
         position = [0.0, 0.0, 0.0]
@@ -4405,83 +4632,92 @@ class C4DSocketServer(threading.Thread):
             except (ValueError, TypeError):
                 self.log(f"Warning: Invalid camera position data {position_list}")
 
-        camera = None  # Initialize camera variable
+        camera = None
         try:
-            doc.StartUndo()  # Start undo block
+            doc.StartUndo()
             camera = c4d.BaseObject(c4d.Ocamera)
             if not camera:
                 raise RuntimeError("Failed to create camera object")
 
             camera.SetName(requested_name)
-            camera.SetAbsPos(c4d.Vector(*position))
+            cam_pos_vec = c4d.Vector(*position)
+            camera.SetAbsPos(cam_pos_vec)
 
-            # Apply camera-specific properties safely
+            # --- Apply standard camera properties ---
             applied_properties = {}
             bc = camera.GetDataInstance()
             if bc:
                 if "focal_length" in properties:
                     try:
                         val = float(properties["focal_length"])
-                        # Use CAMERAOBJECT_FOCUS which is often the correct one, fallback to CAMERA_FOCUS
                         focus_id = getattr(c4d, "CAMERAOBJECT_FOCUS", c4d.CAMERA_FOCUS)
                         bc[focus_id] = val
                         applied_properties["focal_length"] = val
                     except (ValueError, TypeError, AttributeError) as e:
-                        self.log(
-                            f"Warning: Failed to set focal_length '{properties['focal_length']}': {e}"
-                        )
+                        self.log(f"Warning: Failed to set focal_length: {e}")
                 if "aperture" in properties:
                     try:
                         val = float(properties["aperture"])
-                        bc[c4d.CAMERAOBJECT_APERTURE] = val  # Use CAMERAOBJECT_APERTURE
+                        bc[c4d.CAMERAOBJECT_APERTURE] = val
                         applied_properties["aperture"] = val
                     except (ValueError, TypeError, AttributeError) as e:
-                        self.log(
-                            f"Warning: Failed to set aperture '{properties['aperture']}': {e}"
-                        )
-                if "film_offset_x" in properties:
-                    try:
-                        val = float(properties["film_offset_x"])
-                        bc[c4d.CAMERAOBJECT_FILM_OFFSET_X] = (
-                            val  # Use CAMERAOBJECT_FILM_OFFSET_X
-                        )
-                        applied_properties["film_offset_x"] = val
-                    except (ValueError, TypeError, AttributeError) as e:
-                        self.log(
-                            f"Warning: Failed to set film_offset_x '{properties['film_offset_x']}': {e}"
-                        )
-                if "film_offset_y" in properties:
-                    try:
-                        val = float(properties["film_offset_y"])
-                        bc[c4d.CAMERAOBJECT_FILM_OFFSET_Y] = (
-                            val  # Use CAMERAOBJECT_FILM_OFFSET_Y
-                        )
-                        applied_properties["film_offset_y"] = val
-                    except (ValueError, TypeError, AttributeError) as e:
-                        self.log(
-                            f"Warning: Failed to set film_offset_y '{properties['film_offset_y']}': {e}"
-                        )
+                        self.log(f"Warning: Failed to set aperture: {e}")
+                # Add other properties like film offset here if needed...
+
+            # --- NEW: Handle Target Position ---
+            target_pos = None
+            target_list = properties.get(
+                "target_position"
+            )  # Expect key "target_position"
+            if isinstance(target_list, list) and len(target_list) >= 3:
+                try:
+                    target_pos = c4d.Vector(*[float(p) for p in target_list[:3]])
+                except (ValueError, TypeError):
+                    self.log(f"Warning: Invalid target_position data {target_list}")
             else:
+                # Default target to world origin if not specified
+                target_pos = c4d.Vector(0, 0, 0)
                 self.log(
-                    f"Warning: Could not get BaseContainer for camera '{requested_name}'"
+                    f"No target_position provided, defaulting camera target to world origin."
                 )
 
-            # Insert into the scene
+            if target_pos is not None:
+                try:
+                    # Calculate direction vector
+                    direction = target_pos - cam_pos_vec
+                    direction.Normalize()
+
+                    # Calculate HPB rotation in radians
+                    hpb = c4d.utils.VectorToHPB(direction)
+
+                    # Apply rotation (SetAbsRot expects radians)
+                    camera.SetAbsRot(hpb)
+                    applied_properties["rotation_set_to_target"] = [
+                        c4d.utils.RadToDeg(a) for a in [hpb.x, hpb.y, hpb.z]
+                    ]  # Report degrees
+                    self.log(
+                        f"Pointed camera '{camera.GetName()}' towards target {target_list or '[0,0,0]'}"
+                    )
+                except Exception as e_rot:
+                    self.log(
+                        f"Warning: Failed to calculate or set camera rotation towards target: {e_rot}"
+                    )
+            # --- END NEW TARGET HANDLING ---
+
             doc.InsertObject(camera)
             doc.AddUndo(c4d.UNDOTYPE_NEW, camera)
-            doc.SetActiveObject(camera)  # Make active by default
-            doc.EndUndo()  # End undo block
+            doc.SetActiveObject(camera)
+            doc.EndUndo()
             c4d.EventAdd()
 
             self.log(f"[C4D] Created camera '{camera.GetName()}' at {position}")
 
-            # --- MODIFIED: Contextual Return ---
+            # --- Contextual Return ---
             actual_name = camera.GetName()
             guid = str(camera.GetGUID())
             pos_vec = camera.GetAbsPos()
+            rot_vec_rad = camera.GetAbsRot()  # Get final rotation
             camera_type_name = self.get_object_type_name(camera)
-
-            # Register the camera object
             self.register_object_name(camera, requested_name)
 
             return {
@@ -4492,16 +4728,20 @@ class C4DSocketServer(threading.Thread):
                     "type": camera_type_name,
                     "type_id": camera.GetType(),
                     "position": [pos_vec.x, pos_vec.y, pos_vec.z],
-                    "properties_applied": applied_properties,  # Show which optional props were set
+                    "rotation": [
+                        c4d.utils.RadToDeg(a)
+                        for a in [rot_vec_rad.x, rot_vec_rad.y, rot_vec_rad.z]
+                    ],  # Return final rotation in degrees
+                    "properties_applied": applied_properties,
                 }
             }
 
         except Exception as e:
-            doc.EndUndo()  # Ensure undo ended
+            if doc and doc.IsUndoEnabled():
+                doc.EndUndo()  # Ensure undo ended
             self.log(
                 f"[**ERROR**] Error creating camera '{requested_name}': {str(e)}\n{traceback.format_exc()}"
             )
-            # Clean up camera if created but not inserted
             if camera and not camera.GetDocument():
                 try:
                     camera.Remove()
@@ -4518,7 +4758,7 @@ class C4DSocketServer(threading.Thread):
         if not doc:
             return {"error": "No active document"}
 
-        # Identify target camera ---
+        # --- MODIFIED: Identify target camera ---
         identifier = None
         use_guid = False
         if command.get("guid"):  # Check for GUID first
@@ -4529,6 +4769,7 @@ class C4DSocketServer(threading.Thread):
             identifier = command.get("camera_name")
             use_guid = False
             self.log(f"[ANIM CAM] Using Name identifier: '{identifier}'")
+        # --- END MODIFIED ---
 
         path_type = command.get("path_type", "linear").lower()
         positions = command.get("positions", [])
@@ -4697,6 +4938,7 @@ class C4DSocketServer(threading.Thread):
             }
 
             return {"camera_animation": response_data}  # Keep original top-level key
+            # --- END MODIFIED ---
 
         except Exception as e:
             doc.EndUndo()  # Ensure undo ended
@@ -5467,6 +5709,7 @@ class C4DSocketServer(threading.Thread):
                     # Add any other relevant context about properties set
                 }
             }
+            # --- END MODIFIED ---
 
         except Exception as e:
             doc.EndUndo()  # Ensure undo ended
@@ -5586,10 +5829,11 @@ class C4DSocketServer(threading.Thread):
 
                 target_time = c4d.BaseTime(frame, doc.GetFps())
                 doc.SetTime(target_time)
-                # --- ExecutePasses Call ---
+                # --- FIXED ExecutePasses Call ---
                 doc.ExecutePasses(
                     None, True, True, True, c4d.BUILDFLAGS_NONE
                 )  # Use None instead of active_draw
+                # --- END FIXED ---
 
                 bmp = c4d.bitmaps.BaseBitmap()  # Use BaseBitmap
                 if (
@@ -5616,6 +5860,7 @@ class C4DSocketServer(threading.Thread):
                     if last_c4d_err:
                         err_str += f" (GetLastError: {last_c4d_err})"
                     raise RuntimeError(f"RenderDocument failed: {err_str}")
+                # --- End Core Logic Adaptation ---
 
                 # Save the resulting bitmap to file
                 self.log(
@@ -5703,6 +5948,7 @@ class C4DSocketServer(threading.Thread):
             use_guid = False
             object_specified = True
             self.log(f"[APPLY SHADER] Using Name identifier for object: '{identifier}'")
+        # --- END MODIFIED ---
 
         shader_type = command.get("shader_type", "noise").lower()
         channel = command.get("channel", "color").lower()
@@ -5995,6 +6241,7 @@ class C4DSocketServer(threading.Thread):
                     "is_redshift_material": is_redshift_material,
                 }
             }
+            # --- END MODIFIED ---
 
         except Exception as e:
             doc.EndUndo()  # Ensure undo ended
