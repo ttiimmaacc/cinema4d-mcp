@@ -157,7 +157,7 @@ async def homepage(request):
 
 
 # Initialize our FastMCP server
-mcp = FastMCP(title="Cinema4D", routes=[Route("/", endpoint=homepage)])
+mcp = FastMCP(name="Cinema4D")
 
 
 @mcp.tool()
