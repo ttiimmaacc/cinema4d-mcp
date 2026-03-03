@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Union
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP, Context
-from starlette.routing import Route
 from starlette.responses import JSONResponse
 
 from .config import C4D_HOST, C4D_PORT
@@ -143,6 +142,11 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
         return {"error": f"Communication error: {str(e)}"}
 
 
+# Initialize our FastMCP server (name= for current MCP SDK; routes added via decorator)
+mcp = FastMCP(name="Cinema4D")
+
+
+@mcp.custom_route("/", methods=["GET"])
 async def homepage(request):
     """Handle homepage requests to check if server is running."""
     c4d_available = check_c4d_connection(C4D_HOST, C4D_PORT)
@@ -154,10 +158,6 @@ async def homepage(request):
             "port": C4D_PORT,
         }
     )
-
-
-# Initialize our FastMCP server
-mcp = FastMCP(title="Cinema4D", routes=[Route("/", endpoint=homepage)])
 
 
 @mcp.tool()
@@ -184,6 +184,82 @@ async def get_scene_info(ctx: Context) -> str:
 - **FPS**: {scene_info.get('fps', 30)}
 - **Frame Range**: {scene_info.get('frame_start', 0)} - {scene_info.get('frame_end', 90)}
 """
+
+
+@mcp.tool()
+async def get_recent_activity(
+    limit: Optional[int] = None,
+    export_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Get or export the Cinema 4D action log (recent MCP commands executed in C4D).
+    Use when the user wants to see what was done in C4D or to export the log for skill generation.
+
+    Args:
+        limit: Optional. Return only the last N events. If omitted, returns all buffered events.
+        export_path: Optional. If provided, write the log to this file (path relative to workspace or absolute).
+                     Example: .cursor/c4d-action-log.json
+    """
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return "Not connected to Cinema 4D"
+
+        if export_path:
+            abs_path = os.path.abspath(export_path)
+            cmd = {"command": "export_action_log", "file_path": abs_path}
+            if limit is not None:
+                cmd["limit"] = limit
+            response = send_to_c4d(connection, cmd)
+            if response.get("ok"):
+                return f"Action log exported to {response.get('file_path', abs_path)}"
+            return f"Export failed: {response.get('error', response)}"
+
+        cmd = {"command": "get_action_log"}
+        if limit is not None:
+            cmd["limit"] = limit
+        response = send_to_c4d(connection, cmd)
+        if "error" in response:
+            return f"Error: {response['error']}"
+        return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_ui_action_log(
+    limit: Optional[int] = None,
+    export_path: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Get or export the Cinema 4D UI action log (user actions in C4D: object create/delete, selection changes).
+    Use when the user wants to see or export what was done in the C4D UI for skill generation.
+
+    Args:
+        limit: Optional. Return only the last N events. If omitted, returns all buffered events.
+        export_path: Optional. If provided, write the UI log to this file (path relative to workspace or absolute).
+                     Example: logs/ui-log.json
+    """
+    async with c4d_connection_context() as connection:
+        if not connection.connected:
+            return "Not connected to Cinema 4D"
+
+        if export_path:
+            abs_path = os.path.abspath(export_path)
+            cmd = {"command": "export_ui_action_log", "file_path": abs_path}
+            if limit is not None:
+                cmd["limit"] = limit
+            response = send_to_c4d(connection, cmd)
+            if response.get("ok"):
+                return f"UI action log exported to {response.get('file_path', abs_path)}"
+            return f"Export failed: {response.get('error', response)}"
+
+        cmd = {"command": "get_ui_action_log"}
+        if limit is not None:
+            cmd["limit"] = limit
+        response = send_to_c4d(connection, cmd)
+        if "error" in response:
+            return f"Error: {response['error']}"
+        return json.dumps(response, indent=2)
 
 
 @mcp.tool()

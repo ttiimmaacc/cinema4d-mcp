@@ -18,6 +18,21 @@ import base64
 import traceback
 
 PLUGIN_ID = 1057843  # Unique plugin ID for SpecialEventAdd
+UI_OBSERVER_PLUGIN_ID = 1057844  # Unique ID for UI action observer (MessageData)
+ACTION_LOG_MAX = 500  # Max events to keep in action log buffer
+UI_ACTION_LOG_MAX = 2000  # Max events to keep in UI action log buffer
+SNAPSHOT_MAX_MS = 80  # If snapshot+diff takes longer, skip reorder/extra details for large hierarchies
+PARAM_EPSILON = 1e-5  # Min change for position/rotation/scale to emit param event
+ANIM_SNAPSHOT_EVERY_TICKS = 5  # Build anim snapshot every N timer ticks (~2s at 400ms)
+# Transform param IDs for keyframe snapshot (position, rotation, scale only)
+_TRANSFORM_PARAM_IDS = frozenset([
+    getattr(c4d, "ID_BASEOBJECT_POSITION", None),
+    getattr(c4d, "ID_BASEOBJECT_ROTATION", None),
+    getattr(c4d, "ID_BASEOBJECT_SCALE", None),
+]) - {None}
+
+# Module-level reference so UiActionObserver can push events when server is running
+_g_ui_log_server = None
 
 # Check Cinema 4D version and log compatibility info
 C4D_VERSION = c4d.GetC4DVersion()
@@ -57,6 +72,14 @@ class C4DSocketServer(threading.Thread):
             {}
         )  # Maps guid -> {'requested_name': str, 'actual_name': str}
 
+        # Action log for workflow recording (MCP commands only)
+        self._action_log = []
+        self._action_log_lock = threading.Lock()
+
+        # UI action log (user actions in C4D, independent of MCP)
+        self._ui_action_log = []
+        self._ui_action_log_lock = threading.Lock()
+
     def log(self, message):
         """Send log messages to UI via queue and trigger an event."""
         self.msg_queue.put(("LOG", message))
@@ -66,6 +89,56 @@ class C4DSocketServer(threading.Thread):
         """Update status via queue and trigger an event."""
         self.msg_queue.put(("STATUS", status))
         c4d.SpecialEventAdd(PLUGIN_ID)
+
+    def _sanitize_command_params(self, command):
+        """Build a JSON-serializable subset of command for action log (no code, no huge values)."""
+        safe_keys = (
+            "name", "object_name", "target", "target_name", "primitive_type", "type",
+            "position", "size", "material_name", "cloner_name", "effector_type",
+            "field_type", "field_name", "group_name", "object_names", "cloner_type",
+            "light_type", "shape_type", "camera_name", "property_name", "property",
+            "frame", "value", "mode", "count", "file_path",
+        )
+        params = {}
+        for k, v in command.items():
+            if k in ("command", "code", "script"):  # skip command type and code
+                continue
+            if k not in safe_keys:
+                continue
+            if isinstance(v, (str, int, float, bool, type(None))):
+                params[k] = v
+            elif isinstance(v, (list, tuple)) and len(str(v)) < 200:
+                params[k] = list(v)
+            elif isinstance(v, dict) and len(str(v)) < 200:
+                params[k] = dict(v)
+        return params
+
+    def _append_action_log(self, event_dict):
+        """Append an event to the action log (thread-safe). event_dict must be JSON-serializable."""
+        with self._action_log_lock:
+            event_dict["t"] = len(self._action_log)
+            self._action_log.append(event_dict)
+            if len(self._action_log) > ACTION_LOG_MAX:
+                self._action_log[:] = self._action_log[-ACTION_LOG_MAX:]
+
+    def get_action_log_snapshot(self):
+        """Return a copy of the current action log (thread-safe)."""
+        with self._action_log_lock:
+            return list(self._action_log)
+
+    def _append_ui_action(self, event_dict):
+        """Append a UI event to the UI action log (thread-safe). event_dict must be JSON-serializable."""
+        with self._ui_action_log_lock:
+            event_dict = dict(event_dict)
+            event_dict["t"] = len(self._ui_action_log)
+            self._ui_action_log.append(event_dict)
+            if len(self._ui_action_log) > UI_ACTION_LOG_MAX:
+                self._ui_action_log[:] = self._ui_action_log[-UI_ACTION_LOG_MAX:]
+
+    def get_ui_action_log_snapshot(self):
+        """Return a copy of the current UI action log (thread-safe)."""
+        with self._ui_action_log_lock:
+            return list(self._ui_action_log)
 
     def execute_on_main_thread(self, func, args=None, kwargs=None, _timeout=None):
         """Execute a function on the main thread using a thread-safe queue and special event.
@@ -274,8 +347,44 @@ class C4DSocketServer(threading.Thread):
                             response = self.handle_create_soft_body(command)
                         elif command_type == "apply_dynamics":
                             response = self.handle_apply_dynamics(command)
+                        elif command_type == "get_action_log":
+                            response = self.handle_get_action_log(command)
+                        elif command_type == "export_action_log":
+                            response = self.handle_export_action_log(command)
+                        elif command_type == "get_ui_action_log":
+                            response = self.handle_get_ui_action_log(command)
+                        elif command_type == "export_ui_action_log":
+                            response = self.handle_export_ui_action_log(command)
                         else:
                             response = {"error": f"Unknown command: {command_type}"}
+
+                        # Append to action log (except for log read/export to avoid meta-noise)
+                        if command_type not in (
+                            "get_action_log",
+                            "export_action_log",
+                            "get_ui_action_log",
+                            "export_ui_action_log",
+                        ):
+                            try:
+                                summary_keys = ("name", "object_name", "guid", "error", "created_name", "status")
+                                response_summary = {}
+                                if isinstance(response, dict):
+                                    for k in summary_keys:
+                                        if k in response and response[k] is not None:
+                                            v = response[k]
+                                            if isinstance(v, str) and len(v) > 100:
+                                                v = v[:97] + "..."
+                                            response_summary[k] = v
+                                event = {
+                                    "type": "command",
+                                    "command": command_type,
+                                    "params": self._sanitize_command_params(command),
+                                }
+                                if response_summary:
+                                    event["response_summary"] = response_summary
+                                self._append_action_log(event)
+                            except Exception:
+                                pass  # do not fail the request if logging fails
 
                         # Send the response as JSON
                         response_json = json.dumps(response) + "\n"
@@ -328,6 +437,107 @@ class C4DSocketServer(threading.Thread):
         }
 
         return {"scene_info": scene_info}
+
+    def handle_get_action_log(self, command):
+        """Return the action log buffer (last N events)."""
+        limit = command.get("limit")
+        with self._action_log_lock:
+            events = list(self._action_log)
+        if limit is not None:
+            try:
+                limit = int(limit)
+                events = events[-limit:] if limit > 0 else []
+            except (TypeError, ValueError):
+                pass
+        from datetime import datetime
+        recorded_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if events:
+            # Use first event's time if we had a timestamp; for now use current
+            pass
+        return {
+            "version": 1,
+            "source": "cinema4d",
+            "recorded_at": recorded_at,
+            "events": events,
+        }
+
+    def handle_export_action_log(self, command):
+        """Write action log to a file. file_path must be absolute."""
+        file_path = command.get("file_path", "").strip()
+        if not file_path:
+            return {"ok": False, "error": "file_path is required"}
+        limit = command.get("limit")
+        with self._action_log_lock:
+            events = list(self._action_log)
+        if limit is not None:
+            try:
+                limit = int(limit)
+                events = events[-limit:] if limit > 0 else []
+            except (TypeError, ValueError):
+                pass
+        from datetime import datetime
+        recorded_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {
+            "version": 1,
+            "source": "cinema4d",
+            "recorded_at": recorded_at,
+            "events": events,
+        }
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            return {"ok": True, "file_path": file_path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def handle_get_ui_action_log(self, command):
+        """Return the UI action log buffer (last N events)."""
+        limit = command.get("limit")
+        with self._ui_action_log_lock:
+            events = list(self._ui_action_log)
+        if limit is not None:
+            try:
+                limit = int(limit)
+                events = events[-limit:] if limit > 0 else []
+            except (TypeError, ValueError):
+                pass
+        from datetime import datetime
+        recorded_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "version": 1,
+            "source": "cinema4d-ui",
+            "recorded_at": recorded_at,
+            "events": events,
+        }
+
+    def handle_export_ui_action_log(self, command):
+        """Write UI action log to a file. file_path must be absolute."""
+        file_path = command.get("file_path", "").strip()
+        if not file_path:
+            return {"ok": False, "error": "file_path is required"}
+        limit = command.get("limit")
+        with self._ui_action_log_lock:
+            events = list(self._ui_action_log)
+        if limit is not None:
+            try:
+                limit = int(limit)
+                events = events[-limit:] if limit > 0 else []
+            except (TypeError, ValueError):
+                pass
+        from datetime import datetime
+        recorded_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {
+            "version": 1,
+            "source": "cinema4d-ui",
+            "recorded_at": recorded_at,
+            "events": events,
+        }
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            return {"ok": True, "file_path": file_path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def count_objects(self, doc):
         """Count all objects in the document."""
@@ -6254,6 +6464,505 @@ class C4DSocketServer(threading.Thread):
             }
 
 
+def _get_node_visible(obj):
+    """Return visibility flag for object (not hidden in OM). Uses NBIT_OM_HIDE if available."""
+    try:
+        nbit_hide = getattr(c4d, "NBIT_OM_HIDE", None)
+        if nbit_hide is not None and hasattr(obj, "GetNBit"):
+            return not obj.GetNBit(nbit_hide)
+    except Exception:
+        pass
+    return True
+
+
+def _build_scene_snapshot(doc):
+    """
+    Build full scene snapshot: nodes map (guid -> {name, type_id, parent_guid, index, visible})
+    and selection list of GUIDs. Recursive walk over object tree.
+    Returns (snapshot_dict, selection_guids, selection_names) or (None, [], []) on error.
+    """
+    if not doc:
+        return (None, [], [])
+    nodes = {}
+    selection_guids = []
+    selection_names = []
+
+    def _vec_to_list(v):
+        if v is None:
+            return None
+        try:
+            return [float(v.x), float(v.y), float(v.z)]
+        except Exception:
+            return None
+
+    def walk(obj, parent_guid, sibling_index):
+        if obj is None:
+            return
+        try:
+            guid = str(obj.GetGUID())
+            name = obj.GetName() or ""
+            type_id = obj.GetType()
+            visible = _get_node_visible(obj)
+            pos = _vec_to_list(obj.GetAbsPos()) if hasattr(obj, "GetAbsPos") else None
+            rot = _vec_to_list(obj.GetAbsRot()) if hasattr(obj, "GetAbsRot") else None
+            scl = _vec_to_list(obj.GetAbsScale()) if hasattr(obj, "GetAbsScale") else None
+            nodes[guid] = {
+                "name": name,
+                "type_id": type_id,
+                "parent_guid": parent_guid,
+                "index": sibling_index,
+                "visible": visible,
+                "position": pos,
+                "rotation": rot,
+                "scale": scl,
+            }
+        except Exception:
+            return
+        # Children: first child index 0, then siblings
+        child = obj.GetDown()
+        idx = 0
+        while child:
+            walk(child, guid, idx)
+            idx += 1
+            child = child.GetNext()
+
+    try:
+        root = doc.GetFirstObject()
+        idx = 0
+        while root:
+            walk(root, None, idx)
+            idx += 1
+            root = root.GetNext()
+    except Exception:
+        return (None, [], [])
+
+    try:
+        flags = getattr(c4d, "GETACTIVEOBJECTFLAGS_NONE", 0)
+        sel = doc.GetActiveObjects(flags)
+        if sel:
+            for o in sel:
+                try:
+                    selection_guids.append(str(o.GetGUID()))
+                    selection_names.append(o.GetName() or "")
+                except Exception:
+                    pass
+    except Exception:
+        active = doc.GetActiveObject()
+        if active:
+            try:
+                selection_guids.append(str(active.GetGUID()))
+                selection_names.append(active.GetName() or "")
+            except Exception:
+                pass
+
+    return ({"nodes": nodes}, selection_guids, selection_names)
+
+
+def _vec_differs(a, b, epsilon):
+    """True if two [x,y,z] lists differ by more than epsilon (or one is None)."""
+    if a is None or b is None:
+        return a != b
+    if len(a) != 3 or len(b) != 3:
+        return True
+    return (
+        abs(a[0] - b[0]) > epsilon or abs(a[1] - b[1]) > epsilon or abs(a[2] - b[2]) > epsilon
+    )
+
+
+def _diff_snapshots(prev_snapshot, curr_snapshot, prev_sel_guids, curr_sel_guids, curr_sel_names, now, frame, skip_reorder):
+    """
+    Compare prev vs curr snapshot and produce list of UI events.
+    skip_reorder: if True, do not emit reorder_siblings (for performance on large scenes).
+    curr_sel_names: list of names for current selection (same order as curr_sel_guids).
+    """
+    events = []
+    if not prev_snapshot or not curr_snapshot:
+        return events
+    prev_nodes = prev_snapshot.get("nodes") or {}
+    curr_nodes = curr_snapshot.get("nodes") or {}
+    prev_guids = set(prev_nodes.keys())
+    curr_guids = set(curr_nodes.keys())
+    eps = PARAM_EPSILON
+
+    # create_object
+    for guid in (curr_guids - prev_guids):
+        n = curr_nodes.get(guid, {})
+        events.append({
+            "type": "ui_command",
+            "action": "create_object",
+            "guid": guid,
+            "object_name": n.get("name", ""),
+            "time": now,
+            "frame": frame,
+            "details": {"type_id": n.get("type_id"), "parent_guid": n.get("parent_guid"), "index": n.get("index")},
+        })
+
+    # delete_object
+    for guid in (prev_guids - curr_guids):
+        n = prev_nodes.get(guid, {})
+        events.append({
+            "type": "ui_command",
+            "action": "delete_object",
+            "guid": guid,
+            "object_name": n.get("name", ""),
+            "time": now,
+            "frame": frame,
+            "details": {},
+        })
+
+    # For existing guids: rename, reparent, reorder, visibility
+    for guid in (prev_guids & curr_guids):
+        pn = prev_nodes[guid]
+        cn = curr_nodes[guid]
+
+        if pn.get("name") != cn.get("name"):
+            events.append({
+                "type": "ui_command",
+                "action": "rename_object",
+                "guid": guid,
+                "object_name": cn.get("name", ""),
+                "time": now,
+                "frame": frame,
+                "details": {"old_name": pn.get("name"), "new_name": cn.get("name")},
+            })
+
+        if pn.get("parent_guid") != cn.get("parent_guid"):
+            events.append({
+                "type": "ui_command",
+                "action": "reparent_object",
+                "guid": guid,
+                "object_name": cn.get("name", ""),
+                "time": now,
+                "frame": frame,
+                "details": {"old_parent_guid": pn.get("parent_guid"), "new_parent_guid": cn.get("parent_guid")},
+            })
+
+        same_parent = pn.get("parent_guid") == cn.get("parent_guid")
+        index_changed = pn.get("index") != cn.get("index")
+        if not skip_reorder and same_parent and index_changed:
+            events.append({
+                "type": "ui_command",
+                "action": "reorder_siblings",
+                "guid": guid,
+                "object_name": cn.get("name", ""),
+                "time": now,
+                "frame": frame,
+                "details": {"parent_guid": cn.get("parent_guid"), "old_index": pn.get("index"), "new_index": cn.get("index")},
+            })
+
+        if pn.get("visible") != cn.get("visible"):
+            events.append({
+                "type": "ui_command",
+                "action": "visibility_change",
+                "guid": guid,
+                "object_name": cn.get("name", ""),
+                "time": now,
+                "frame": frame,
+                "details": {"visible": cn.get("visible")},
+            })
+
+        # Param events: position, rotation, scale (transform)
+        if _vec_differs(pn.get("position"), cn.get("position"), eps):
+            events.append({
+                "type": "param",
+                "object_guid": guid,
+                "object_name": cn.get("name", ""),
+                "param": "position",
+                "old": pn.get("position"),
+                "new": cn.get("position"),
+                "time": now,
+                "frame": frame,
+            })
+        if _vec_differs(pn.get("rotation"), cn.get("rotation"), eps):
+            events.append({
+                "type": "param",
+                "object_guid": guid,
+                "object_name": cn.get("name", ""),
+                "param": "rotation",
+                "old": pn.get("rotation"),
+                "new": cn.get("rotation"),
+                "time": now,
+                "frame": frame,
+            })
+        if _vec_differs(pn.get("scale"), cn.get("scale"), eps):
+            events.append({
+                "type": "param",
+                "object_guid": guid,
+                "object_name": cn.get("name", ""),
+                "param": "scale",
+                "old": pn.get("scale"),
+                "new": cn.get("scale"),
+                "time": now,
+                "frame": frame,
+            })
+
+    # Selection change (compare by GUID list)
+    if prev_sel_guids != curr_sel_guids:
+        active_name = curr_sel_names[0] if curr_sel_names else None
+        names_list = list(curr_sel_names) if curr_sel_names else []
+        events.append({
+            "type": "selection",
+            "active_guid": curr_sel_guids[0] if curr_sel_guids else None,
+            "active_name": active_name,
+            "active": active_name,  # backward compatibility
+            "guids": list(curr_sel_guids),
+            "names": names_list,
+            "objects": names_list,  # backward compatibility
+            "time": now,
+            "frame": frame,
+        })
+
+    return events
+
+
+def _track_param_name(desc_id):
+    """Return short param name for track DescID (position/rotation/scale) or None."""
+    if desc_id is None:
+        return None
+    try:
+        pid = None
+        if hasattr(desc_id, "GetDepth") and desc_id.GetDepth() > 0 and hasattr(desc_id, "GetLevel"):
+            level = desc_id.GetLevel(0)
+            if level is not None:
+                pid = getattr(level, "id", None)
+        if pid is None and hasattr(desc_id, "__getitem__"):
+            try:
+                level = desc_id[0]
+                pid = getattr(level, "id", None)
+            except (IndexError, TypeError, KeyError):
+                pass
+        if pid is not None:
+            names = {
+                getattr(c4d, "ID_BASEOBJECT_POSITION", None): "position",
+                getattr(c4d, "ID_BASEOBJECT_ROTATION", None): "rotation",
+                getattr(c4d, "ID_BASEOBJECT_SCALE", None): "scale",
+            }
+            return names.get(pid)
+    except Exception:
+        pass
+    return None
+
+
+def _build_anim_snapshot(doc):
+    """
+    Build snapshot of transform keyframes: { guid -> { param_name -> [frame, ...] } }.
+    Only position, rotation, scale tracks. Returns None on error or if no transform IDs available.
+    """
+    if not doc or not _TRANSFORM_PARAM_IDS:
+        return None
+    fps = doc.GetFps() or 30
+    result = {}
+
+    def walk(obj):
+        while obj:
+            try:
+                guid = str(obj.GetGUID())
+                tracks_by_param = {}
+                track = obj.GetFirstCTrack() if hasattr(obj, "GetFirstCTrack") else None
+                while track:
+                    try:
+                        desc_id = track.GetDescriptionID() if hasattr(track, "GetDescriptionID") else None
+                        param_name = _track_param_name(desc_id) if desc_id else None
+                        if param_name and param_name in ("position", "rotation", "scale"):
+                            curve = track.GetCurve() if hasattr(track, "GetCurve") else None
+                            if curve and hasattr(curve, "GetKeyCount"):
+                                frames = []
+                                for i in range(curve.GetKeyCount()):
+                                    key = curve.GetKey(i)
+                                    if key and hasattr(key, "GetTime"):
+                                        t = key.GetTime()
+                                        if hasattr(t, "GetFrame"):
+                                            frame_val = int(t.GetFrame(fps))
+                                        else:
+                                            frame_val = 0
+                                        frames.append(frame_val)
+                                frames.sort()
+                                if frames:
+                                    tracks_by_param[param_name] = frames
+                    except Exception:
+                        pass
+                    track = track.GetNext() if hasattr(track, "GetNext") else None
+                if tracks_by_param:
+                    result[guid] = tracks_by_param
+            except Exception:
+                pass
+            if hasattr(obj, "GetDown") and obj.GetDown():
+                walk(obj.GetDown())
+            obj = obj.GetNext() if hasattr(obj, "GetNext") else None
+
+    try:
+        root = doc.GetFirstObject()
+        if root:
+            walk(root)
+    except Exception:
+        return None
+    return result
+
+
+def _diff_anim_snapshots(prev_anim, curr_anim, curr_nodes, now, frame):
+    """
+    Compare prev vs curr anim snapshots. curr_nodes = scene snapshot nodes dict for object_name.
+    Returns list of events: keyframe_add, keyframe_delete.
+    """
+    events = []
+    if curr_anim is None:
+        return events
+    prev_anim = prev_anim or {}
+    all_guids = set(prev_anim.keys()) | set(curr_anim.keys())
+    for guid in all_guids:
+        prev_tracks = prev_anim.get(guid, {})
+        curr_tracks = curr_anim.get(guid, {})
+        obj_name = (curr_nodes.get(guid) or {}).get("name", "") if curr_nodes else ""
+        if not obj_name and guid in prev_anim:
+            obj_name = (curr_nodes.get(guid) or {}).get("name", "")
+        all_params = set(prev_tracks.keys()) | set(curr_tracks.keys())
+        for param in all_params:
+            prev_frames = set(prev_tracks.get(param, []))
+            curr_frames = set(curr_tracks.get(param, []))
+            for f in (curr_frames - prev_frames):
+                events.append({
+                    "type": "keyframe",
+                    "action": "keyframe_add",
+                    "object_guid": guid,
+                    "object_name": obj_name,
+                    "param": param,
+                    "frame": f,
+                    "time": now,
+                })
+            for f in (prev_frames - curr_frames):
+                events.append({
+                    "type": "keyframe",
+                    "action": "keyframe_delete",
+                    "object_guid": guid,
+                    "object_name": obj_name,
+                    "param": param,
+                    "frame": f,
+                    "time": now,
+                })
+    return events
+
+
+def _get_doc_scene_state(doc):
+    """Return (set of top-level object names, active object name, list of selected names). Legacy helper."""
+    if not doc:
+        return (set(), None, [])
+    names = set()
+    obj = doc.GetFirstObject()
+    while obj:
+        try:
+            names.add(obj.GetName() or "")
+        except Exception:
+            pass
+        obj = obj.GetNext()
+    active = doc.GetActiveObject()
+    active_name = active.GetName() if active else None
+    try:
+        flags = getattr(c4d, "GETACTIVEOBJECTFLAGS_NONE", 0)
+        sel = doc.GetActiveObjects(flags)
+        sel_names = [o.GetName() for o in sel] if sel else []
+    except Exception:
+        sel_names = [active_name] if active_name else []
+    return (names, active_name, sel_names)
+
+
+class UiActionObserver(c4d.plugins.MessageData):
+    """Observes C4D scene changes (objects, hierarchy, selection) and appends events to UI action log."""
+
+    def __init__(self):
+        self._last_snapshot = None  # {"nodes": {guid: {...}}}
+        self._last_sel_guids = []
+        self._last_sel_names = []
+        self._last_frame = None
+        self._last_anim_snapshot = None
+        self._anim_tick_counter = 0
+        self._initialized = False
+
+    def GetTimer(self):
+        return 400  # Poll every 400 ms
+
+    def CoreMessage(self, id, bc):
+        if id != c4d.MSG_TIMER:
+            return True
+        global _g_ui_log_server
+        if not _g_ui_log_server:
+            return True
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return True
+        try:
+            t0 = time.perf_counter()
+            curr_snapshot, curr_sel_guids, curr_sel_names = _build_scene_snapshot(doc)
+            if curr_snapshot is None:
+                return True
+
+            from datetime import datetime
+            now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            frame = int(doc.GetTime().GetFrame(doc.GetFps())) if doc.GetFps() else 0
+
+            if not self._initialized:
+                self._last_snapshot = curr_snapshot
+                self._last_sel_guids = list(curr_sel_guids)
+                self._last_sel_names = list(curr_sel_names)
+                self._last_frame = frame
+                self._last_anim_snapshot = _build_anim_snapshot(doc) if _TRANSFORM_PARAM_IDS else None
+                self._anim_tick_counter = 0
+                self._initialized = True
+                return True
+
+            # Time change (Faza 3)
+            if self._last_frame is not None and frame != self._last_frame:
+                play_state = "playing" if frame > self._last_frame else "stopped"
+                _g_ui_log_server._append_ui_action({
+                    "type": "time_change",
+                    "old_frame": self._last_frame,
+                    "new_frame": frame,
+                    "play_state": play_state,
+                    "time": now,
+                })
+            self._last_frame = frame
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            skip_reorder = elapsed_ms > SNAPSHOT_MAX_MS
+            if skip_reorder and self._last_snapshot and curr_snapshot:
+                num_nodes = len((curr_snapshot.get("nodes") or {}))
+                if num_nodes > 50:
+                    pass  # silent skip reorder for large scenes
+
+            events = _diff_snapshots(
+                self._last_snapshot,
+                curr_snapshot,
+                self._last_sel_guids,
+                curr_sel_guids,
+                curr_sel_names,
+                now,
+                frame,
+                skip_reorder,
+            )
+            for ev in events:
+                _g_ui_log_server._append_ui_action(ev)
+
+            # Anim snapshot every N ticks (Faza 3 – keyframe_add / keyframe_delete)
+            self._anim_tick_counter += 1
+            if self._anim_tick_counter >= ANIM_SNAPSHOT_EVERY_TICKS and _TRANSFORM_PARAM_IDS:
+                self._anim_tick_counter = 0
+                curr_anim = _build_anim_snapshot(doc)
+                curr_nodes = (curr_snapshot.get("nodes") or {}) if curr_snapshot else {}
+                anim_events = _diff_anim_snapshots(
+                    self._last_anim_snapshot, curr_anim, curr_nodes, now, frame
+                )
+                for ev in anim_events:
+                    _g_ui_log_server._append_ui_action(ev)
+                if curr_anim is not None:
+                    self._last_anim_snapshot = curr_anim
+
+            self._last_snapshot = curr_snapshot
+            self._last_sel_guids = list(curr_sel_guids)
+            self._last_sel_names = list(curr_sel_names)
+        except Exception:
+            pass
+        return True
+
+
 class SocketServerDialog(gui.GeDialog):
     """GUI Dialog to control the server and display logs."""
 
@@ -6270,9 +6979,11 @@ class SocketServerDialog(gui.GeDialog):
             1002, c4d.BFH_SCALEFIT, name="Server: Offline"
         )
 
-        self.GroupBegin(1010, c4d.BFH_SCALEFIT, 2, 1)
+        self.GroupBegin(1010, c4d.BFH_SCALEFIT, 4, 1)
         self.AddButton(1011, c4d.BFH_SCALE, name="Start Server")
         self.AddButton(1012, c4d.BFH_SCALE, name="Stop Server")
+        self.AddButton(1013, c4d.BFH_SCALE, name="Export log")
+        self.AddButton(1014, c4d.BFH_SCALE, name="Export UI log")
         self.GroupEnd()
 
         self.log_box = self.AddMultiLineEditText(
@@ -6284,6 +6995,8 @@ class SocketServerDialog(gui.GeDialog):
         )
 
         self.Enable(1012, False)  # Disable "Stop" button initially
+        self.Enable(1013, False)  # Disable "Export log" until server is running
+        self.Enable(1014, False)  # Disable "Export UI log" until server is running
         return True
 
     def CoreMessage(self, id, msg):
@@ -6353,6 +7066,8 @@ class SocketServerDialog(gui.GeDialog):
         self.SetString(1002, f"Server: {status}")
         self.Enable(1011, status == "Offline")
         self.Enable(1012, status == "Online")
+        self.Enable(1013, status == "Online")
+        self.Enable(1014, status == "Online")
 
     def AppendLog(self, message):
         """Append log messages to UI."""
@@ -6367,21 +7082,112 @@ class SocketServerDialog(gui.GeDialog):
         elif id == 1012:  # Stop Server button
             self.StopServer()
             return True
+        elif id == 1013:  # Export log button
+            self._export_action_log()
+            return True
+        elif id == 1014:  # Export UI log button
+            self._export_ui_action_log()
+            return True
         return False
+
+    def _export_action_log(self):
+        """Export action log to a user-selected file."""
+        if not self.server:
+            gui.MessageDialog("Server is not running.")
+            return
+        try:
+            from datetime import datetime
+            events = self.server.get_action_log_snapshot()
+            if not events:
+                gui.MessageDialog(
+                    "Log jest pusty.\n\nZdarzenia zapisywane są tylko gdy Cursor wysyła komendy do C4D (np. pobierz scenę, listuj obiekty, dodaj prymityw).\n\nWykonaj kilka poleceń z Cursora (MCP Cinema 4D), potem wyeksportuj ponownie."
+                )
+                return
+            recorded_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            payload = {
+                "version": 1,
+                "source": "cinema4d",
+                "recorded_at": recorded_at,
+                "events": events,
+            }
+            file_path = None
+            if hasattr(c4d.storage, "SaveDialog"):
+                save_type = getattr(
+                    c4d.storage, "FILESELECTTYPE_ANYTHING", 0
+                )
+                file_path = c4d.storage.SaveDialog(
+                    type=save_type,
+                    title="Export C4D action log",
+                    force_suffix="json",
+                )
+            if not file_path:
+                gui.MessageDialog("No file selected or SaveDialog not available.")
+                return
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            gui.MessageDialog("Action log exported to:\n" + file_path)
+        except Exception as e:
+            gui.MessageDialog("Export failed: " + str(e))
+
+    def _export_ui_action_log(self):
+        """Export UI action log (C4D user actions) to a user-selected file."""
+        if not self.server:
+            gui.MessageDialog("Server is not running.")
+            return
+        try:
+            from datetime import datetime
+            events = self.server.get_ui_action_log_snapshot()
+            if not events:
+                gui.MessageDialog(
+                    "Log UI jest pusty.\n\nZdarzenia zapisywane są gdy wykonujesz akcje w Cinema 4D (dodawanie/usuwanie obiektów, zmiana zaznaczenia).\n\nWykonaj akcje w scenie, potem wyeksportuj ponownie."
+                )
+                return
+            recorded_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            doc = c4d.documents.GetActiveDocument()
+            scene_name = doc.GetDocumentName() if doc else None
+            fps = doc.GetFps() if doc and doc.GetFps() else 30
+            payload = {
+                "version": 1,
+                "source": "cinema4d-ui",
+                "recorded_at": recorded_at,
+                "scene_name": scene_name,
+                "fps": fps,
+                "events": events,
+            }
+            file_path = None
+            if hasattr(c4d.storage, "SaveDialog"):
+                save_type = getattr(c4d.storage, "FILESELECTTYPE_ANYTHING", 0)
+                file_path = c4d.storage.SaveDialog(
+                    type=save_type,
+                    title="Export C4D UI action log",
+                    force_suffix="json",
+                )
+            if not file_path:
+                gui.MessageDialog("No file selected or SaveDialog not available.")
+                return
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            gui.MessageDialog("UI action log exported to:\n" + file_path)
+        except Exception as e:
+            gui.MessageDialog("Export failed: " + str(e))
 
     def StartServer(self):
         """Start the socket server thread."""
+        global _g_ui_log_server
         if not self.server:
             self.server = C4DSocketServer(msg_queue=self.msg_queue)
             self.server.start()
+            _g_ui_log_server = self.server
             self.Enable(1011, False)
             self.Enable(1012, True)
 
     def StopServer(self):
         """Stop the socket server."""
+        global _g_ui_log_server
         if self.server:
             self.server.stop()
             self.server = None
+            _g_ui_log_server = None
             self.Enable(1011, True)
             self.Enable(1012, False)
 
@@ -6417,4 +7223,10 @@ if __name__ == "__main__":
         None,
         None,
         SocketServerPlugin(),
+    )
+    c4d.plugins.RegisterMessagePlugin(
+        UI_OBSERVER_PLUGIN_ID,
+        "MCP UI Action Observer",
+        0,
+        UiActionObserver(),
     )
