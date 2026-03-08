@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/ttiimmaacc-cinema4d-mcp-badge.png)](https://mseep.ai/app/ttiimmaacc-cinema4d-mcp)
+
 # Cinema4D MCP — Model Context Protocol (MCP) Server
 
 Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D manipulation.
