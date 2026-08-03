@@ -2,6 +2,8 @@
 
 Cinema4D MCP Server connects Cinema 4D to Claude, enabling prompt-assisted 3D manipulation.
 
+> [简体中文](README.zh-CN.md)
+
 ## Table of Contents
 
 - [Components](#components)
